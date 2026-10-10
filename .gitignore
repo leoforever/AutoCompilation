@@ -1,0 +1,67 @@
+# 龙芯 LoongArch 智能编译平台 · .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+cache/
+
+# 上传文件
+uploads/
+artifacts/
+
+# 日志
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境变量
+.env
+.env.local
+
+# 编译平台专用环境变量（含 AI API key）
+.env.compile
+.env.compile.swp
+
+# 例外：模板文件要提交
+!.env.compile.example
+
+# 配置文件（含敏感信息）
+config.yaml
+
+# macOS
+.DS_Store
+
+# 客户端配置
+~/.compile-platform/
