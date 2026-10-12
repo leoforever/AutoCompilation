@@ -65,3 +65,21 @@ config.yaml
 
 # 客户端配置
 ~/.compile-platform/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Vite / 框架生成
+dist/
+.vite/
+*.local
+
+# 早期开发笔记（开发流水账，正式文档在 docs/api.md / changelog.md / roadmap.md）
+docs/day1-*.md
+docs/day2-*.md
+docs/pg-vs-mariadb.md
+docs/database-evaluation.md
