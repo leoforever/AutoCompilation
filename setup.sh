@@ -157,6 +157,20 @@ do_install() {
         sleep 2
     fi
 
+    info "检查 git（worker 克隆源码用）..."
+    if ! command -v git &>/dev/null; then
+        warn "git 未安装，正在安装..."
+        dnf install -y git || yum install -y git
+    fi
+
+    info "检查 docker daemon（worker 编译沙箱依赖）..."
+    if ! command -v docker &>/dev/null; then
+        warn "docker 未安装"
+        warn "编译平台 worker 通过 Docker 起容器，缺 docker 后端能起但编译任务全挂"
+        warn "请手动安装 docker（https://docs.docker.com/engine/install/）后重跑"
+        # 不强制退出 —— 让后端能起来，编译功能等 docker 装好再 work
+    fi
+
     info "创建数据库用户和数据库..."
     sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD 'compile123';" 2>/dev/null || true
     sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
@@ -168,6 +182,16 @@ do_install() {
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
     npm install
+
+    info "拉取 worker 编译镜像（首次较慢，1-2GB）..."
+    if command -v docker &>/dev/null; then
+        # docker pull 之前 source 一下 .env.compile 拿 DOCKER_IMAGE（可选）
+        if [ -f "$ENV_FILE" ]; then
+            set -a; source "$ENV_FILE"; set +a
+        fi
+        docker pull "${DOCKER_IMAGE:-loongnix-build:23.2}" || \
+            warn "docker pull 失败（请检查 DOCKER_IMAGE 配置和镜像仓库访问），编译任务会失败"
+    fi
 
     info "建表 + 默认管理员账号..."
     do_init
