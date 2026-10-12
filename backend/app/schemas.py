@@ -1,7 +1,8 @@
 """
 Pydantic schemas for request/response validation
 """
-from pydantic import BaseModel, ConfigDict, Field
+import json
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from typing import Optional, List, Any
 from datetime import datetime
 from app.models import CompileMode, TaskStatus, TicketStatus, ExperienceStatus, UserRole
@@ -97,6 +98,20 @@ class CompileTaskResponse(BaseModel):
     duration_seconds: Optional[int]
     updated_at: Optional[datetime]
 
+    @field_serializer('created_at', 'updated_at', 'started_at', 'completed_at', check_fields=False)
+    def _serialize_dt(self, v):
+        """DB 写的是 datetime.utcnow()（naive UTC）；序列化时加 'Z' 后缀
+
+        前端 new Date(...Z) 正确解析为 UTC，toLocaleString 自动转本地时区
+        naive datetime（无 tzinfo）一律当 UTC 处理
+        """
+        if v is None:
+            return None
+        if v.tzinfo is None:
+            return v.isoformat() + 'Z'
+        return v.isoformat()
+
+
 
 class CompileTaskListResponse(BaseModel):
     total: int
@@ -184,12 +199,36 @@ class SkillResponse(BaseModel):
     name: str
     type: str
     description: Optional[str]
-    system_ids: List[int]
+    # system_ids 持久化时是 JSON 字符串（'[]' / '[1,2]'），model_validate 直接拿 ORM
+    # 字段会是 str。接受 str/None/list，缺省空 list。
+    system_ids: List[int] = []
     version: Optional[str]
     is_active: bool
-    sync_status: str
+    source: Optional[str] = "admin"  # admin | experience
+    # 列表接口返这两个字段可能让响应变大，但前端 editSkill 需要填充编辑器；
+    # 如果嫌大可以另开 /admin/skills/{id} 详情接口
+    skill_content: Optional[str] = ""
+    script_content: Optional[str] = ""
+    deleted_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("system_ids", mode="before")
+    @classmethod
+    def _parse_system_ids(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [int(x) for x in parsed]
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return []
+            return []
+        if isinstance(v, list):
+            return [int(x) for x in v]
+        return []
 
 
 # ==================== 统计 ====================

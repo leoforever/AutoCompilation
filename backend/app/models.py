@@ -219,10 +219,16 @@ class Skill(Base):
     description = Column(Text)
     system_ids = Column(Text)  # JSON 字符串：适用的系统 ID 列表
     version = Column(String(20))
-    skill_content = Column(Text)  # SKILL.md 内容
+    skill_content = Column(Text)  # SKILL.md 内容（DB 备份用，磁盘为准）
     script_content = Column(Text)  # run.sh 脚本内容
     is_active = Column(Boolean, default=True)
-    sync_status = Column(String(20), default="pending")
+    # 来源：admin（管理页面创建）/ experience（用户提交经验通过审核）
+    # 默认 admin；老记录没填也按 admin 视之
+    source = Column(String(20), default="admin")
+    # 软删：磁盘文件被删后，reconcile 把 deleted_at 设上（DB 行保留作备份）
+    # 恢复 = write_skill_to_disk + deleted_at = None
+    # 永久删除 = db.delete()（admin 手动操作）
+    deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_by = Column(Integer, ForeignKey("users.user_id"))
@@ -248,9 +254,37 @@ class AuditLog(Base):
 
 # ==================== 初始化函数 ====================
 
+def _safe_add_column(table_name: str, column_name: str, ddl_type: str):
+    """幂等 ALTER TABLE ADD COLUMN（PostgreSQL / SQLite 都吃）"""
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+    if column_name in {c["name"] for c in insp.get_columns(table_name)}:
+        return  # 已存在
+    with engine.begin() as conn:
+        conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}'))
+    logger.info("Added column %s.%s (%s)", table_name, column_name, ddl_type)
+
+
+def _safe_drop_column(table_name: str, column_name: str):
+    """幂等 ALTER TABLE DROP COLUMN（PostgreSQL/SQLite 都吃）"""
+    from sqlalchemy import text, inspect
+    insp = inspect(engine)
+    if column_name not in {c["name"] for c in insp.get_columns(table_name)}:
+        return  # 不存在，no-op
+    with engine.begin() as conn:
+        # PG 用 DROP COLUMN；SQLite 也支持，括号防 keyword
+        conn.execute(text(f'ALTER TABLE {table_name} DROP COLUMN "{column_name}"'))
+    logger.info("Dropped column %s.%s", table_name, column_name)
+
+
 def init_db():
-    """初始化数据库（创建所有表）"""
+    """初始化数据库（创建所有表 + 幂等迁移）"""
     Base.metadata.create_all(bind=engine)
+    # 幂等迁移：新增字段（老库升级用）
+    _safe_add_column("skills", "source", "VARCHAR(20) DEFAULT 'admin'")
+    _safe_add_column("skills", "deleted_at", "TIMESTAMP NULL")
+    # 幂等迁移：删字段（sync_status 在 2026-10-12 简化后不再用）
+    _safe_drop_column("skills", "sync_status")
     logger.info("Database initialized")
 
 
