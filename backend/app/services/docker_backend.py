@@ -46,8 +46,17 @@ class DockerBackend(SandboxBackendProtocol):
             raise RuntimeError("Docker 客户端未连接")
         self.container = cli.containers.get(container_id)
 
-    def _exec(self, command: str, timeout: int = 600):
-        """底层执行命令，返回 (output: str, exit_code: int)"""
+    def _exec(self, command: str, timeout: int = None):
+        """底层执行命令，返回 (output: str, exit_code: int)
+
+        默认 timeout 取环境变量 DOCKER_EXEC_TIMEOUT，默认 3600s（1 小时），
+        留给 ollama cmake --build 这种大项目充足时间。
+        """
+        if timeout is None:
+            try:
+                timeout = int(os.environ.get("DOCKER_EXEC_TIMEOUT", "3600"))
+            except (ValueError, TypeError):
+                timeout = 3600
         full_cmd = f"(cd {self.work_dir} 2>/dev/null || true); {command}"
         try:
             exec_id = self.container.client.api.exec_create(
@@ -86,9 +95,9 @@ class DockerBackend(SandboxBackendProtocol):
             except Exception as e2:
                 return f"Error: {type(e).__name__}: {e}; fallback: {type(e2).__name__}: {e2}", -1
 
-    def execute(self, command: str, *, timeout: int | None = 600, **kwargs) -> ExecuteResponse:
-        if timeout is None:
-            timeout = 600
+    def execute(self, command: str, *, timeout: int | None = None, **kwargs) -> ExecuteResponse:
+        # 默认 timeout 由 _exec 内部从环境变量读取（默认 3600s）
+        # 调用方传 timeout=None 时直接传 None 给 _exec，让它自己读 env
         output, exit_code = self._exec(command, timeout=timeout)
         return ExecuteResponse(
             output=output,

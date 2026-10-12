@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import CompileTask, TaskStatus, SessionLocal
 from app.services.docker_backend import DockerBackend, get_docker_client
-from app.services.skill_loader import SKILLS_PATHS, SKILLS_DIR_HOST, SKILLS_DIR_CONTAINER
+from app.services.skill_loader import get_skills_paths, SKILLS_DIR_HOST, SKILLS_DIR_CONTAINER
 
 
 # ==================== AI / Engine 配置（按 spec：不写死，从环境变量读）====================
@@ -450,15 +450,17 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         temperature=0.1,
     )
 
+    # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
+    _skills_paths = get_skills_paths()
     from deepagents import create_deep_agent
     agent = create_deep_agent(
         model=llm,
         system_prompt=system_prompt,
         backend=backend,
-        skills=SKILLS_PATHS,
+        skills=_skills_paths,
     )
 
-    _log(state, "info", f"[阶段5] DeepAgent 启动, skills={len(SKILLS_PATHS)}", on_log)
+    _log(state, "info", f"[阶段5] DeepAgent 启动, skills={len(_skills_paths)}", on_log)
 
     state["current_attempt"] = 1
     task_prompt = f"""开始编译 {state['software_name']}。
@@ -470,20 +472,34 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 
     try:
         # 阶段5 上限：避免 AI 死循环调 API（教训：9/30 932B3C 任务卡 stage5 26 分钟）
-        # 默认 200 chunk 或 10 分钟，超出就强退（标 failed）
+        # 默认 200 chunk / 30 分钟（ollama cmake --build 要 15+ 分钟，10 分钟不够）
+        # 死循环启发式：连续 5 次快速 execute 失败 → 强退（区别真编译 vs 死循环）
         try:
             _max_chunks = int(os.environ.get("STAGE5_MAX_CHUNKS", "200"))
         except ValueError:
             _max_chunks = 200
         try:
-            _max_seconds = int(os.environ.get("STAGE5_MAX_SECONDS", "600"))  # 10 分钟
+            _max_seconds = int(os.environ.get("STAGE5_MAX_SECONDS", "1800"))  # 30 分钟
         except ValueError:
-            _max_seconds = 600
+            _max_seconds = 1800
+        try:
+            _loop_threshold = int(os.environ.get("STAGE5_LOOP_THRESHOLD", "5"))  # 连续快速失败次数
+        except ValueError:
+            _loop_threshold = 5
+        try:
+            _loop_window = float(os.environ.get("STAGE5_LOOP_WINDOW", "5"))  # 快速判定窗口（秒）
+        except ValueError:
+            _loop_window = 5.0
 
         start_ts = time.time()
         result = None
         prev_msg_count = 0
         chunk_count = 0
+        # 死循环检测：连续快速失败计数器
+        # "快速失败" = 上一条 tool result 距今 < _loop_window 秒 + tool result 内容是 error/traceback
+        _recent_fast_fail_count = 0
+        _last_tool_ts = start_ts  # 上一条 tool result 的 wall-clock 时间
+        _warned_at_80 = False
         for chunk in agent.stream(
             {"messages": [{"role": "user", "content": task_prompt}]},
             stream_mode="values",
@@ -505,6 +521,38 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                 state["status"] = TaskStatus.FAILED.value
                 state["last_error"] = f"stage5 超时：耗时 {elapsed:.1f}s > {_max_seconds}s"
                 return state
+            # 软警告：超过 80% 时限发一条提示（用户能看到"在跑"）
+            if not _warned_at_80 and elapsed > _max_seconds * 0.8:
+                _warned_at_80 = True
+                _log(state, "warn",
+                     f"[阶段5] 已用 {elapsed:.0f}s / {_max_seconds}s（80%），仍在跑；如非预期可手动取消",
+                     on_log)
+            # 死循环启发式：扫这一批新增消息里的 tool result
+            messages = chunk.get("messages", [])
+            new_msgs = messages[prev_msg_count:]
+            now = time.time()
+            for nm in new_msgs:
+                nm_type = getattr(nm, "type", None) or getattr(nm, "role", None) or nm.__class__.__name__
+                if nm_type != "tool":
+                    continue
+                content = nm.content if isinstance(nm.content, str) else str(nm.content or "")
+                is_fail = "error:" in content.lower() or "traceback" in content.lower()
+                # 间隔 = 当前 wall-clock - 上一条 tool result 时间
+                gap = now - _last_tool_ts
+                if is_fail and gap < _loop_window:
+                    _recent_fast_fail_count += 1
+                    if _recent_fast_fail_count >= _loop_threshold:
+                        _log(state, "error",
+                             f"[阶段5] 连续 {_loop_threshold} 次快速失败（间隔 < {_loop_window}s），疑似死循环，强退",
+                             on_log)
+                        state["status"] = TaskStatus.FAILED.value
+                        state["last_error"] = (
+                            f"stage5 死循环：连续 {_loop_threshold} 次快速失败"
+                        )
+                        return state
+                else:
+                    _recent_fast_fail_count = 0
+                _last_tool_ts = now
             # 外部标了 failed/success：_periodic_persist 已经感知，强退
             if state.get("_external_terminal"):
                 _log(state, "error",
@@ -514,7 +562,6 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                 state["last_error"] = state.get("_external_error") or state["last_error"]
                 return state
 
-            messages = chunk.get("messages", [])
             for msg in messages[prev_msg_count:]:
                 _render_agent_message(msg, state, start_ts, on_log)
             prev_msg_count = len(messages)
