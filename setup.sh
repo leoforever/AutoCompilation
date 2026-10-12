@@ -182,16 +182,8 @@ do_install() {
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
     npm install
-
-    info "拉取 worker 编译镜像（首次较慢，1-2GB）..."
-    if command -v docker &>/dev/null; then
-        # docker pull 之前 source 一下 .env.compile 拿 DOCKER_IMAGE（可选）
-        if [ -f "$ENV_FILE" ]; then
-            set -a; source "$ENV_FILE"; set +a
-        fi
-        docker pull "${DOCKER_IMAGE:-loongnix-build:23.2}" || \
-            warn "docker pull 失败（请检查 DOCKER_IMAGE 配置和镜像仓库访问），编译任务会失败"
-    fi
+    # 不主动拉 docker 镜像：每个目标系统的镜像地址 / tag 由部署者配 DOCKER_IMAGE，
+    # 第一次编译任务提交时 worker 会自动 docker pull。强制 install 阶段拉只会拖慢。
 
     info "建表 + 默认管理员账号..."
     do_init
