@@ -125,6 +125,26 @@ backend_healthcheck() {
 
 # ========== 安装（一次性） ==========
 do_install() {
+    # .env.compile 不入库（真实 AI key/Docker 配置），首次安装从模板复制
+    # 复制后立刻停在这里等用户编辑，避免后面跑 init 才发现 AI key 是空
+    if [ ! -f "$ENV_FILE" ]; then
+        if [ ! -f "${ENV_FILE}.example" ]; then
+            error "缺少 ${ENV_FILE}.example 模板（git 应入库），无法初始化 .env.compile"
+        fi
+        cp "${ENV_FILE}.example" "$ENV_FILE"
+        info "已从模板创建 $ENV_FILE（AI key / Docker 镜像 / DB 配置都在里面）"
+        warn "请立刻编辑 $ENV_FILE，至少填好以下 3 项："
+        warn "  1) AI_API_KEY  —— LLM API 密钥（AI 调用必需）"
+        warn "  2) AI_BASE_URL —— LLM API base URL"
+        warn "  3) AI_MODEL   —— 模型名"
+        warn "其它项（MAX_WORKERS、STAGE5_MAX_SECONDS 等）有合理默认值，可暂不改"
+        if [ -t 0 ]; then
+            read -p "编辑好 .env.compile 后按回车继续（Ctrl+C 中止安装）: " _ || true
+        else
+            error "非交互式终端：手动编辑 $ENV_FILE 后再跑 bash setup.sh install"
+        fi
+    fi
+
     info "检查 PostgreSQL..."
     if ! command -v psql &>/dev/null; then
         warn "PostgreSQL 未安装，正在安装..."
