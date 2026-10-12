@@ -272,14 +272,15 @@ onMounted(async () => {
   // 2) 查"我名下"是否有 running 任务（覆盖：A 浏览器提交 → 关 A → 开 B → 进 Workbench 接管）
   try {
     const r: any = await api.get('/compile/tasks?status=compiling&page_size=5')
-    const running = r?.data?.tasks || []
+    // /compile/tasks 直接返 {total, tasks}，不走 ApiResponse
+    const running = r?.tasks || []
     if (running.length) {
       const ok = await restoreFromTaskId(running[0].task_id)
       if (ok) return
     }
     // submitted 也接管（刚提交没 worker 抢）
     const sub: any = await api.get('/compile/tasks?status=submitted&page_size=5')
-    const subs = sub?.data?.tasks || []
+    const subs = sub?.tasks || []
     if (subs.length) {
       const ok = await restoreFromTaskId(subs[0].task_id)
       if (ok) return

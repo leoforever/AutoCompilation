@@ -106,8 +106,9 @@ async function loadTasks() {
   if (searchText.value) params.search = searchText.value
   
   const res = await api.get('/compile/tasks', { params })
-  tasks.value = res.data?.tasks || []
-  pagination.value.total = res.data?.total || 0
+  // /compile/tasks 直接返 {total, tasks}（没包 ApiResponse）—— 与单 task 接口不同
+  tasks.value = res.tasks || []
+  pagination.value.total = res.total || 0
 }
 
 function statusType(status: string) {
@@ -131,13 +132,19 @@ function statusText(status: string) {
 }
 
 function formatDate(dateStr: string) {
-  return new Date(dateStr).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  // 完整日期时间 YYYY-MM-DD HH:MM（跨天任务也看得出来）
+  const d = new Date(dateStr)
+  if (isNaN(d.getTime())) return dateStr
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+         `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 async function viewLog(task: any) {
   currentTask.value = task
   const res = await api.get(`/compile/tasks/${task.task_id}/log`)
-  const log = res.data?.log || ''
+  // axios 拦截器已 unwrap response.data，res 直接是 {task_id, log}
+  const log = res.log || res.data?.log || ''
   currentLog.value = log.split('\n').filter(Boolean).map(line => ({
     text: line,
     type: line.includes('[OK]') ? 'ok' : line.includes('[ERROR]') ? 'err' : line.includes('[WARN]') ? 'warn' : 'dim'
