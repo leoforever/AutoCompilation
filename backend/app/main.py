@@ -101,6 +101,9 @@ async def lifespan(app: FastAPI):
         fut = executor.submit(worker_loop, wid)
         futures.append(fut)
 
+    # 注：reconcile 不在后台跑，改为前端进入 SkillLib 页面时按需触发
+    # （见 admin.py /admin/skills/reconcile 接口 + SkillLib.vue onMounted）
+
     try:
         yield
     finally:
