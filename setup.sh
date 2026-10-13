@@ -212,38 +212,37 @@ do_install() {
     sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD 'compile123';" 2>/dev/null || true
     sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
 
-    info "配置 PG 认证：让应用走 md5 密码认证（修复 Ident 认证失败）..."
-    # pg_hba.conf 默认是 peer 认证（基于 OS 用户），应用通过 tcp 连接时
-    # 会被匹配到 host 行的 peer → 密码不参与 → "Ident 认证失败"
-    # 改：让 compile_user 走 md5（密码认证）
+    info "配置 PG 认证：pg_hba.conf 把 host 行的 ident 改 md5（修复 Ident 认证失败）..."
+    # 默认 PG 是 peer 认证（基于 OS 用户），应用通过 tcp 连接时密码不参与验证
+    # 改：把所有 host 行的 ident 改成 md5（密码认证）
     HBA_FILE=$(sudo -u postgres psql -tAc "SHOW hba_file;" 2>/dev/null)
     if [ -z "$HBA_FILE" ]; then
         warn "无法定位 pg_hba.conf 路径（SHOW 失败），跳过认证配置"
-        warn "若应用连不上 DB，请手动编辑 pg_hba.conf 让 compile_user 走 md5"
+        warn "若应用连不上 DB，请手动编辑 pg_hba.conf 把 host 行 ident 改 md5 + systemctl reload postgresql"
     else
         info "pg_hba.conf: $HBA_FILE"
-        # 用编译时占位标记，避免重复追加
-        HBA_MARK="# --- compile-platform managed: compile_user md5 ---"
-        if ! sudo grep -q "$HBA_MARK" "$HBA_FILE" 2>/dev/null; then
-            # 在文件末尾追加一行（顺序很重要 — 写在最前优先匹配）
-            sudo tee -a "$HBA_FILE" >/dev/null <<EOF
-
-$HBA_MARK
-host    compile_platform    compile_user    127.0.0.1/32    md5
-host    compile_platform    compile_user    ::1/128           md5
-EOF
+        # 检查是否已转换过（幂等）
+        HBA_MARK="# --- compile-platform managed: ident converted to md5 ---"
+        if sudo grep -q "$HBA_MARK" "$HBA_FILE" 2>/dev/null; then
+            info "pg_hba.conf 已含 compile-platform managed 配置，跳过"
+        else
+            # 备份原文件
+            sudo cp "$HBA_FILE" "${HBA_FILE}.compile-platform.bak"
+            info "已备份原 pg_hba.conf 到 ${HBA_FILE}.compile-platform.bak"
+            # sed 替换 host 行末尾的 ident → md5（只改 host 行，不动 local 行；local 是 peer 没问题）
+            sudo sed -i.bak '/^host\s.*ident$/s/ident$/md5/' "$HBA_FILE"
+            # 在文件开头加标记（用 # 注释，避免匹配规则影响）
+            sudo sed -i "1i $HBA_MARK" "$HBA_FILE"
             # reload 让 pg_hba.conf 生效（无需 restart）
             if sudo systemctl reload postgresql 2>/dev/null; then
-                info "PG 配置已 reload（compile_user 现在走 md5 密码认证）"
+                info "PG 配置已 reload（host 行已从 ident 改 md5）"
             else
                 warn "systemctl reload 失败（systemd 不可用），请手动 pg_ctl reload"
             fi
-        else
-            info "pg_hba.conf 已含 compile-platform managed 配置，跳过"
         fi
     fi
 
-    info "安装 Python 依赖..."
+    info "安装 Python 依赖（fastapi / sqlalchemy / psycopg2-binary / python-jose / passlib / langchain-openai 等）..."
     cd "$BACKEND_DIR"
     pip install -r requirements.txt -q
 
