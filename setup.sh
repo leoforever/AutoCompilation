@@ -20,6 +20,7 @@ FRONTEND_DIR="$PROJECT_DIR/frontend"
 LOG_DIR="$PROJECT_DIR/logs"
 PID_DIR="$LOG_DIR/pids"
 ENV_FILE="$BACKEND_DIR/.env.compile"
+CONFIG_FILE="$BACKEND_DIR/config.yaml"
 BACKEND_PORT=8000
 FRONTEND_PORT=3000
 
@@ -148,6 +149,16 @@ do_install() {
         fi
     fi
 
+    # config.yaml 同理：缺则从 .example 复制
+    if [ ! -f "$CONFIG_FILE" ]; then
+        if [ ! -f "${CONFIG_FILE}.example" ]; then
+            error "缺少 ${CONFIG_FILE}.example 模板（git 应入库），无法初始化 config.yaml"
+        fi
+        cp "${CONFIG_FILE}.example" "$CONFIG_FILE"
+        info "已从模板创建 $CONFIG_FILE（默认配置：PostgreSQL + dev/test 账号）"
+        info "生产部署请手动编辑 $CONFIG_FILE（改 secret_key 等）"
+    fi
+
     info "检查 PostgreSQL..."
     if ! command -v psql &>/dev/null; then
         warn "PostgreSQL 未安装，正在安装..."
@@ -172,6 +183,13 @@ do_install() {
         info "PostgreSQL 服务运行中"
     fi
 
+    info "安装 postgresql-devel（编译/构建 PG 扩展需要；多数 pip PG 包推荐装）..."
+    # 即使 psycopg2-binary 不需要 devel，未来若装 psycopg2 源码版 / 其他 PG 扩展会用上
+    # 幂等：已装 dnf 会跳过
+    dnf install -y postgresql-devel 2>/dev/null || \
+        yum install -y postgresql-devel 2>/dev/null || \
+        info "postgresql-devel 安装失败（可能是离线环境），跳过"
+
     info "检查 git（worker 克隆源码用）..."
     if ! command -v git &>/dev/null; then
         warn "git 未安装，正在安装..."
@@ -193,6 +211,37 @@ do_install() {
     info "创建数据库用户和数据库..."
     sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD 'compile123';" 2>/dev/null || true
     sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
+
+    info "配置 PG 认证：让应用走 md5 密码认证（修复 Ident 认证失败）..."
+    # pg_hba.conf 默认是 peer 认证（基于 OS 用户），应用通过 tcp 连接时
+    # 会被匹配到 host 行的 peer → 密码不参与 → "Ident 认证失败"
+    # 改：让 compile_user 走 md5（密码认证）
+    HBA_FILE=$(sudo -u postgres psql -tAc "SHOW hba_file;" 2>/dev/null)
+    if [ -z "$HBA_FILE" ]; then
+        warn "无法定位 pg_hba.conf 路径（SHOW 失败），跳过认证配置"
+        warn "若应用连不上 DB，请手动编辑 pg_hba.conf 让 compile_user 走 md5"
+    else
+        info "pg_hba.conf: $HBA_FILE"
+        # 用编译时占位标记，避免重复追加
+        HBA_MARK="# --- compile-platform managed: compile_user md5 ---"
+        if ! sudo grep -q "$HBA_MARK" "$HBA_FILE" 2>/dev/null; then
+            # 在文件末尾追加一行（顺序很重要 — 写在最前优先匹配）
+            sudo tee -a "$HBA_FILE" >/dev/null <<EOF
+
+$HBA_MARK
+host    compile_platform    compile_user    127.0.0.1/32    md5
+host    compile_platform    compile_user    ::1/128           md5
+EOF
+            # reload 让 pg_hba.conf 生效（无需 restart）
+            if sudo systemctl reload postgresql 2>/dev/null; then
+                info "PG 配置已 reload（compile_user 现在走 md5 密码认证）"
+            else
+                warn "systemctl reload 失败（systemd 不可用），请手动 pg_ctl reload"
+            fi
+        else
+            info "pg_hba.conf 已含 compile-platform managed 配置，跳过"
+        fi
+    fi
 
     info "安装 Python 依赖..."
     cd "$BACKEND_DIR"

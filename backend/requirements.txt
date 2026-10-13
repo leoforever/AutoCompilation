@@ -10,6 +10,7 @@ sse-starlette>=2.0.0             # Server-Sent Events
 
 # ===== 数据 / 配置 =====
 sqlalchemy>=2.0.0                # ORM
+psycopg2-binary>=2.9.9           # PostgreSQL 驱动（SQLAlchemy 不会自动装，缺它会启动失败）
 pydantic>=2.0.0                  # 请求/响应模型
 PyYAML>=6.0                      # config.yaml 解析（app/config.py 用）
 
