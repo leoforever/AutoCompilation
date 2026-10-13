@@ -5,8 +5,9 @@ Based on design doc section 11.1: POST /api/compile/submit, GET /api/compile/tas
 改动（集成 compile_engine 后）：
 - POST /submit 现在调 task_queue.enqueue 让 worker 能抢到任务
 - WS /ws/compile/log/{id} 改用 worker.BROADCASTER 实时推送
+- POST /upload 新增：上传源码包 + 创建 task（source_type=upload，git 路径不变）
 """
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
@@ -14,6 +15,8 @@ from typing import List, Optional
 import uuid
 import json
 import asyncio
+import re
+import os
 from datetime import datetime
 from app.dependencies import get_current_user
 from app.models import User
@@ -24,8 +27,14 @@ from app.schemas import (
     ApiResponse
 )
 from app.services import task_queue
+from app.config import get_settings
 
 router = APIRouter()
+
+
+# 上传源码包允许的扩展名（白名单）
+_ALLOWED_EXT = {".tar.gz", ".zip", ".tgz"}
+_ALLOWED_NAME_RE = re.compile(r"^[\w\-. ]+\.(tar\.gz|zip|tgz)$", re.IGNORECASE)
 
 
 @router.post("/submit", response_model=ApiResponse)
@@ -36,7 +45,7 @@ async def submit_compile_task(
 ):
     """
     提交编译任务
-    
+
     - system_id: 目标系统 ID
     - software_name: 软件名称/版本
     - source_type: upload 或 git
@@ -49,7 +58,7 @@ async def submit_compile_task(
     ).first()
     if not system:
         raise HTTPException(status_code=404, detail="目标系统不存在或已禁用")
-    
+
     # 生成任务 ID
     task_id = f"T-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
 
@@ -81,6 +90,141 @@ async def submit_compile_task(
             "task_id": task.task_id,
             "status": str(task.status),
         }
+    )
+
+
+@router.post("/upload", response_model=ApiResponse)
+async def upload_and_submit(
+    file: UploadFile = File(..., description=".tar.gz / .zip / .tgz 源码包"),
+    system_id: int = Form(...),
+    software_name: str = Form(...),
+    git_branch: str = Form("main"),
+    compile_mode: str = Form("container"),
+    build_args: Optional[str] = Form(None, description='JSON 字符串，如 {"KEY":"VAL"}'),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    上传源码包 + 提交编译任务
+
+    - multipart/form-data：file + system_id + software_name + 可选 git_branch/compile_mode/build_args
+    - 文件保存到 artifacts/sources/{task_id}.tar.gz（实际扩展名按文件原样）
+    - worker stage4a 会按 source_type='upload' 解压到容器 /work/src
+
+    与 POST /submit (git 路径) 是并行路径，互不影响
+    """
+    # 1. 校验文件名 + 扩展名
+    original_name = file.filename or "upload.bin"
+    if not _ALLOWED_NAME_RE.match(original_name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的源码包格式：{original_name}（仅接受 .tar.gz / .zip / .tgz）",
+        )
+
+    # 2. 校验目标系统
+    system = db.query(TargetSystem).filter(
+        TargetSystem.system_id == system_id,
+        TargetSystem.is_active == True,
+    ).first()
+    if not system:
+        raise HTTPException(status_code=404, detail="目标系统不存在或已禁用")
+
+    # 3. 校验 compile_mode
+    if compile_mode not in ("container", "local"):
+        raise HTTPException(status_code=400, detail="compile_mode 必须是 .container 或 .local")
+
+    # 4. 生成 task_id + 写文件到 artifacts/sources/
+    settings = get_settings()
+    artifact_dir = Path(os.environ.get("ARTIFACTS_DIR") or settings.artifact_dir)
+    if not artifact_dir.is_absolute():
+        artifact_dir = Path("/root/.openclaw/workspace/compile-platform/backend").parent / artifact_dir
+    sources_dir = artifact_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    task_id = f"T-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+    # 用 task_id 命名避免路径冲突（保留原扩展名）
+    # 注意 .tar.gz 有两个点，Path.suffix 只取最后一个（.gz），会丢 .tar
+    name_lower = original_name.lower()
+    if name_lower.endswith(".tar.gz"):
+        suffix = ".tar.gz"
+    elif name_lower.endswith(".tgz"):
+        suffix = ".tar.gz"  # 内部统一存为 .tar.gz
+    else:
+        suffix = Path(original_name).suffix.lower()  # .zip 等
+    stored_name = f"{task_id}{suffix}"
+    stored_path = sources_dir / stored_name
+
+    # 写文件（限制大小）
+    max_size = int(os.environ.get("UPLOAD_MAX_SIZE", settings.max_upload_size))
+    bytes_written = 0
+    try:
+        with open(stored_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_size:
+                    # 清理已写部分
+                    f.close()
+                    stored_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"源码包过大：>{max_size // (1024*1024)} MB",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"保存源码包失败：{e}")
+
+    # 5. 解析 build_args
+    parsed_build_args = None
+    if build_args:
+        try:
+            parsed_build_args = json.loads(build_args)
+        except json.JSONDecodeError:
+            stored_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="build_args 必须是合法 JSON")
+
+    # 6. 创建 CompileTask 记录
+    try:
+        task = CompileTask(
+            task_id=task_id,
+            user_id=current_user.user_id,
+            system_id=system_id,
+            software_name=software_name,
+            source_type="upload",
+            source_path=str(stored_path),
+            git_url=None,
+            git_branch=git_branch,
+            build_args=json.dumps(parsed_build_args) if parsed_build_args else None,
+            compile_mode=compile_mode,
+            status=TaskStatus.SUBMITTED,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+    except Exception as e:
+        # DB 失败回滚 + 删文件
+        db.rollback()
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"创建任务失败：{e}")
+
+    # 7. 入队列让 worker 抢
+    task_queue.enqueue(task_id)
+
+    return ApiResponse(
+        code=200,
+        message="源码包已上传，编译任务已提交",
+        data={
+            "task_id": task.task_id,
+            "status": str(task.status),
+            "source_path": str(stored_path),
+            "bytes": bytes_written,
+        },
     )
 
 

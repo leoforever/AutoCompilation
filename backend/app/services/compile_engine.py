@@ -166,6 +166,9 @@ def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallbac
         "software_name": task.software_name,
         "source_type": task.source_type or "git",
         "git_url": task.git_url or "",
+        # upload 模式：source_path 存宿主机源码包路径，stage4a 读这个解压
+        # git 模式：source_path 没用
+        "source_path": task.source_path or "",
         "git_branch": task.git_branch or "main",
         "commit_hash": "",
         "system_id": task.system_id,
@@ -179,6 +182,10 @@ def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallbac
         "status": TaskStatus.COMPILING.value,
         "container_id": "",
     })
+    # DEBUG: 排查 source_path 何时为空
+    print(f"[DEBUG stage1] task_id={task.task_id} source_type={state['source_type']!r} "
+          f"task.source_path={task.source_path!r} state.source_path={state['source_path']!r} "
+          f"task.id={task.id}", flush=True)
     _log(state, "info", f"[阶段1] 任务初始化: {task.task_id} / {task.software_name}", on_log)
     return state
 
@@ -284,70 +291,157 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback]) -> 
 
 # ==================== 阶段 4a ====================
 def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
-    """宿主机侧：把源码下载到 container_work/src/
+    """宿主机侧：把源码下载/解压到 container_work/src/
 
     为什么要宿主机做：
       1. 容器内网络可能受限（防火墙/DNS/代理），宿主机通常可达公网
       2. 下载用 subprocess + timeout，失败可立即报错退出，不会出现容器内 git
          zombie 后容器 exec 永远不返回的卡死现象
       3. 流式输出逐行进 _log，前端 WS 能实时看到 clone 进度
-    """
-    if state["source_type"] != "git" or not state.get("git_url"):
-        # 非 git 源：跳过此阶段，由 stage4 在容器内处理
-        return state
 
+    两条路径：
+      - source_type='git'    → git clone（不变）
+      - source_type='upload' → 解压 state['git_url'... 不，是 state['source_path'] 的 tar.gz/zip
+    """
     work_dir = Path(state["work_dir"])
     src_dir = work_dir / "container_work" / "src"
 
-    # 复用已有 clone（节省时间）
-    if src_dir.exists() and (src_dir / ".git").exists():
-        _log(state, "info", f"[阶段4a] 源码已存在，复用: {src_dir}", on_log)
-    else:
-        if src_dir.exists():
-            shutil.rmtree(src_dir, ignore_errors=True)
-        src_dir.parent.mkdir(parents=True, exist_ok=True)
+    if state["source_type"] == "git" and state.get("git_url"):
+        # git clone（原有逻辑，原样保留）
+        # 复用已有 clone（节省时间）
+        if src_dir.exists() and (src_dir / ".git").exists():
+            _log(state, "info", f"[阶段4a] 源码已存在，复用: {src_dir}", on_log)
+        else:
+            if src_dir.exists():
+                shutil.rmtree(src_dir, ignore_errors=True)
+            src_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        branch = state.get("git_branch") or "main"
-        url = state["git_url"]
-        cmd = ["git", "clone", "--depth", "1", "--branch", branch, url, str(src_dir)]
+            branch = state.get("git_branch") or "main"
+            url = state["git_url"]
+            cmd = ["git", "clone", "--depth", "1", "--branch", branch, url, str(src_dir)]
 
-        _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch})", on_log)
+            _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch})", on_log)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _log(state, "info", f"[阶段4a]   {line}", on_log)
+                ret = proc.wait(timeout=600)  # 10 分钟硬上限
+                if ret != 0:
+                    raise RuntimeError(f"git clone exit_code={ret}")
+            except subprocess.TimeoutExpired:
+                try: proc.kill()
+                except Exception: pass
+                raise RuntimeError("git clone 超时（>10 分钟）")
+            except FileNotFoundError:
+                raise RuntimeError("宿主机未安装 git")
+
+        # 读 commit hash
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    _log(state, "info", f"[阶段4a]   {line}", on_log)
-            ret = proc.wait(timeout=600)  # 10 分钟硬上限
-            if ret != 0:
-                raise RuntimeError(f"git clone exit_code={ret}")
-        except subprocess.TimeoutExpired:
-            try: proc.kill()
-            except Exception: pass
-            raise RuntimeError("git clone 超时（>10 分钟）")
-        except FileNotFoundError:
-            raise RuntimeError("宿主机未安装 git")
+            out = subprocess.check_output(
+                ["git", "-C", str(src_dir), "rev-parse", "HEAD"],
+                text=True, timeout=10,
+            ).strip()
+            state["commit_hash"] = out
+            _log(state, "info", f"[阶段4a] 完成: commit={out[:8]}", on_log)
+        except Exception as e:
+            _log(state, "warn", f"[阶段4a] 读 commit hash 失败: {e}", on_log)
 
-    # 读 commit hash
-    try:
-        out = subprocess.check_output(
-            ["git", "-C", str(src_dir), "rev-parse", "HEAD"],
-            text=True, timeout=10,
-        ).strip()
-        state["commit_hash"] = out
-        _log(state, "info", f"[阶段4a] 完成: commit={out[:8]}", on_log)
-    except Exception as e:
-        _log(state, "warn", f"[阶段4a] 读 commit hash 失败: {e}", on_log)
+        state["host_src_dir"] = str(src_dir)
+        return state
 
-    state["host_src_dir"] = str(src_dir)
-    return state
+    if state["source_type"] == "upload":
+        # 解压用户上传的 .tar.gz / .zip
+        archive = state.get("source_path") or state.get("git_url")  # 兼容：有些路由可能写到 git_url
+        if not archive:
+            raise RuntimeError("source_type=upload 但 source_path 为空")
+        archive_path = Path(archive)
+        if not archive_path.exists():
+            raise RuntimeError(f"上传的源码包不存在：{archive_path}")
+
+        # 复用已有解压（节省时间）
+        if src_dir.exists() and any(src_dir.iterdir()):
+            _log(state, "info", f"[阶段4a] 源码已存在，复用: {src_dir}", on_log)
+        else:
+            if src_dir.exists():
+                shutil.rmtree(src_dir, ignore_errors=True)
+            src_dir.parent.mkdir(parents=True, exist_ok=True)
+            _extract_archive_safely(archive_path, src_dir, on_log, state)
+
+        state["host_src_dir"] = str(src_dir)
+        _log(state, "info", f"[阶段4a] 解压完成: {src_dir}", on_log)
+        return state
+
+    # 未知 source_type
+    raise RuntimeError(f"不支持的 source_type: {state['source_type']}")
+
+
+def _extract_archive_safely(
+    archive_path: Path,
+    dst_dir: Path,
+    on_log: Optional[LogCallback],
+    state: TaskState,
+) -> None:
+    """解压 .tar.gz / .zip 到 dst_dir
+
+    安全防护：
+      - 解压文件数 ≤ 50,000（防 zip bomb 大量小文件）
+      - 解压后总字节 ≤ 10 GB（防 zip bomb 单文件超大）
+      - 文件路径必须落到 dst_dir 内（防 zip slip）
+    """
+    MAX_FILES = 50_000
+    MAX_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
+
+    suffix = archive_path.suffix.lower()
+    if archive_path.name.lower().endswith(".tar.gz") or suffix == ".tgz":
+        import tarfile
+        members = 0
+        total_bytes = 0
+        dst_resolved = dst_dir.resolve()
+        with tarfile.open(archive_path, "r:gz") as tf:
+            for member in tf:
+                members += 1
+                if members > MAX_FILES:
+                    raise RuntimeError(f"压缩包内文件数超过 {MAX_FILES}，疑似 zip bomb")
+                # zip slip 检查：解压后路径必须在 dst_dir 内
+                target_path = (dst_dir / member.name).resolve()
+                if not str(target_path).startswith(str(dst_resolved)):
+                    raise RuntimeError(f"非法解压路径（zip slip?）：{member.name}")
+                total_bytes += member.size or 0
+                if total_bytes > MAX_BYTES:
+                    raise RuntimeError(f"解压后总字节超过 {MAX_BYTES // (1024**3)} GB")
+                if on_log and members % 200 == 0:
+                    _log(state, "info", f"[阶段4a] 解压中... {members} 文件", on_log)
+            tf.extractall(dst_dir)
+    elif suffix == ".zip":
+        import zipfile
+        members = 0
+        total_bytes = 0
+        dst_resolved = dst_dir.resolve()
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                members += 1
+                if members > MAX_FILES:
+                    raise RuntimeError(f"压缩包内文件数超过 {MAX_FILES}，疑似 zip bomb")
+                target_path = (dst_dir / info.filename).resolve()
+                if not str(target_path).startswith(str(dst_resolved)):
+                    raise RuntimeError(f"非法解压路径（zip slip?）：{info.filename}")
+                total_bytes += info.file_size or 0
+                if total_bytes > MAX_BYTES:
+                    raise RuntimeError(f"解压后总字节超过 {MAX_BYTES // (1024**3)} GB")
+                if on_log and members % 200 == 0:
+                    _log(state, "info", f"[阶段4a] 解压中... {members} 文件", on_log)
+            zf.extractall(dst_dir)
+    else:
+        raise RuntimeError(f"不支持的源码包格式：{suffix}（仅 .tar.gz / .zip / .tgz）")
 
 
 # ==================== 阶段 4 ====================
@@ -368,7 +462,10 @@ def stage4_import_source(state: TaskState, on_log: Optional[LogCallback]) -> Tas
                 raise RuntimeError("源码目录缺少 .git，stage4a 未正确下载")
             _log(state, "info", f"[阶段4] 容器内源码已就绪 (commit={state.get('commit_hash', '?')[:8]})", on_log)
         elif state["source_type"] == "upload":
-            raise NotImplementedError("upload 模式暂未实现")
+            chk = container.exec_run(["ls", "-la", src_dir])
+            if chk.exit_code != 0:
+                raise RuntimeError(f"源码目录不存在: {src_dir} (stage4a 解压失败?)")
+            _log(state, "info", f"[阶段4] 容器内 upload 源码已就绪: {src_dir}", on_log)
         else:
             raise RuntimeError(f"未知 source_type: {state['source_type']}")
     except Exception as e:

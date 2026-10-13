@@ -34,14 +34,14 @@
         <!-- 上传源码 -->
         <div v-if="form.sourceType === 'upload'" class="field">
           <div class="upload-area" @click="triggerUpload">
-            <input ref="fileInput" type="file" accept=".tar.gz,.zip" style="display:none" @change="handleFileChange" />
+            <input ref="fileInput" type="file" accept=".tar.gz,.zip,.tgz" style="display:none" @change="handleFileChange" />
             <div v-if="uploadedFile" class="notice ok">
               📦 已选择 <b>{{ uploadedFile.name }}</b>（{{ (uploadedFile.size / 1024 / 1024).toFixed(1) }} MB）
-              <span class="muted">（upload 模式暂未开放，请使用 Git 地址）</span>
+              <span class="muted" v-if="!uploadingFile">（点击 "发起云端编译" 上传并提交）</span>
             </div>
             <div v-else class="upload-placeholder">
               点击或拖拽上传源码包（.tar.gz / .zip）<br>
-              <span class="muted">支持最大 2 GB · 当前建议用 Git 地址</span>
+              <span class="muted">支持最大 2 GB</span>
             </div>
           </div>
         </div>
@@ -328,24 +328,37 @@ const genericSkills = computed(() => matchedSkills.value.filter(s => s.type === 
 const specificSkills = computed(() => matchedSkills.value.filter(s => s.type === 'specific'))
 const matchStatus = reactive({ text: '待匹配', type: 'info' as '' | 'success' | 'warning' | 'danger' | 'info' })
 
-// ============== 文件上传（暂未开放，仅记录） ==============
+// ============== 文件上传 ==============
+const uploadingFile = ref(false)
 function triggerUpload() {
-  // spec 9.1 云端模式只走 git；upload 模式未实现，这里点击提示
-  ElMessage.warning('当前为源码上传模式（未开放）；请切到「Git 地址」')
+  fileInput.value?.click()
 }
 
-function handleFileChange(_e: Event) {
-  // 占位保留
+function handleFileChange(e: Event) {
+  const target = e.target as HTMLInputElement
+  if (target.files && target.files.length > 0) {
+    uploadedFile.value = target.files[0]
+  }
+}
+
+function clearUploadedFile() {
+  uploadedFile.value = null
+  if (fileInput.value) fileInput.value.value = ''
 }
 
 // ============== 提交编译（真实链路） ==============
 async function submitCompile() {
   if (!form.systemId) { ElMessage.warning('请选择目标系统'); return }
   if (!form.softwareName) { ElMessage.warning('请填写软件名称'); return }
-  if (form.sourceType !== 'git') {
-    ElMessage.warning('当前仅支持 Git 地址模式（upload 暂未开放）'); return
+
+  // 上传模式：必须有文件
+  if (form.sourceType === 'upload' && !uploadedFile.value) {
+    ElMessage.warning('请选择源码包文件'); return
   }
-  if (!form.gitUrl) { ElMessage.warning('请填写 Git 仓库地址'); return }
+  // git 模式：必须有 URL
+  if (form.sourceType !== 'upload' && !form.gitUrl) {
+    ElMessage.warning('请填写 Git 仓库地址'); return
+  }
 
   // 如果当前有正在跑的任务（可能是 onMounted 恢复的旧任务），确认是否覆盖
   // 旧任务在后端会继续跑到自然结束（除非用户主动 cancel），不影响新任务
@@ -370,33 +383,52 @@ async function submitCompile() {
   logLines.value = []
   compileResult.value = null
   matchedSkills.value = []
-  matchStatus.text = '匹配中…'
+  matchStatus.text = '提交中…'
   matchStatus.type = 'warning'
 
-  // 1) POST /api/compile/submit
+  // 1) 提交编译任务（git 走 /compile/submit，upload 走 /compile/upload）
   let task_id = ''
   try {
-    // request.ts 拦截器已 unwrap 了，返回值是后端的 {code, message, data}
-    const r: any = await api.post('/compile/submit', {
-      system_id: form.systemId,
-      software_name: form.softwareName,
-      source_type: form.sourceType,
-      git_url: form.gitUrl,
-      git_branch: form.gitBranch || 'main',
-      compile_mode: form.compileMode,
-    })
-    task_id = r?.data?.task_id || ''
-    if (!task_id) throw new Error(`响应无 task_id: ${JSON.stringify(r).slice(0, 200)}`)
-    sessionStorage.setItem(TASK_STORAGE_KEY, task_id)  // 切走再切回恢复用
-    appendLog('info', `[SUBMIT] task_id=${task_id}，等待 worker 抢到…`)
+    if (form.sourceType === 'upload') {
+      // multipart/form-data 上传
+      uploadingFile.value = true
+      const fd = new FormData()
+      fd.append('file', uploadedFile.value!)
+      fd.append('system_id', String(form.systemId))
+      fd.append('software_name', form.softwareName)
+      fd.append('git_branch', form.gitBranch || 'main')
+      fd.append('compile_mode', form.compileMode)
+      const r: any = await api.post('/compile/upload', fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      task_id = r?.data?.task_id || ''
+      if (!task_id) throw new Error(`响应无 task_id: ${JSON.stringify(r).slice(0, 200)}`)
+      appendLog('info', `[UPLOAD] task_id=${task_id}（已上传 ${(uploadedFile.value!.size / 1024 / 1024).toFixed(1)} MB），等待 worker 抢到…`)
+    } else {
+      // request.ts 拦截器已 unwrap 了，返回值是后端的 {code, message, data}
+      const r: any = await api.post('/compile/submit', {
+        system_id: form.systemId,
+        software_name: form.softwareName,
+        source_type: form.sourceType,
+        git_url: form.gitUrl,
+        git_branch: form.gitBranch || 'main',
+        compile_mode: form.compileMode,
+      })
+      task_id = r?.data?.task_id || ''
+      if (!task_id) throw new Error(`响应无 task_id: ${JSON.stringify(r).slice(0, 200)}`)
+      sessionStorage.setItem(TASK_STORAGE_KEY, task_id)  // 切走再切回恢复用
+      appendLog('info', `[SUBMIT] task_id=${task_id}，等待 worker 抢到…`)
+    }
   } catch (e: any) {
     compiling.value = false
+    uploadingFile.value = false
     appendLog('err', `[ERROR] 提交失败: ${e?.message || e}`)
     compileResult.value = { status: 'failed' }
     matchStatus.text = '失败'
     matchStatus.type = 'danger'
     return
   }
+  uploadingFile.value = false  // 提交成功后清理
 
   // 2) 打开 WebSocket 接收实时日志
   subscribeWS(task_id)

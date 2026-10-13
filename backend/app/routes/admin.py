@@ -33,7 +33,7 @@ async def get_stats_overview(db: Session = Depends(get_db)):
     
     total_tasks = db.query(CompileTask).count()
     success_tasks = db.query(CompileTask).filter(
-        CompileTask.status.value == "success"
+        CompileTask.status == "success"
     ).count()
     
     # 近30天趋势
