@@ -15,7 +15,8 @@ pydantic>=2.0.0                  # 请求/响应模型
 PyYAML>=6.0                      # config.yaml 解析（app/config.py 用）
 
 # ===== 认证 =====
-python-jose[cryptography]>=3.3.0 # JWT 签发
+python-jose[cryptography]>=3.3.0 # JWT 签发（项目实际用）
+PyJWT>=2.8.0                     # JWT 备用（个别脚本 / 用户脚本可能用到）
 passlib[bcrypt]>=1.7.4           # 密码哈希（bcrypt 4.x 后 passlib 兼容问题，必要时直接用 bcrypt）
 
 # ===== AI agent =====

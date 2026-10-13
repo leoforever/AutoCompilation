@@ -214,11 +214,13 @@ do_install() {
 
     info "配置 PG 认证：pg_hba.conf 把 host 行的 ident 改 md5（修复 Ident 认证失败）..."
     # 默认 PG 是 peer 认证（基于 OS 用户），应用通过 tcp 连接时密码不参与验证
-    # 改：把所有 host 行的 ident 改成 md5（密码认证）
+    # 改：把所有 host 行的 ident 改成 md5（密码认证，包括 replication 行）
     HBA_FILE=$(sudo -u postgres psql -tAc "SHOW hba_file;" 2>/dev/null)
-    if [ -z "$HBA_FILE" ]; then
+    if [ -z "$HBA_FILE" ] || [ ! -f "$HBA_FILE" ]; then
         warn "无法定位 pg_hba.conf 路径（SHOW 失败），跳过认证配置"
-        warn "若应用连不上 DB，请手动编辑 pg_hba.conf 把 host 行 ident 改 md5 + systemctl reload postgresql"
+        warn "若应用连不上 DB，请手动执行下面命令："
+        warn "  HBA=/var/lib/pgsql/data/pg_hba.conf"
+        warn "  cp \$HBA \$HBA.bak && sudo sed -i.bak '/^host\\s.*ident$/s/ident\$/md5/' \$HBA && sudo systemctl reload postgresql"
     else
         info "pg_hba.conf: $HBA_FILE"
         # 检查是否已转换过（幂等）
