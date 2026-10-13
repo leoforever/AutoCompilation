@@ -78,7 +78,7 @@
         </h3>
 
         <div v-if="!matchedSkills.length && !compiling" class="empty">
-          发起编译后，大模型将自动匹配通用 + 专用 OpenClaw Skill
+          发起编译后，大模型将自动匹配通用 + 专用 Skill
         </div>
 
         <div v-else-if="matchedSkills.length">
@@ -126,19 +126,47 @@
       </div>
 
       <!-- 结果操作 -->
-      <div v-if="compileResult?.status === 'success'" class="result-actions">
-        <el-button type="primary" @click="submitExperience">
-          💾 沉淀经验
+      <div v-if="compileResult?.status === 'success' || compileResult?.status === 'failed'" class="result-actions">
+        <el-button type="primary" :loading="generatingDraft" @click="onGenerateDraft">
+          ✨ AI 生成经验草稿
         </el-button>
-        <el-button @click="downloadArtifact">⬇️ 下载产物</el-button>
-      </div>
-
-      <div v-if="compileResult?.status === 'failed'" class="result-actions">
-        <el-button type="danger" @click="reportTicket">
+        <el-button v-if="compileResult?.status === 'success'" @click="downloadArtifact">⬇️ 下载产物</el-button>
+        <el-button v-if="compileResult?.status === 'failed'" type="danger" @click="reportTicket">
           🐛 一键上报工单
         </el-button>
       </div>
     </div>
+
+    <!-- 经验草稿预览/编辑/提交 对话框 -->
+    <el-dialog v-model="draftVisible" title="✨ AI 生成的经验草稿" width="780px" :close-on-click-modal="false">
+      <el-alert
+        v-if="draftSource === 'ai'"
+        type="success"
+        :closable="false"
+        show-icon
+        title="由 AI 基于本任务日志总结；请检查后修改再提交，管理员审核通过后会入库到 Skill 库"
+        style="margin-bottom: 12px"
+      />
+      <div class="field" style="margin-bottom: 10px">
+        <label>Skill 名称（slug）</label>
+        <el-input v-model="draftForm.skill_name" placeholder="如 ollama-openeuler-2403" />
+      </div>
+      <div class="field" style="margin-bottom: 10px">
+        <label>类型</label>
+        <el-radio-group v-model="draftForm.skill_type">
+          <el-radio value="generic">通用（工具链 / 环境 / 错误经验）</el-radio>
+          <el-radio value="specific">专用（单软件编译）</el-radio>
+        </el-radio-group>
+      </div>
+      <div class="field">
+        <label>SKILL.md 内容</label>
+        <el-input v-model="draftForm.skill_content" type="textarea" :rows="18" resize="vertical" />
+      </div>
+      <template #footer>
+        <el-button @click="draftVisible = false">取消</el-button>
+        <el-button type="primary" :loading="submitting" @click="onSubmitDraft">提交审核</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -225,6 +253,10 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
           if (m) return { text: `${m[1]} ${m[3]}`, type: mapLevel(m[2]) }
           return { text: line, type: 'info' }
         })
+      // 重新从历史日志里扫匹配的 skill（之前只在 WS 流式 append 时实时扫，
+      // 重新 mount 时没回放，matchedSkills 一直空）
+      // 用整段 log 文本扫更稳（不依赖行格式解析）
+      extractSkillsFromText(logText)
     }
     // 状态
     compileResult.value = { status: t.status, task_id: taskId }
@@ -475,6 +507,12 @@ function extractSkillsFromLine(text: string) {
   }
 }
 
+// 整段文本扫（重新 mount 时用，log 拼成一行搜更稳）
+function extractSkillsFromText(text: string) {
+  if (!text) return
+  extractSkillsFromLine(text)
+}
+
 function appendLog(type: string, text: string) {
   logLines.value.push({ text, type })
   nextTick(() => {
@@ -488,24 +526,101 @@ function cleanup() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-function submitExperience() {
-  if (!compileResult.value?.task_id) { ElMessage.warning('无 task_id'); return }
-  api.post('/experience/submit', {
-    task_id: compileResult.value.task_id,
-    skill_name: 'auto-' + Date.now(),
-    skill_content: '(从 workbench 一键沉淀)',
-    skill_type: 'specific',
-    system_id: form.systemId,
-  }).then(() => ElMessage.success('已提交经验沉淀请求，等待管理员审核'))
-    .catch(err => ElMessage.error('提交失败：' + (err?.message || err)))
-}
-
 function reportTicket() {
   ElMessage.info('已生成工单跳转到工单中心')
 }
 
 function downloadArtifact() {
   ElMessage.info('产物归档路径在后端 ARTIFACTS_DIR 下')
+}
+
+// ============== AI 经验草稿（手动触发）==============
+// 设计：不自动跑，按钮唤起 → 弹框预览 → 用户编辑 → 走 /experience/submit 入审核队列
+const draftVisible = ref(false)
+const generatingDraft = ref(false)
+const submitting = ref(false)
+const draftSource = ref<'ai' | 'manual'>('ai')
+const draftForm = reactive({
+  skill_name: '',
+  skill_type: 'specific' as 'generic' | 'specific',
+  skill_content: '',
+})
+
+// 持久提示（duration: 0）：让用户知道正在调用 LLM 生成草稿
+const pendingMsg = ref<any>(null)
+function showPendingMsg() {
+  hidePendingMsg()
+  pendingMsg.value = ElMessage({
+    message: '正在生成 AI 经验草稿（5~30 秒，请稍候）…',
+    type: 'info',
+    duration: 0,
+    showClose: false,
+  })
+}
+function hidePendingMsg() {
+  if (pendingMsg.value) {
+    try { pendingMsg.value.close() } catch {}
+    pendingMsg.value = null
+  }
+}
+
+// 从 task_id（compileResult 里存的可能是 "abc123" 这种业务 ID）解析出 DB 主键
+// 后端 generate-draft 接受 int task_id；前端展示的是业务 task_id（字符串）。
+// 解决：用 /compile/tasks/{task_id} 详情接口的 id 字段。
+async function fetchTaskDbId(taskId: string): Promise<number> {
+  const r: any = await api.get(`/compile/tasks/${taskId}`)
+  // request 拦截器已 unwrap response.data → r 是 ApiResponse 的 data 字段（CompileTaskResponse）
+  const t = r?.data ?? r
+  if (t && typeof t.id === 'number') return t.id
+  throw new Error('无法解析 task 主键 id（请检查返回结构）')
+}
+
+async function onGenerateDraft() {
+  if (!compileResult.value?.task_id) { ElMessage.warning('无 task_id'); return }
+  generatingDraft.value = true
+  showPendingMsg()
+  try {
+    const dbId = await fetchTaskDbId(compileResult.value.task_id)
+    const r: any = await api.post('/experience/generate-draft', { task_id: dbId })
+    const data = r?.data ?? r
+    draftForm.skill_name = data?.skill_name || ''
+    draftForm.skill_type = (data?.skill_type === 'generic' || data?.skill_type === 'specific') ? data.skill_type : 'specific'
+    draftForm.skill_content = data?.draft_content || ''
+    draftSource.value = 'ai'
+    draftVisible.value = true
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.response?.data?.message || e?.message || String(e)
+    ElMessage.error('草稿生成失败：' + msg)
+  } finally {
+    generatingDraft.value = false
+    hidePendingMsg()
+  }
+}
+
+async function onSubmitDraft() {
+  if (!compileResult.value?.task_id) { ElMessage.warning('无 task_id'); return }
+  if (!draftForm.skill_name.trim()) { ElMessage.warning('请填写 Skill 名称'); return }
+  if (!draftForm.skill_content.trim() || draftForm.skill_content.length < 10) {
+    ElMessage.warning('SKILL.md 内容不能为空（至少 10 字）'); return
+  }
+  submitting.value = true
+  try {
+    const dbId = await fetchTaskDbId(compileResult.value.task_id)
+    await api.post('/experience/submit', {
+      task_id: dbId,
+      skill_name: draftForm.skill_name.trim(),
+      skill_type: draftForm.skill_type,
+      skill_content: draftForm.skill_content,
+      system_id: form.systemId,
+    })
+    ElMessage.success('已提交经验沉淀请求，等待管理员审核')
+    draftVisible.value = false
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.response?.data?.message || e?.message || String(e)
+    ElMessage.error('提交失败：' + msg)
+  } finally {
+    submitting.value = false
+  }
 }
 
 onUnmounted(() => {

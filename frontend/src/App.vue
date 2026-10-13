@@ -83,6 +83,7 @@ const menuItems = computed(() => {
       { id: 'tickets-admin', ico: '🎫', label: '报错工单管理' },
       { id: 'review', ico: '✅', label: 'Skill 经验审核' },
       { id: 'skilllib', ico: '📚', label: '经验库管理' },
+      { id: 'systems-admin', ico: '🖥️', label: '目标系统管理' },
       { id: 'users', ico: '👥', label: '用户权限管理' },
       { id: 'chat-admin', ico: '💬', label: '对话式答疑' },
     ]

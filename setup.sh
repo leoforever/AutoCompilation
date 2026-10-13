@@ -11,7 +11,10 @@
 #   status   探活报告实际运行情况
 
 set -e
-PROJECT_DIR="/root/.openclaw/workspace/compile-platform"
+# 路径：默认是 setup.sh 所在目录的父目录（即仓库根），可被环境变量覆盖
+# 用法：COMPILE_PLATFORM_DIR=/your/path bash setup.sh install
+: "${COMPILE_PLATFORM_DIR:=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PROJECT_DIR="$COMPILE_PLATFORM_DIR"
 BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 LOG_DIR="$PROJECT_DIR/logs"

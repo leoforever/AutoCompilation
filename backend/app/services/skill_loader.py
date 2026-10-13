@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+    from app.models import Experience, ExperienceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ SKILLS_PATHS: list[str] = get_skills_paths()
 
 def reconcile_all(db: "Session", *, dry_run: bool = False) -> dict:
     """2 状态 reconcile。返回变更计数。"""
-    from app.models import Skill
+    from app.models import Skill, Experience, ExperienceStatus
 
     # 1. 扫磁盘：拿到所有 (type, name) 集合
     disk_keys: set[tuple[str, str]] = set()
@@ -224,22 +225,27 @@ def reconcile_all(db: "Session", *, dry_run: bool = False) -> dict:
             db.rollback()
             logger.warning("[reconcile] disk_only 插入失败 %s/%s: %s", skill_type, skill_name, e)
 
-    # 4. db_only：软删（设 deleted_at，DB 行保留作备份）
-    # 恢复方式：调用 POST /admin/skills/{id}/restore
-    # 永久删除：调用 DELETE /admin/skills/{id}/permanent
+    # 4. db_only：磁盘没有的 Skill 行 DB 硬删（删 = 真删）
+    # 注：这里的 DB 行清理等同于手动 DELETE /skills/{id} 路径 — 同步级联清 Experience
     for key in db_only_keys:
         skill_type, skill_name = key
         try:
             skill = db_skills[key]
-            if skill.deleted_at is None:
-                if not dry_run:
-                    skill.deleted_at = datetime.utcnow()
-                    db.commit()
-                logger.info("[reconcile] db_only → soft delete %s/%s", skill_type, skill_name)
+            if not dry_run:
+                # 级联清关联 approved/synced Experience 行
+                related_exps = db.query(Experience).filter(
+                    Experience.skill_name == skill.name,
+                    Experience.status.in_([ExperienceStatus.APPROVED.value, ExperienceStatus.SYNCED.value]),
+                ).all()
+                for e in related_exps:
+                    db.delete(e)
+                db.delete(skill)
+                db.commit()
+            logger.info("[reconcile] db_only → delete %s/%s", skill_type, skill_name)
             stats["db_only"] += 1
         except Exception as e:
             db.rollback()
-            logger.warning("[reconcile] db_only 标记失败 %s/%s: %s", skill_type, skill_name, e)
+            logger.warning("[reconcile] db_only 删除失败 %s/%s: %s", skill_type, skill_name, e)
 
     return stats
 

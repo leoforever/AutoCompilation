@@ -9,14 +9,17 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from app.models import get_db, Experience, Skill, CompileTask, TargetSystem, ExperienceStatus
+from app.models import get_db, Experience, Skill, CompileTask, TargetSystem, ExperienceStatus, User
 from app.schemas import (
     ExperienceSubmit, ExperienceResponse, SkillCreate, SkillUpdate, SkillResponse,
     ApiResponse
 )
 from app.services.skill_loader import write_skill_to_disk
+from app.dependencies import get_current_user
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/submit", response_model=ApiResponse)
@@ -26,19 +29,37 @@ async def submit_experience(
     current_user_id: int = 1  # TODO: 从 session 获取
 ):
     """提交编译经验"""
-    # 验证任务存在且成功
+    # 验证任务存在
     task = db.query(CompileTask).filter(CompileTask.id == exp_data.task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="关联任务不存在")
-    if task.status.value != "success":
-        raise HTTPException(status_code=400, detail="只有成功的编译任务才能提交经验")
+    # 允许 success 和 failed 状态（CompileTask.status 是 String(20)，存的是 str）
+    # failed 经验比成功经验更宝贵（告诉后续用户"别这样编"）
+    if task.status not in ("success", "failed"):
+        raise HTTPException(status_code=400, detail="只有已完成（成功或失败）的编译任务才能提交经验")
     
-    # 检查是否已提交过
+    # 检查是否已有 pending 中的经验（submitted / under_review）
+    # 允许 rejected → 用户可修改后重新提
+    # 允许 superseded → 已被取代，旧 approve 行被清掉后用户再提
+    # 阻止 approved / synced → 当前 Skill 还在 DB + 磁盘，重复提等于覆盖；走 admin 改
     existing = db.query(Experience).filter(
-        Experience.task_id == exp_data.task_id
+        Experience.task_id == exp_data.task_id,
+        Experience.status.in_([
+            ExperienceStatus.SUBMITTED.value,
+            ExperienceStatus.UNDER_REVIEW.value,
+            ExperienceStatus.APPROVED.value,
+            ExperienceStatus.SYNCED.value,
+        ]),
     ).first()
     if existing:
-        raise HTTPException(status_code=400, detail="该任务已提交过经验")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"该任务已有 {existing.status} 经验（eid={existing.experience_id}, "
+                f"skill={existing.skill_name}），请勿重复提交。"
+                f"如需更新 Skill 内容，请到「经验库管理」修改对应 SKILL.md 后重新提交"
+            ),
+        )
     
     # 创建经验记录
     experience = Experience(
@@ -109,6 +130,20 @@ async def approve_experience(
     if not experience:
         raise HTTPException(status_code=404, detail="经验不存在")
 
+    # 清掉同名 skill 的旧 approved/synced 行（保证"approved 唯一对应有效 Skill"）
+    # 这些行的内容已被新 approve 覆盖，留着会脏数据 + 触发虚假 400
+    old_approved = db.query(Experience).filter(
+        Experience.skill_name == experience.skill_name,
+        Experience.status.in_([ExperienceStatus.APPROVED.value, ExperienceStatus.SYNCED.value]),
+        Experience.experience_id != experience_id,
+    ).all()
+    for old in old_approved:
+        old.status = "superseded"
+        old.reviewed_at = datetime.utcnow()
+    if old_approved:
+        logger.info("[approve_experience] skill_name=%s 标 superseded %d 行",
+                    experience.skill_name, len(old_approved))
+
     experience.status = ExperienceStatus.APPROVED
     experience.reviewed_at = datetime.utcnow()
 
@@ -169,10 +204,53 @@ async def reject_experience(
     experience.status = ExperienceStatus.REJECTED
     experience.rejection_reason = reason
     experience.reviewed_at = datetime.utcnow()
-    
+
     db.commit()
-    
+
     return ApiResponse(message="经验已驳回")
+
+
+@router.post("/generate-draft", response_model=ApiResponse)
+async def generate_experience_draft(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """手动触发：根据已完成 task 生成经验草稿（AI 后置总结）
+
+    Body: { "task_id": int }
+    - 仅 SUCCESS / FAILED 状态可触发（其它状态直接 400）
+    - 调用方必须为 task 所有者或管理员，否则 403
+    - 草稿不入 DB，前端拿到后由用户编辑再走 /experience/submit
+    - LLM 配置复用 compile_engine：AI_API_KEY / AI_BASE_URL / AI_MODEL
+    """
+    from app.services.experience_generator import generate_draft
+
+    task_id = body.get("task_id") if isinstance(body, dict) else None
+    if not isinstance(task_id, int):
+        raise HTTPException(status_code=422, detail="body.task_id 必须是整数")
+
+    task = db.query(CompileTask).filter(CompileTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task 不存在")
+    if current_user.role != "admin" and task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+
+    try:
+        result = generate_draft(db, task_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        # 任务未结束 / LLM 失败 / 草稿不合法
+        msg = str(e)
+        if "未结束" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=500, detail=msg)
+
+    return ApiResponse(
+        message="草稿生成成功",
+        data=result,
+    )
 
 
 import json

@@ -36,15 +36,14 @@ class UserResponse(BaseModel):
 class TargetSystemCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     name: str = Field(..., min_length=1, max_length=100)
-    arch: str = Field(..., pattern="^loongarch64$")
-    base_image: str = Field(..., min_length=1)
-    tag: Optional[str] = "latest"
+    # 镜像（不含 tag，admin 写完整 image:tag 字符串，如 loongnix-build:23.2）
+    # 默认值给老数据迁移兜底（init_db seed 走老 path 时不写也会用默认）
+    base_image: str = Field(default="loongnix-build:23.2", min_length=1)
 
 
 class TargetSystemUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
-    base_image: Optional[str]
-    tag: Optional[str]
+    base_image: Optional[str] = Field(None, min_length=1)
     is_active: Optional[bool]
 
 
@@ -52,12 +51,10 @@ class TargetSystemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     system_id: int
     name: str
-    arch: str
     base_image: str
-    tag: Optional[str]
     is_active: bool
-    created_at: Optional[datetime]
-
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 # ==================== 编译任务 ====================
 

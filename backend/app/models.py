@@ -74,6 +74,8 @@ class ExperienceStatus(str, enum.Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     SYNCED = "synced"
+    # 已被新版本/删除取代（旧 approved 行被新 approve 或被删 Skill 级联清时标）
+    SUPERSEDED = "superseded"
 
 
 class UserRole(str, enum.Enum):
@@ -108,10 +110,8 @@ class TargetSystem(Base):
     __tablename__ = "target_systems"
 
     system_id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)  # 如：openEuler 24.03 LTS
-    arch = Column(String(20), nullable=False)   # 如：loongarch64
-    base_image = Column(String(255), nullable=False)  # Docker/Podman 镜像
-    tag = Column(String(50))
+    name = Column(String(100), unique=True, nullable=False)  # 如：openEuler 24.03 LTS
+    base_image = Column(String(255), nullable=False)  # Docker/Podman 镜像（不含 tag）
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -278,14 +278,43 @@ def _safe_drop_column(table_name: str, column_name: str):
 
 
 def init_db():
-    """初始化数据库（创建所有表 + 幂等迁移）"""
+    """初始化数据库（创建所有表 + 幂等迁移 + 种子数据）"""
     Base.metadata.create_all(bind=engine)
     # 幂等迁移：新增字段（老库升级用）
     _safe_add_column("skills", "source", "VARCHAR(20) DEFAULT 'admin'")
     _safe_add_column("skills", "deleted_at", "TIMESTAMP NULL")
-    # 幂等迁移：删字段（sync_status 在 2026-10-12 简化后不再用）
+    # 幂等迁移：删字段
     _safe_drop_column("skills", "sync_status")
+    # 2026-10-13: TargetSystem 简化（drop arch / tag，只用 name + base_image）
+    _safe_drop_column("target_systems", "arch")
+    _safe_drop_column("target_systems", "tag")
+    # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
+    _seed_default_target_systems()
     logger.info("Database initialized")
+
+
+def _seed_default_target_systems():
+    """seed 默认的目标系统（idempotent，已存在跳过）"""
+    defaults = [
+        {
+            "name": "openEuler 24.03 LTS",
+            "base_image": "loongnix-build:23.2",
+        },
+    ]
+    db = SessionLocal()
+    try:
+        for s in defaults:
+            existing = db.query(TargetSystem).filter(TargetSystem.name == s["name"]).first()
+            if existing:
+                continue
+            db.add(TargetSystem(name=s["name"], base_image=s["base_image"]))
+            logger.info("Seeded target_system: %s", s["name"])
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning("Seed target_systems failed: %s", e)
+    finally:
+        db.close()
 
 
 def get_db():

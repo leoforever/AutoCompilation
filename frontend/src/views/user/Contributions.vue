@@ -86,7 +86,7 @@ async function loadExperiences() {
   const res = await api.get('/experience/my')
   experiences.value = res.data || []
   
-  // 统计
+  // 统计（superseded 不单列卡片，列表中以"已取代"标签呈现）
   stats.value = {
     total: experiences.value.length,
     approved: experiences.value.filter(e => e.status === 'approved').length,
@@ -102,6 +102,7 @@ function expStatusType(status: string) {
     submitted: 'info',
     under_review: 'warning',
     synced: 'success',
+    superseded: 'info',
   }
   return map[status] || 'info'
 }
@@ -113,6 +114,7 @@ function expStatusText(status: string) {
     submitted: '待审核',
     under_review: '审核中',
     synced: '已同步',
+    superseded: '已取代',
   }
   return map[status] || status
 }

@@ -50,11 +50,18 @@
             {{ formatDate(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240">
+        <el-table-column label="操作" width="280">
           <template #default="{ row }">
             <el-button size="small" @click="viewLog(row)">日志</el-button>
             <el-button v-if="row.status === 'success'" size="small" @click="downloadArtifact(row)">下载</el-button>
             <el-button v-if="row.status === 'failed'" size="small" type="danger" @click="reportTicket(row)">一键上报</el-button>
+            <el-button
+              v-if="row.status === 'success' || row.status === 'failed'"
+              size="small"
+              type="success"
+              :loading="generatingDraftIds.has(row.id)"
+              :disabled="generatingDraftIds.has(row.id)"
+              @click="onGenerateDraft(row)">✨ 沉淀经验</el-button>
             <el-button v-if="row.status === 'submitted' || row.status === 'compiling'" size="small" type="warning" @click="cancelTask(row)">取消</el-button>
             <el-button v-if="row.status === 'success' || row.status === 'failed' || row.status === 'cancelled'" size="small" type="primary" @click="retryTask(row)">重试</el-button>
           </template>
@@ -80,11 +87,41 @@
         <el-button @click="logDialogVisible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <!-- 经验草稿预览/编辑/提交 对话框（与 Workbench 共用逻辑） -->
+    <el-dialog v-model="draftVisible" title="✨ AI 生成的经验草稿" width="780px" :close-on-click-modal="false">
+      <el-alert
+        type="success"
+        :closable="false"
+        show-icon
+        title="由 AI 基于本任务日志总结；请检查后修改再提交，管理员审核通过后会入库到 Skill 库"
+        style="margin-bottom: 12px"
+      />
+      <div class="field" style="margin-bottom: 10px">
+        <label>Skill 名称（slug）</label>
+        <el-input v-model="draftForm.skill_name" placeholder="如 ollama-openeuler-2403" />
+      </div>
+      <div class="field" style="margin-bottom: 10px">
+        <label>类型</label>
+        <el-radio-group v-model="draftForm.skill_type">
+          <el-radio value="generic">通用（工具链 / 环境 / 错误经验）</el-radio>
+          <el-radio value="specific">专用（单软件编译）</el-radio>
+        </el-radio-group>
+      </div>
+      <div class="field">
+        <label>SKILL.md 内容</label>
+        <el-input v-model="draftForm.skill_content" type="textarea" :rows="18" resize="vertical" />
+      </div>
+      <template #footer>
+        <el-button @click="draftVisible = false">取消</el-button>
+        <el-button type="primary" :loading="submitting" @click="onSubmitDraft">提交审核</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import api from '@/utils/request'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -204,6 +241,96 @@ async function retryTask(task: any) {
     }
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '重试失败')
+  }
+}
+
+// ============== AI 经验草稿（手动触发，与 Workbench 同逻辑）==============
+const draftVisible = ref(false)
+const submitting = ref(false)
+// 多任务行并行生成可能同时进行，按 id 区分 loading 态
+const generatingDraftIds = ref<Set<number>>(new Set())
+// 持久提示（duration: 0）：让用户知道正在调用 LLM 生成草稿（可能较慢）
+const pendingMsg = ref<any>(null)
+function showPendingMsg(taskId: number) {
+    hidePendingMsg()
+    pendingMsg.value = ElMessage({
+        message: `正在为任务 #${taskId} 生成 AI 经验草稿（5~30 秒，请稍候）…`,
+        type: 'info',
+        duration: 0,
+        showClose: false,
+    })
+}
+function hidePendingMsg() {
+    if (pendingMsg.value) {
+        try { pendingMsg.value.close() } catch {}
+        pendingMsg.value = null
+    }
+}
+// 当前正在操作的任务（含 system_id，提交时用）
+const draftTask = ref<any>(null)
+const draftForm = reactive({
+  skill_name: '',
+  skill_type: 'specific' as 'generic' | 'specific',
+  skill_content: '',
+})
+
+// 业务 task_id → DB 主键 id
+async function fetchTaskDbId(taskId: string): Promise<number> {
+  const r: any = await api.get(`/compile/tasks/${taskId}`)
+  const t = r?.data ?? r
+  if (t && typeof t.id === 'number') return t.id
+  throw new Error('无法解析 task 主键 id')
+}
+
+async function onGenerateDraft(task: any) {
+  if (generatingDraftIds.value.has(task.id)) return  // 防重复点
+  draftTask.value = task
+  generatingDraftIds.value.add(task.id)
+  // 触发响应式（Set 不会自动追踪，需替换）
+  generatingDraftIds.value = new Set(generatingDraftIds.value)
+  showPendingMsg(task.id)
+  try {
+    const dbId = await fetchTaskDbId(task.task_id)
+    const r: any = await api.post('/experience/generate-draft', { task_id: dbId })
+    const data = r?.data ?? r
+    draftForm.skill_name = data?.skill_name || ''
+    draftForm.skill_type = (data?.skill_type === 'generic' || data?.skill_type === 'specific') ? data.skill_type : 'specific'
+    draftForm.skill_content = data?.draft_content || ''
+    draftVisible.value = true
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.response?.data?.message || e?.message || String(e)
+    ElMessage.error('草稿生成失败：' + msg)
+  } finally {
+    generatingDraftIds.value.delete(task.id)
+    generatingDraftIds.value = new Set(generatingDraftIds.value)
+    hidePendingMsg()
+  }
+}
+
+async function onSubmitDraft() {
+  const task = draftTask.value
+  if (!task) return
+  if (!draftForm.skill_name.trim()) { ElMessage.warning('请填写 Skill 名称'); return }
+  if (!draftForm.skill_content.trim() || draftForm.skill_content.length < 10) {
+    ElMessage.warning('SKILL.md 内容不能为空（至少 10 字）'); return
+  }
+  submitting.value = true
+  try {
+    const dbId = await fetchTaskDbId(task.task_id)
+    await api.post('/experience/submit', {
+      task_id: dbId,
+      skill_name: draftForm.skill_name.trim(),
+      skill_type: draftForm.skill_type,
+      skill_content: draftForm.skill_content,
+      system_id: task.system_id,
+    })
+    ElMessage.success('已提交经验沉淀请求，等待管理员审核')
+    draftVisible.value = false
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.response?.data?.message || e?.message || String(e)
+    ElMessage.error('提交失败：' + msg)
+  } finally {
+    submitting.value = false
   }
 }
 

@@ -46,9 +46,6 @@ def _ai_api_key() -> str:
 def _ai_base_url() -> str:
     return os.environ.get("AI_BASE_URL", "")
 
-def _docker_image() -> str:
-    return os.environ.get("DOCKER_IMAGE", "loongnix-build:23.2")
-
 def _max_retries() -> int:
     return int(os.environ.get("MAX_RETRIES", "4"))
 
@@ -71,10 +68,13 @@ class TaskState(TypedDict, total=False):
     git_branch: str
     commit_hash: str
     system_id: str
-    env_id: str
+    system_name: str
+    # stage2 从 DB TargetSystem.base_image 读取的完整镜像名（含 tag）
+    docker_image: str
     container_id: str
     work_dir: str
     container_work_dir: str
+    host_log_path: str  # 宿主机 build.log 路径（兜底双写用）
     build_logs: list
     current_attempt: int
     last_error: str
@@ -176,24 +176,22 @@ def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallbac
         "log_output": "",
         "status": TaskStatus.COMPILING.value,
         "container_id": "",
-        "env_id": "",
     })
     _log(state, "info", f"[阶段1] 任务初始化: {task.task_id} / {task.software_name}", on_log)
     return state
 
 
 # ==================== 阶段 2 ====================
-# system name -> env_id 映射
-# name 来自 TargetSystem.name（如 "openEuler 24.03 LTS"），由 engine 从 DB 读
-ENV_BY_NAME = {
-    "openEuler 24.03": {"env_id": "loongarch64-openeuler-2403"},
-    "openEuler 24.03 LTS": {"env_id": "loongarch64-openeuler-2403"},
-    "Ubuntu 22.04": {"env_id": "x86_64-ubuntu-2204"},
-}
+# 之前是 ENV_BY_NAME 硬编码字典映射 system.name → env_id。
+# 2026-10-13 改造：从 DB 读 TargetSystem.base_image 直接用，不再硬编码。
+# base_image 字段已含完整 image:tag 字符串（admin 端可改），worker 拿啥用啥。
+# env_id 字段保留但含义改为"构建系统标识"，用于 docker exec 时的环境变量注入。
+# 系统为空时 stage2 显式报错，admin 知道要去 /admin/systems 配。
+DEFAULT_BASE_IMAGE = "loongnix-build:23.2"  # DB 字段为空时的兜底（实际不会走这里）
 
 
 def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
-    """从 DB 读 TargetSystem，按 name 匹配 ENV_BY_NAME"""
+    """从 DB 读 TargetSystem，按 name 匹配 base_image + 给 env_id 兜底值"""
     from app.models import SessionLocal, TargetSystem
     db = SessionLocal()
     try:
@@ -202,18 +200,16 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         ).first()
         if not sys_rec:
             state["status"] = TaskStatus.FAILED.value
-            state["last_error"] = f"目标系统 ID {state.get('system_id')} 不存在"
+            state["last_error"] = (
+                f"目标系统 ID {state.get('system_id')} 不存在。"
+                f"管理员需在 /admin/systems 添加。"
+            )
             _log(state, "error", state["last_error"], on_log)
             return state
-        cfg = ENV_BY_NAME.get(sys_rec.name)
-        if not cfg:
-            state["status"] = TaskStatus.FAILED.value
-            state["last_error"] = f"不支持的的系统: name={sys_rec.name!r}"
-            _log(state, "error", state["last_error"], on_log)
-            return state
-        state["env_id"] = cfg["env_id"]
-        state["system_name"] = sys_rec.name  # 后续 stage 备用
-        _log(state, "info", f"[阶段2] 环境匹配: {cfg['env_id']} (system={sys_rec.name})", on_log)
+        state["system_name"] = sys_rec.name
+        # base_image 是 admin 配置的完整镜像名（含 tag）
+        state["docker_image"] = sys_rec.base_image or DEFAULT_BASE_IMAGE
+        _log(state, "info", f"[阶段2] 环境匹配: {sys_rec.name} (image={state['docker_image']})", on_log)
     finally:
         db.close()
     return state
@@ -237,7 +233,10 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback]) -> 
     state["host_log_path"] = str(base_dir / "build.log")
 
     try:
-        image = _docker_image()
+        # 镜像名从 stage2 读 DB 拿（admin 在 /admin/systems 配的）
+        # state["docker_image"] 一定有值（DB 字段非空 + DEFAULT 兜底）
+        image = state.get("docker_image") or "loongnix-build:23.2"
+        _log(state, "info", f"[阶段3] 使用镜像: {image}", on_log)
         volumes = {
             str(container_work): {"bind": state["container_work_dir"], "mode": "rw"},
         }

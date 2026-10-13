@@ -16,8 +16,10 @@ from app.schemas import (
     StatsOverview, ApiResponse
 )
 from app.services.skill_loader import write_skill_to_disk, remove_skill_from_disk
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ==================== 统计看板 ====================
@@ -322,37 +324,54 @@ async def delete_skill(
     skill_id: int,
     db: Session = Depends(get_db)
 ):
-    """删除 Skill（软删：清磁盘 + DB 标 deleted_at，备份用）
+    """删除 Skill（真删）：DB 硬删 Skill 行 + 删磁盘 SKILL.md + 级联清关联 Experience 行
 
-    恢复方式：POST /admin/skills/{id}/restore
-    永久删除：DELETE /admin/skills/{id}/permanent
+    一致性保证：磁盘 = source of truth，DB = derived cache。删 Skill 后：
+      - 磁盘 SKILL.md 删
+      - DB Skills 行删
+      - 关联的 Experience 行（同 skill_name 且 status='approved'/'synced'）一并删
+        避免下次有人提交同 task 时 400 报"已有经验"但实际 Skill 已被删
+
+    旧版设计有"软删 + 回收站"，已废弃（接口保留返回 404/空避免前端点错）
     """
+    from app.models import Experience, ExperienceStatus
+
     skill = db.query(Skill).filter(Skill.skill_id == skill_id).first()
     if not skill:
         raise HTTPException(status_code=404, detail="Skill 不存在")
-    if skill.deleted_at is not None:
-        # 已经是软删状态，不重复设
-        return ApiResponse(message="Skill 已在回收站")
 
     skill_type = str(skill.type)
     skill_name = str(skill.name)
 
-    # 软删：设 deleted_at
-    skill.deleted_at = datetime.utcnow()
+    # 1) 级联清关联 Experience 行（approved/synced 状态；submitted/rejected 留给用户后续走完）
+    related_exps = db.query(Experience).filter(
+        Experience.skill_name == skill_name,
+        Experience.status.in_([ExperienceStatus.APPROVED.value, ExperienceStatus.SYNCED.value]),
+    ).all()
+    related_count = len(related_exps)
+    for e in related_exps:
+        db.delete(e)
+    if related_count:
+        logger.info("[delete_skill] 级联清 %d 条关联 Experience 行（skill_name=%s）", related_count, skill_name)
+
+    # 2) DB 硬删 Skill 行
+    db.delete(skill)
     try:
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB 标记失败: {e}")
+        raise HTTPException(status_code=500, detail=f"DB 删 Skill 失败: {e}")
 
-    # 同步清磁盘（失败不致命 — DB 已标，磁盘残留下次 reconcile 也会清）
+    # 3) 同步删磁盘（失败不致命 — DB 已删；磁盘残留下次 reconcile 会清）
     try:
         remove_skill_from_disk(skill_type, skill_name)
     except RuntimeError as e:
-        import logging
-        logging.warning("清磁盘失败（DB 已软删）: %s", e)
+        logger.warning("清磁盘失败（DB 已删）: %s", e)
 
-    return ApiResponse(message="Skill 已删除（回收站可恢复）")
+    msg = f"Skill 已删除：{skill_name}"
+    if related_count:
+        msg += f"（同时清理 {related_count} 条关联经验）"
+    return ApiResponse(message=msg)
 
 
 def _parse_frontmatter_field(content: str, field: str) -> str | None:
@@ -406,9 +425,8 @@ async def reconcile_skills(db: Session = Depends(get_db)):
 
 @router.get("/skills/trash", response_model=ApiResponse)
 async def list_trash_skills(db: Session = Depends(get_db)):
-    """列出回收站里的 skill（已软删，可恢复）"""
-    skills = db.query(Skill).filter(Skill.deleted_at.isnot(None)).order_by(Skill.deleted_at.desc()).all()
-    return ApiResponse(data=[SkillResponse.model_validate(s).model_dump() for s in skills])
+    """回收站机制已下线（删 = 真删）。保留接口返空，兼容前端可能残留的菜单"""
+    return ApiResponse(message="回收站机制已下线，删除即真删", data=[])
 
 
 @router.post("/skills/{skill_id}/restore", response_model=ApiResponse)
@@ -416,35 +434,8 @@ async def restore_skill_from_trash(
     skill_id: int,
     db: Session = Depends(get_db)
 ):
-    """从回收站恢复 skill：写盘 + 清 deleted_at
-
-    如果磁盘上已经有同名 skill 文件，直接覆盖（disk 改了就改了）
-    """
-    from app.services.skill_loader import write_skill_to_disk
-
-    skill = db.query(Skill).filter(Skill.skill_id == skill_id).first()
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-    if skill.deleted_at is None:
-        raise HTTPException(status_code=400, detail="Skill 未在回收站，无需恢复")
-
-    try:
-        write_skill_to_disk(
-            skill_type=str(skill.type),
-            skill_name=str(skill.name),
-            content=str(skill.skill_content or ""),
-            version=str(skill.version) if skill.version else None,
-        )
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(status_code=500, detail=f"写盘失败: {e}")
-
-    skill.deleted_at = None
-    db.commit()
-    db.refresh(skill)
-    return ApiResponse(
-        message=f"已恢复 {skill.name} 到磁盘",
-        data=SkillResponse.model_validate(skill).model_dump(),
-    )
+    """回收站机制已下线，永远 410"""
+    raise HTTPException(status_code=410, detail="回收站机制已下线，无法恢复；如需重新入库请走 experience 流程")
 
 
 @router.delete("/skills/{skill_id}/permanent", response_model=ApiResponse)
@@ -452,23 +443,18 @@ async def permanently_delete_skill(
     skill_id: int,
     db: Session = Depends(get_db)
 ):
-    """永久删除 skill（从 DB 硬删，不可恢复）
+    """兼容保留：调 DELETE /skills/{id} 即真删（包括磁盘），permanent 端点不再额外做事
 
-    磁盘文件不管（用户可能想保留）
+    旧版语义：从 DB 硬删（磁盘文件不管）。新版 DELETE /skills/{id} 已包含磁盘删。
+    留这个接口兼容老前端，但功能已被 DELETE 覆盖。
+    raise HTTPException 让前端明确：本路由该 skill 不存在即可
     """
     skill = db.query(Skill).filter(Skill.skill_id == skill_id).first()
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-
-    skill_name = str(skill.name)
-    db.delete(skill)
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB 硬删失败: {e}")
-
-    return ApiResponse(message=f"已永久删除 {skill_name}（不可恢复）")
+    if skill:
+        # 走 DELETE /skills/{id} 的逻辑：DB 硬删 + 磁盘删 + 级联清 Experience
+        # 这里直接调 delete_skill 实现（避免重复代码）
+        return await delete_skill(skill_id, db)
+    raise HTTPException(status_code=404, detail="Skill 不存在（请用 DELETE /admin/skills/{id}）")
 
 
 # ==================== 目标系统管理 ====================
@@ -495,16 +481,22 @@ async def create_system(
     db: Session = Depends(get_db)
 ):
     """新增目标系统"""
+    # 唯一性检查（schema 不会报，但 DB unique constraint 会让 commit 抛 IntegrityError）
+    existing = db.query(TargetSystem).filter(TargetSystem.name == system_data.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"系统名已存在: {system_data.name}")
     system = TargetSystem(
         name=system_data.name,
-        arch=system_data.arch,
         base_image=system_data.base_image,
-        tag=system_data.tag or "latest"
     )
     db.add(system)
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
     db.refresh(system)
-    
+
     return ApiResponse(data=TargetSystemResponse.model_validate(system).model_dump())
 
 
@@ -518,19 +510,28 @@ async def update_system(
     system = db.query(TargetSystem).filter(TargetSystem.system_id == system_id).first()
     if not system:
         raise HTTPException(status_code=404, detail="目标系统不存在")
-    
-    if system_data.name:
+
+    # 改名时检查新名不冲突
+    if system_data.name and system_data.name != system.name:
+        clash = db.query(TargetSystem).filter(
+            TargetSystem.name == system_data.name,
+            TargetSystem.system_id != system_id,
+        ).first()
+        if clash:
+            raise HTTPException(status_code=400, detail=f"系统名已存在: {system_data.name}")
         system.name = system_data.name
     if system_data.base_image:
         system.base_image = system_data.base_image
-    if system_data.tag is not None:
-        system.tag = system_data.tag
     if system_data.is_active is not None:
         system.is_active = system_data.is_active
-    
-    db.commit()
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB 更新失败: {e}")
     db.refresh(system)
-    
+
     return ApiResponse(data=TargetSystemResponse.model_validate(system).model_dump())
 
 
