@@ -14,7 +14,17 @@ logger = logging.getLogger(__name__)
 # 加载配置文件
 import os
 import yaml
-BASE_DIR = '/root/.openclaw/workspace/compile-platform/backend'
+from pathlib import Path
+
+# 仓库根：默认从本文件位置推断（backend/app/models.py → 往上跳 2 层是仓库根）
+# 可被 COMPILE_PLATFORM_DIR 环境变量覆盖（与 setup.sh 同源）
+# 用法：COMPILE_PLATFORM_DIR=/your/path python -m ...
+_PROJECT_ROOT_ENV = os.environ.get("COMPILE_PLATFORM_DIR")
+if _PROJECT_ROOT_ENV:
+    BASE_DIR = os.path.join(_PROJECT_ROOT_ENV, "backend")
+else:
+    # models.py 在 backend/app/，往上两级到仓库根，再加 backend
+    BASE_DIR = str(Path(__file__).resolve().parents[1])
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
 
 def load_db_config():

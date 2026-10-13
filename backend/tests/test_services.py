@@ -2,14 +2,27 @@
 import asyncio
 import os
 import uuid
+from pathlib import Path
 
 import pytest
+
+
+# 仓库根：tests/test_services.py → 往上 2 层到 backend/，再 1 层到仓库根
+REPO_ROOT = Path(__file__).resolve().parents[2]
+APP_ROOT = REPO_ROOT / "backend" / "app"
+
+
+def _path(*parts) -> str:
+    """根据仓库根拼路径（替代原绝对路径硬编码）"""
+    return str(APP_ROOT.joinpath(*parts))
 
 
 # ===================== skill_loader =====================
 def test_skill_loader_path():
     from app.services.skill_loader import SKILLS_DIR_HOST
-    assert str(SKILLS_DIR_HOST) == "/root/.openclaw/workspace/compile-platform/skills"
+    # SKILLS_DIR_HOST 推断自 skill_loader.py 的 __file__，应该是仓库根 / skills
+    import re
+    assert re.search(r'/skills$', str(SKILLS_DIR_HOST)), f"应指向 */skills: {SKILLS_DIR_HOST}"
 
 
 def test_skill_loader_count():
@@ -145,7 +158,7 @@ def test_stage4a_failure_does_not_hang(tmp_path):
 
 def test_compile_engine_no_hardcoded_url():
     """system_prompt 不再硬编码 golang 等下载 URL"""
-    path = "/root/.openclaw/workspace/compile-platform/backend/app/services/compile_engine.py"
+    path = _path("services", "compile_engine.py")
     with open(path) as f:
         code = f.read()
     assert "go.dev/dl/go1.27.2" not in code
@@ -154,7 +167,7 @@ def test_compile_engine_no_hardcoded_url():
 
 def test_compile_engine_skill_prompt_present():
     """system_prompt 含 '从 Skill 读' 指引"""
-    path = "/root/.openclaw/workspace/compile-platform/backend/app/services/compile_engine.py"
+    path = _path("services", "compile_engine.py")
     with open(path) as f:
         code = f.read()
     assert "Skill 读" in code or "从 Skill 读" in code
@@ -236,7 +249,7 @@ def test_ws_broadcaster_pubsub():
 def test_worker_constants():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "worker", "/root/.openclaw/workspace/compile-platform/backend/worker.py"
+        "worker", str(REPO_ROOT / "backend" / "worker.py")
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -250,7 +263,7 @@ def test_worker_constants():
 # ===================== routes/compile =====================
 def test_route_compile_enqueues():
     """POST /submit 末尾调 task_queue.enqueue"""
-    with open("/root/.openclaw/workspace/compile-platform/backend/app/routes/compile.py") as f:
+    with open(_path("routes", "compile.py")) as f:
         src = f.read()
     assert "from app.services import task_queue" in src
     assert "task_queue.enqueue(task_id)" in src
@@ -258,7 +271,7 @@ def test_route_compile_enqueues():
 
 def test_route_compile_preserves_api():
     """API 路径未改"""
-    with open("/root/.openclaw/workspace/compile-platform/backend/app/routes/compile.py") as f:
+    with open(_path("routes", "compile.py")) as f:
         src = f.read()
     assert '@router.post("/submit"' in src
     assert '@router.get("/tasks"' in src
@@ -266,7 +279,7 @@ def test_route_compile_preserves_api():
 
 # ===================== routes/ws =====================
 def test_route_ws_uses_broadcaster():
-    with open("/root/.openclaw/workspace/compile-platform/backend/app/routes/ws.py") as f:
+    with open(_path("routes", "ws.py")) as f:
         src = f.read()
     assert "from app.services.ws_broadcaster import BROADCASTER" in src
     assert "BROADCASTER.subscribe" in src
@@ -313,7 +326,7 @@ def test_skills_middleware_in_container():
 # ===================== submit 路径回归 =====================
 def test_submit_status_returns_string():
     """POST /submit 返回 dict["status"] 必须是字符串（不是 enum）"""
-    with open("/root/.openclaw/workspace/compile-platform/backend/app/routes/compile.py") as f:
+    with open(_path("routes", "compile.py")) as f:
         src = f.read()
     # 修过的代码用 str(task.status)，不能再用 .value（str 没 .value 属性）
     assert '"status": str(task.status),' in src, \
@@ -322,7 +335,7 @@ def test_submit_status_returns_string():
 
 def test_submit_returns_task_id():
     """POST /submit 返回值含 task_id + status 两个键"""
-    with open("/root/.openclaw/workspace/compile-platform/backend/app/routes/compile.py") as f:
+    with open(_path("routes", "compile.py")) as f:
         src = f.read()
     assert '"task_id": task.task_id' in src
     assert '"status": str(task.status)' in src

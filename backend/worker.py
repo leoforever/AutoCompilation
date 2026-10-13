@@ -1,7 +1,7 @@
 """编译 worker - 独立进程入口
 
-启动：
-    cd /root/.openclaw/workspace/compile-platform/backend
+启动（任意部署路径下）：
+    cd <仓库根>/backend
     python worker.py
 
 工作循环：

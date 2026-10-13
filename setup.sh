@@ -153,17 +153,31 @@ do_install() {
         warn "PostgreSQL 未安装，正在安装..."
         dnf install -y postgresql-server postgresql-contrib \
             || yum install -y postgresql-server postgresql-contrib
-        sudo -u postgres /usr/bin/postgresql-setup --initdb \
-            || warn "postgresql-setup --initdb 失败（可能已初始化），继续"
+        # 幂等：重复跑 install 时 DB 已初始化（initdb 报错"already initialized"）属正常
+        if sudo -u postgres /usr/bin/postgresql-setup --initdb 2>/dev/null; then
+            info "PostgreSQL 已初始化"
+        else
+            info "PostgreSQL 已初始化（initdb 跳过 — 重复运行 install 时属正常）"
+        fi
         sudo systemctl enable postgresql 2>/dev/null || true
         sudo systemctl start postgresql 2>/dev/null || true
         sleep 2
+    else
+        info "PostgreSQL 已安装"
+        # 已安装但服务可能未启动（机器重启后）— 探活 + 启
+        if ! pg_isready -q 2>/dev/null; then
+            sudo systemctl start postgresql 2>/dev/null || true
+            sleep 2
+        fi
+        info "PostgreSQL 服务运行中"
     fi
 
     info "检查 git（worker 克隆源码用）..."
     if ! command -v git &>/dev/null; then
         warn "git 未安装，正在安装..."
         dnf install -y git || yum install -y git
+    else
+        info "git 已安装"
     fi
 
     info "检查 docker daemon（worker 编译沙箱依赖）..."
@@ -172,6 +186,8 @@ do_install() {
         warn "编译平台 worker 通过 Docker 起容器，缺 docker 后端能起但编译任务全挂"
         warn "请手动安装 docker（https://docs.docker.com/engine/install/）后重跑"
         # 不强制退出 —— 让后端能起来，编译功能等 docker 装好再 work
+    else
+        info "docker 已安装"
     fi
 
     info "创建数据库用户和数据库..."
@@ -184,7 +200,8 @@ do_install() {
 
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
-    npm install
+    # npm install 本身幂等（已装会 skip）；加 --no-audit --no-fund 加速
+    npm install --no-audit --no-fund --silent 2>&1 | tail -20
     # 不主动拉 docker 镜像：每个目标系统的镜像地址 / tag 由部署者配 DOCKER_IMAGE，
     # 第一次编译任务提交时 worker 会自动 docker pull。强制 install 阶段拉只会拖慢。
 

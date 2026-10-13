@@ -53,7 +53,9 @@ def _artifacts_dir() -> Path:
     cfg = get_settings()
     base = Path(os.environ.get("ARTIFACTS_DIR") or cfg.artifact_dir)
     if not base.is_absolute():
-        base = Path("/root/.openclaw/workspace/compile-platform/backend") / base
+        # 从本文件位置推断仓库根（services/compile_engine.py → 往上一层到 backend/app/services → 上 2 层到 backend → 上 3 层到仓库根）
+        project_root = Path(__file__).resolve().parents[3]
+        base = project_root / base
     base.mkdir(parents=True, exist_ok=True)
     return base
 
