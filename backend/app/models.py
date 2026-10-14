@@ -147,7 +147,7 @@ class CompileTask(Base):
     matched_skills = Column(Text)  # JSON 字符串：匹配的 Skill ID 列表
     depend_tree = Column(Text)  # JSON 字符串：依赖树
     log_output = Column(Text)  # 编译日志
-    artifact_path = Column(String(255))  # 产物路径
+    artifact_path = Column(Text)  # 产物路径 JSON 列表（多产物时 > 255 字符，不能用 String(255)）
     error_message = Column(Text)
     container_id = Column(String(64))  # 编译容器 ID（cancel 时用于 docker stop）
     created_at = Column(DateTime, default=datetime.utcnow)

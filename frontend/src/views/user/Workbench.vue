@@ -70,37 +70,48 @@
         </div>
       </div>
 
-      <!-- AI 技能匹配面板 -->
+      <!-- 已加载的 Skills（实际可用 vs log 命中分开显示） -->
       <div class="card">
         <h3>
-          🤖 AI 技能匹配
+          🤖 已加载的 Skills
           <el-tag :type="matchStatus.type" size="small">{{ matchStatus.text }}</el-tag>
         </h3>
 
-        <div v-if="!matchedSkills.length && !compiling" class="empty">
-          发起编译后，大模型将自动匹配通用 + 专用 Skill
+        <div v-if="!availableSkills.length && !compiling" class="empty">
+          发起编译前，系统会从知识库拉取所有可用的 Skill
         </div>
 
-        <div v-else-if="matchedSkills.length">
+        <div v-else-if="availableSkills.length">
           <div class="field">
-            <label>命中 Skill（{{ genericSkills.length }} 通用 · {{ specificSkills.length }} 专用）</label>
+            <label>
+              知识库 Skill（{{ availableSkills.length }} 个：{{ availableGenericCount }} 通用 · {{ availableSpecificCount }} 专用）
+              <span v-if="matchedSkills.length" style="margin-left: 8px; color: #67c23a;">
+                ✓ 本次命中 {{ matchedSkills.length }} 个
+              </span>
+            </label>
             <div class="skill-chips">
               <el-tag
-                v-for="skill in matchedSkills"
+                v-for="skill in availableSkills"
                 :key="skill.name"
-                :type="skill.type === 'generic' ? 'primary' : 'warning'"
+                :type="isMatched(skill) ? 'success' : (skill.type === 'generic' ? 'info' : 'warning')"
+                :effect="isMatched(skill) ? 'dark' : 'plain'"
                 style="margin: 3px 4px 3px 0"
               >
                 {{ skill.name }}
                 <el-tag v-if="skill.type === 'specific'" size="small" type="info" class="tag-specific">专用</el-tag>
+                <span v-if="isMatched(skill)" style="margin-left: 4px;">✓</span>
               </el-tag>
+            </div>
+            <div v-if="unmatchedSpecifics.length" style="margin-top: 8px; color: #e6a23c; font-size: 12px;">
+              ⚠ 专用 Skill 加载了但未命中：<b>{{ unmatchedSpecifics.map(s => s.name).join(', ') }}</b>
+              <span style="color: #909399;">（DeepAgent 本次没引用这些专用攻略）</span>
             </div>
           </div>
         </div>
 
         <div v-else-if="compiling" class="empty">
           <el-icon class="is-loading"><Loading /></el-icon>
-          AI 正在匹配 Skill…
+          加载 Skills 知识库…
         </div>
       </div>
     </div>
@@ -204,11 +215,28 @@ async function loadSystems() {
   }
 }
 
+// 拉所有 active skills 填入 availableSkills（用 /admin/skills 因为有 system_names 字段也好用）
+// 注：/admin/skills 要求 admin role，普通用户可能被 403；退路用 /experience/my
+async function fetchAvailableSkills() {
+  try {
+    const res = await api.get('/admin/skills', { params: { is_active: true } })
+    const data = (res.data && (res.data.data || res.data)) || []
+    // 只保留 name + type
+    availableSkills.value = data.map((s: any) => ({ name: s.name, type: s.type }))
+  } catch (e) {
+    console.error('加载 Skills 列表失败（需要 admin 权限）', e)
+    // 普通用户 403 时静默留空
+  }
+}
+
 // ============== 编译状态 ==============
 const compiling = ref(false)
 const logLines = ref<{ text: string; type: string }[]>([])
 const compileResult = ref<{ status: 'success' | 'failed'; task_id?: string; artifact?: string } | null>(null)
 const matchedSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
+// 已加载的 Skills（知识库全量，从 /api/admin/skills 拉）
+// 与 matchedSkills 的区别：availableSkills 是"实际可用"，matchedSkills 是"log 命中"
+const availableSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
 let ws: WebSocket | null = null
 
 // ========== 静默兜底：WS 跨进程 publish 不到时，30s 静默主动查状态 ==========
@@ -366,6 +394,8 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
 
 onMounted(async () => {
   loadSystems()
+  // 0) 立即拉可用 skills（页面打开就知道知识库有哪几个）
+  fetchAvailableSkills()
   // 1) 优先 sessionStorage（用户切走再切回）
   const savedTid = sessionStorage.getItem(TASK_STORAGE_KEY)
   if (savedTid) {
@@ -398,6 +428,16 @@ onMounted(async () => {
 // ============== 匹配结果 ==============
 const genericSkills = computed(() => matchedSkills.value.filter(s => s.type === 'generic'))
 const specificSkills = computed(() => matchedSkills.value.filter(s => s.type === 'specific'))
+const availableGenericCount = computed(() => availableSkills.value.filter(s => s.type === 'generic').length)
+const availableSpecificCount = computed(() => availableSkills.value.filter(s => s.type === 'specific').length)
+// 未命中的专用 skill（用户能看到 DeepAgent 没优先用它们）
+const unmatchedSpecifics = computed(() =>
+  availableSkills.value.filter(s => s.type === 'specific' && !matchedSkills.value.some(m => m.name === s.name))
+)
+// 判断某个 available skill 是否被 log 命中
+function isMatched(skill: { name: string }): boolean {
+  return matchedSkills.value.some(m => m.name === skill.name)
+}
 const matchStatus = reactive({ text: '待匹配', type: 'info' as '' | 'success' | 'warning' | 'danger' | 'info' })
 
 // ============== 文件上传 ==============
@@ -455,8 +495,11 @@ async function submitCompile() {
   logLines.value = []
   compileResult.value = null
   matchedSkills.value = []
+  availableSkills.value = []  // 重新编译时清空
   matchStatus.text = '提交中…'
   matchStatus.type = 'warning'
+  // 异步拉可用 skills（不阻塞提交）
+  fetchAvailableSkills()
 
   // 1) 提交编译任务（git 走 /compile/submit，upload 走 /compile/upload）
   let task_id = ''

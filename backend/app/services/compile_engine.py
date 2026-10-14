@@ -507,16 +507,6 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 - 输出: {output_dir}
 - 系统: {state.get('system_id', '')}
 
-## 并发限制（重要）
-本服务器启用了多 worker 并行处理任务（当前 {_max_workers} 个 worker 共用 32 物理核）。
-为避免 worker 之间互相抢占 CPU 拖慢整体，**编译时强制限速**：
-- make: `make -j{_jobs_per_worker}`
-- cmake: `-j{_jobs_per_worker}` 参数
-- go build: `go build -p {_jobs_per_worker}` 或 `GOMAXPROCS={_jobs_per_worker}`
-- ninja: `-j{_jobs_per_worker}`
-- cargo: `cargo build -j {_jobs_per_worker}`
-不要用 `$(nproc)` 或不指定 -j（会默认吃满 32 核，跟其他 worker 抢）
-
 ## 你能调用的工具
 - ls/read_file/write_file/edit_file/grep/glob — 文件操作
 - execute — 在容器里跑命令
@@ -526,6 +516,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 **不要凭记忆猜工具链地址、编译命令、错误模式**。
 所有具体知识从 Skill 读：系统提示下方的 Skill 清单列出了当前可用 Skill，每条含触发场景描述。
 命中后用 read_file 读对应路径的 SKILL.md 全文执行。
+**编译命令（-j 参数、并行度、工具链版本等）以 Skill 攻略为准，不要在本提示词里找。**
 
 ## 作业流程
 1. 看 Skills 清单，找最匹配的（专用 Skill → generic 工具链 → generic 错误经验）
