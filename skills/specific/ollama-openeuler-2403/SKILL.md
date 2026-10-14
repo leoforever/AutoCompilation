@@ -1,4 +1,3 @@
-<!-- synced version: v20261014 -->
 ---
 name: ollama-openeuler-2403
 type: layer2-build

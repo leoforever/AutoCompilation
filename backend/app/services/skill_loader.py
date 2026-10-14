@@ -122,10 +122,10 @@ def write_skill_to_disk(skill_type: str, skill_name: str, content: str,
     tmp = skill_dir / "SKILL.md.tmp"
 
     body = content or ""
-    if version:
-        # YAML frontmatter 风格注释；DeepAgents SkillsMiddleware 会忽略 # 开头的非 YAML 头
-        header = f"<!-- synced version: {version} -->\n"
-        body = header + body
+    # 注意：不能在 SKILL.md 前面加任何 header（即使 # 注释或 HTML 注释），
+    # DeepAgents SkillsMiddleware 用 ^---\s*\n 匹配 frontmatter 起点，
+    # 任何前置字符都会让 frontmatter 解析失败、skill 被 skip
+    # version 信息从 DB skills.version 字段查；如要写到文件，append 到 frontmatter 内
 
     try:
         tmp.write_text(body, encoding="utf-8")
