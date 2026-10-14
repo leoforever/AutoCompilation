@@ -1,0 +1,41 @@
+# 编译平台配置文件
+# 数据库配置
+database:
+  type: postgresql  # postgresql | sqlite
+  # PostgreSQL 配置
+  postgresql:
+    host: localhost
+    port: 5432
+    username: compile_user
+    password: compile123
+    database: compile_platform
+  # SQLite 配置（仅当 type: sqlite 时生效）
+  sqlite:
+    path: ./cache/compile_platform.db
+
+# JWT 配置
+jwt:
+  secret_key: "loongarch-compile-platform-secret-2026"
+  algorithm: HS256
+  expire_minutes: 1440  # 24小时
+
+# 编译引擎配置
+compile:
+  timeout: 3600        # 编译超时（秒）
+  max_concurrent: 10   # 最大并发任务数
+  artifact_dir: ./artifacts
+
+# 阶段5 / 单条 docker exec 超时（可被 .env.compile 里的同名 env 覆盖）
+# STAGE5_MAX_SECONDS: 整个 stage5 阶段硬上限（默认 1800 = 30 分钟）
+# DOCKER_EXEC_TIMEOUT: 单条 execute 命令 timeout（默认 3600 = 1 小时）
+stage5:
+  max_seconds: 1800    # 整个 stage5 阶段硬上限（秒）
+  loop_threshold: 5    # 死循环检测：连续快速失败次数
+  loop_window: 5       # 死循环检测：单次失败间隔窗口（秒）
+docker_exec:
+  timeout: 3600        # 单条 docker exec 命令 timeout（秒）
+
+# 文件上传配置
+upload:
+  max_size: 2147483648  # 2GB
+  upload_dir: ./uploads
