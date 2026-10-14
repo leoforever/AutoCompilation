@@ -210,6 +210,78 @@ const logLines = ref<{ text: string; type: string }[]>([])
 const compileResult = ref<{ status: 'success' | 'failed'; task_id?: string; artifact?: string } | null>(null)
 const matchedSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
 let ws: WebSocket | null = null
+
+// ========== 静默兜底：WS 跨进程 publish 不到时，30s 静默主动查状态 ==========
+// 触发：任何 WS 消息 onmessage 时 reset；30s 无新消息 → fetch /tasks/{id} 查 status
+// 目的：worker 和 uvicorn 跨进程时 BROADCASTER 内存不共享，status 事件不到前端
+//       轮询 DB 兜底，保证"已完成"任务前端立即从"编译中"切到结果页
+let _silenceTimer: number | null = null
+const SILENCE_TIMEOUT_MS = 30 * 1000  // 30 秒
+
+function stopSilencePolling() {
+  if (_silenceTimer != null) {
+    clearTimeout(_silenceTimer)
+    _silenceTimer = null
+  }
+}
+
+function startSilencePolling(taskId: string) {
+  stopSilencePolling()
+  const tick = async () => {
+    if (!compiling.value) {
+      // 已不在编译中：可能是 WS 已收到 status 停了；停止轮询
+      stopSilencePolling()
+      return
+    }
+    try {
+      const token = localStorage.getItem('token') || ''
+      const resp = await fetch(`/api/compile/tasks/${taskId}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!resp.ok) {
+        // 401/403/404 等：可能是任务被删/权限问题；不致命，等下次 tick
+        return
+      }
+      const json = await resp.json()
+      const s = json?.data?.status as string | undefined
+      if (s && (s === 'success' || s === 'failed' || s === 'cancelled')) {
+        // 走和 WS 收到 status 一样的终态路径
+        compileResult.value = { status: s, task_id: taskId }
+        matchStatus.text = s === 'success' ? '已完成' : '失败'
+        matchStatus.type = s === 'success' ? 'success' : 'danger'
+        appendLog(s === 'success' ? 'ok' : 'err',
+                  `[POLL] 状态=${s}  task_id=${taskId}（WS 静默 30s，主动查 DB 兜底）`)
+        compiling.value = false
+        if (ws) { try { ws.close() } catch {} ws = null }
+        stopSilencePolling()
+        return
+      }
+    } catch {
+      // 网络错误：等下次 tick
+    }
+    // 未到终态，再 30s 后继续
+    _silenceTimer = window.setTimeout(tick, SILENCE_TIMEOUT_MS)
+  }
+  _silenceTimer = window.setTimeout(tick, SILENCE_TIMEOUT_MS)
+}
+
+function resetSilenceTimer(taskId: string) {
+  // 任何新 WS 消息都重置计时器
+  if (_silenceTimer == null) {
+    // 第一次：起 timer
+    startSilencePolling(taskId)
+  } else {
+    // 已起：清掉重新设
+    clearTimeout(_silenceTimer)
+    _silenceTimer = window.setTimeout(() => {
+      // tick 内会自动判断是否继续
+      if (compiling.value && compileResult.value?.task_id === taskId) {
+        // 触发 tick：用 startSilencePolling 的逻辑
+        startSilencePolling(taskId)
+      }
+    }, SILENCE_TIMEOUT_MS)
+  }
+}
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 // 任务 ID 持久化 key（切走再切回恢复用）
@@ -451,9 +523,13 @@ function subscribeWS(task_id: string) {
 
   ws.onopen = () => {
     appendLog('info', `[WS] 已连接到 worker.BROADCASTER`)
+    // 启动 30s 静默轮询：WS 跨进程 publish 不到时兜底查 DB
+    if (task_id) startSilencePolling(task_id)
   }
 
   ws.onmessage = (ev) => {
+    // 任何 WS 消息都重置 30s 静默计时器（避免无消息时仍误判"已完成"）
+    if (task_id) resetSilenceTimer(task_id)
     // 后端推的是 JSON：{ type: "log"|"status"|"connected", level, msg, ts, status }
     let payload: any = ev.data
     try { payload = JSON.parse(ev.data) } catch { /* 兼容纯字符串 */ }
@@ -505,6 +581,8 @@ function subscribeWS(task_id: string) {
   ws.onclose = () => {
     appendLog('dim', `[WS] 连接关闭`)
     cleanup()
+    // WS 关闭时停静默轮询（避免后续查不到状态后一直重试）
+    stopSilencePolling()
   }
 }
 

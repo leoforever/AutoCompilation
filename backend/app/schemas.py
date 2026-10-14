@@ -168,6 +168,10 @@ class ExperienceResponse(BaseModel):
     status: ExperienceStatus
     submitted_at: datetime
     reviewed_at: Optional[datetime]
+    # SKILL.md 内容（经验贡献核心字段，列表接口也返方便前端预览）
+    # 体量：单条经验 markdown 通常 < 10KB，可接受
+    skill_content: Optional[str] = None
+    rejection_reason: Optional[str] = None
 
 
 # ==================== Skill ====================
