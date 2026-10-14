@@ -169,7 +169,8 @@ def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallbac
         # upload 模式：source_path 存宿主机源码包路径，stage4a 读这个解压
         # git 模式：source_path 没用
         "source_path": task.source_path or "",
-        "git_branch": task.git_branch or "main",
+        # git_branch 留空时由 stage4a 走"不传 --branch"路径，让 git 拉远端默认分支
+        "git_branch": task.git_branch or "",
         "commit_hash": "",
         "system_id": task.system_id,
         "container_work_dir": "/work",
@@ -316,11 +317,15 @@ def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]
                 shutil.rmtree(src_dir, ignore_errors=True)
             src_dir.parent.mkdir(parents=True, exist_ok=True)
 
-            branch = state.get("git_branch") or "main"
+            branch = state.get("git_branch", "").strip()
             url = state["git_url"]
-            cmd = ["git", "clone", "--depth", "1", "--branch", branch, url, str(src_dir)]
+            # 留空时不传 --branch → git clone 拉远端默认分支（main / master 等）
+            if branch:
+                cmd = ["git", "clone", "--depth", "1", "--branch", branch, url, str(src_dir)]
+            else:
+                cmd = ["git", "clone", "--depth", "1", url, str(src_dir)]
 
-            _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch})", on_log)
+            _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch or 'default'})", on_log)
             try:
                 proc = subprocess.Popen(
                     cmd,

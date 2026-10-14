@@ -51,7 +51,7 @@
           <label>Git 仓库地址</label>
           <el-input v-model="form.gitUrl" placeholder="https://github.com/xxx/xxx.git" />
           <label style="margin-top:10px">分支 / Tag</label>
-          <el-input v-model="form.gitBranch" placeholder="main 或 v1.0.0" />
+          <el-input v-model="form.gitBranch" placeholder="留空用远端默认分支（如 main / master）" />
         </div>
 
         <div class="field">
@@ -182,7 +182,7 @@ const form = reactive({
   softwareName: '',
   sourceType: 'git' as 'upload' | 'git',  // 默认 git，更符合当前可用路径
   gitUrl: '',
-  gitBranch: 'main',
+  gitBranch: '',
   compileMode: 'container' as 'container' | 'local',
 })
 
@@ -396,7 +396,7 @@ async function submitCompile() {
       fd.append('file', uploadedFile.value!)
       fd.append('system_id', String(form.systemId))
       fd.append('software_name', form.softwareName)
-      fd.append('git_branch', form.gitBranch || 'main')
+      fd.append('git_branch', form.gitBranch || '')
       fd.append('compile_mode', form.compileMode)
       const r: any = await api.post('/compile/upload', fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -411,7 +411,7 @@ async function submitCompile() {
         software_name: form.softwareName,
         source_type: form.sourceType,
         git_url: form.gitUrl,
-        git_branch: form.gitBranch || 'main',
+        git_branch: form.gitBranch || '',
         compile_mode: form.compileMode,
       })
       task_id = r?.data?.task_id || ''

@@ -74,6 +74,21 @@ async def compile_log_websocket(
             "task_id": task_id,
         }, ensure_ascii=False))
 
+        # 回发终态：任务已 success/failed/cancelled 时，订阅前已广播的 status 事件收不到
+        # 客户端刷新 / 晚建 / 重连场景靠这条主动推一次终态，前端立即停转圈
+        db_state = SessionLocal()
+        try:
+            cur_task = db_state.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+            if cur_task and cur_task.status in ("success", "failed", "cancelled"):
+                await websocket.send_text(json.dumps({
+                    "type": "status",
+                    "status": cur_task.status,
+                    "task_id": task_id,
+                }, ensure_ascii=False))
+                logger.info(f"[WS] replayed terminal status for {task_id}: {cur_task.status}")
+        finally:
+            db_state.close()
+
         # 同时启动两个协程：监听 client 消息（cancel 等）+ 监听 broadcaster
         sender_task = asyncio.create_task(_pump(task_id, queue, websocket))
         try:

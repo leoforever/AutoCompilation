@@ -1,14 +1,17 @@
 #!/bin/bash
 # 龙芯智能编译平台 - 安装启动脚本
-# 用法: bash setup.sh [install|init|start|stop|restart|status]
+# 用法: bash setup.sh [install|init|start [dev|prod]|stop|restart [dev|prod]|status|dev|prod]
 #
-# 职责:
-#   install  一次性环境准备（装 PG、建库装表、装 Python/前端依赖、默认账号）
-#   init     仅做"建表 + 默认 admin 账号"，便于重置或首次启动
-#   start    启动后端 + 前端（不做任何初始化）
-#   stop     按端口探活后停掉（不依赖 PID 文件）
-#   restart  stop + start
-#   status   探活报告实际运行情况
+#   start         生产模式启动（默认；uvicorn 无 --reload）
+#   start dev     开发模式启动（uvicorn --reload，改 .py 自动热加载）
+#   dev / prod    等同 'start dev' / 'start prod'
+#   restart       重启（保持当前模式，可用 restart dev/prod 切换）
+#   restart dev   切到开发模式重启
+#   restart prod  切到生产模式重启
+#   stop          按端口探活后停掉（不依赖 PID 文件）
+#   install       一次性环境准备（装 PG、建库装表、装 Python/前端依赖、默认账号）
+#   init          仅做"建表 + 默认 admin 账号"，便于重置或首次启动
+#   status        按端口探活看后端/前端/PG 状态
 
 set -e
 # 路径：默认是 setup.sh 所在目录的父目录（即仓库根），可被环境变量覆盖
@@ -125,6 +128,29 @@ backend_healthcheck() {
     else
         echo "READY:$code"
     fi
+}
+
+# 列本机所有非 loopback / 非 link-local 的 IPv4（用于访问地址展示）
+# 多网卡环境会显示多个 IP（用户挑选）
+_local_ipv4s() {
+    # 优先 ip 命令（多数系统都有）
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 -o addr show scope global 2>/dev/null \
+            | awk '{print $4}' | cut -d/ -f1
+        return
+    fi
+    # 回退 hostname -I（busybox / alpine 也支持）
+    if command -v hostname >/dev/null 2>&1 && hostname -I >/dev/null 2>&1; then
+        hostname -I | tr ' ' '\n' | grep -v '^$'
+        return
+    fi
+    # 实在不行用 ifconfig（macOS 之类）
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}'
+        return
+    fi
+    # 全部失败：列出 localhost（最后兜底）
+    echo "localhost"
 }
 
 # ========== 安装（一次性） ==========
@@ -296,6 +322,11 @@ PY
 
 # ========== 启动 ==========
 do_start() {
+    # COMPILE_MODE 控制 dev / prod：
+    #   dev  → uvicorn --reload（改 .py 自动重启；开发用）
+    #   prod → uvicorn 无 --reload（生产用，性能优先）
+    # 默认 prod（生产优先），显式传 dev 或 env COMPILE_MODE=dev 才走 dev
+    local mode="${1:-${COMPILE_MODE:-prod}}"
     # 1) 如果端口已被占，先按"已运行"语义处理（避免重复拉起导致 bind 失败）
     if [ -n "$(port_pid "$BACKEND_PORT")" ]; then
         warn "后端已在运行（端口 $BACKEND_PORT 已被占用，PID $(port_pid "$BACKEND_PORT")）"
@@ -303,12 +334,20 @@ do_start() {
         if [ ! -f "$ENV_FILE" ]; then
             error "缺少 $ENV_FILE，无法 source 环境变量"
         fi
-        info "启动后端..."
+        info "启动后端 (mode=$mode)..."
         cd "$BACKEND_DIR"
         set -a; source "$ENV_FILE"; set +a
-        nohup python3 -m uvicorn app.main:app \
-            --host 0.0.0.0 --port "$BACKEND_PORT" \
-            >> "$LOG_DIR/backend.log" 2>&1 &
+        # 按模式决定是否加 --reload
+        if [ "$mode" = "dev" ]; then
+            nohup python3 -m uvicorn app.main:app \
+                --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
+                --reload-dir app \
+                >> "$LOG_DIR/backend.log" 2>&1 &
+        else
+            nohup python3 -m uvicorn app.main:app \
+                --host 0.0.0.0 --port "$BACKEND_PORT" \
+                >> "$LOG_DIR/backend.log" 2>&1 &
+        fi
         disown || true
         # 等最多 15 秒探活
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -347,9 +386,20 @@ do_start() {
 
     echo ""
     info "访问地址:"
-    info "  前端: http://10.40.65.201:$FRONTEND_PORT/"
-    info "  API:  http://10.40.65.201:$BACKEND_PORT/docs"
+    # 只列主 IP（default route 对应的网卡 IP），3 行清爽
+    # 回退链：ip route get → 所有非 loopback 的第一个 → localhost
+    local main_ip
+    main_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    if [ -z "$main_ip" ] || [ "$main_ip" = "1.1.1.1" ]; then
+        main_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    fi
+    if [ -z "$main_ip" ]; then
+        main_ip="localhost"
+    fi
+    info "  前端: http://$main_ip:$FRONTEND_PORT/"
+    info "  API:  http://$main_ip:$BACKEND_PORT/docs"
     info "  默认账号: admin / admin123"
+    info "  提示：其他网卡 IP 可手动拼接 http://<ip>:$FRONTEND_PORT/"
 }
 
 # ========== 停止 ==========
@@ -361,9 +411,10 @@ do_stop() {
 }
 
 # ========== 重启 ==========
+# 用法: do_restart [dev|prod] — 默认保持 COMPILE_MODE env；不传则用当前 env
 do_restart() {
     do_stop
-    do_start
+    do_start "$@"
 }
 
 # ========== 状态 ==========
@@ -391,12 +442,21 @@ do_status() {
 case "${1:-start}" in
     install) do_install ;;
     init)    do_init ;;
-    start)   do_start ;;
+    start)   do_start prod ;;    # 默认 prod（生产优先）
     stop)    do_stop ;;
-    restart) do_restart ;;
+    restart) do_restart "$2" ;;  # 透传模式参数；不传 = 保持 COMPILE_MODE
     status)  do_status ;;
+    dev)     do_start dev ;;     # 显式 dev：uvicorn --reload
+    prod)    do_start prod ;;    # 显式 prod：无 --reload
     *)
-        echo "用法: $0 {install|init|start|stop|restart|status}"
+        echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|dev|prod}"
+        echo
+        echo "  start         生产模式启动（默认；无 --reload）"
+        echo "  start dev     开发模式启动（uvicorn --reload，改 .py 自动重启）"
+        echo "  dev / prod    等同 'start dev' / 'start prod'"
+        echo "  restart       重启（保持当前模式，可用 restart dev/prod 切换）"
+        echo "  restart dev   切到开发模式重启"
+        echo "  restart prod  切到生产模式重启"
         exit 1
         ;;
 esac
