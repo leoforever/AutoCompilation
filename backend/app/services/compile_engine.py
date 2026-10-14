@@ -710,6 +710,17 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
                 tar.extractall(path=artifacts_dir)
             os.unlink(tmp_path)
             _log(state, "success", f"[阶段6] 产物归档: {artifacts_dir}", on_log)
+
+            # 顺便打一份 tar.gz 整体包（用户点"下载全部产物"时直接返这个文件，避免每次都重打）
+            bundle_path = artifacts_dir.parent / f"{artifacts_dir.name}.tar.gz"
+            try:
+                with tarfile.open(bundle_path, "w:gz") as tar:
+                    tar.add(artifacts_dir, arcname=artifacts_dir.name)
+                bundle_size = bundle_path.stat().st_size
+                _log(state, "info",
+                     f"[阶段6] 产物打包: {bundle_path} ({bundle_size // 1024} KB)", on_log)
+            except Exception as e:
+                _log(state, "warn", f"[阶段6] 产物打包失败（下载时将实时打包）: {e}", on_log)
         except Exception as e:
             _log(state, "warn", f"[阶段6] 产物归档失败: {e}", on_log)
 

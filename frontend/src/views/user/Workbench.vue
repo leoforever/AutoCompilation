@@ -130,7 +130,7 @@
         <el-button type="primary" :loading="generatingDraft" @click="onGenerateDraft">
           ✨ AI 生成经验草稿
         </el-button>
-        <el-button v-if="compileResult?.status === 'success'" @click="downloadArtifact">⬇️ 下载产物</el-button>
+        <el-button v-if="compileResult?.status === 'success'" type="success" @click="downloadArtifact">📦 下载全部产物 (.tar.gz)</el-button>
         <el-button v-if="compileResult?.status === 'failed'" type="danger" @click="reportTicket">
           🐛 一键上报工单
         </el-button>
@@ -563,7 +563,35 @@ function reportTicket() {
 }
 
 function downloadArtifact() {
-  ElMessage.info('产物归档路径在后端 ARTIFACTS_DIR 下')
+  const taskId = compileResult.value?.task_id
+  if (!taskId) {
+    ElMessage.warning('无 task_id')
+    return
+  }
+  // 用浏览器原生下载（带 Authorization header 需 fetch+blob，简化用 a 标签）
+  const token = localStorage.getItem('token') || ''
+  // 浏览器 a 标签 download 无法加 header — 走 fetch + blob 方案
+  fetch(`/api/compile/tasks/${taskId}/artifacts/download`, {
+    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+  })
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.blob()
+    })
+    .then(blob => {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${taskId}-artifacts.tar.gz`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      ElMessage.success('下载已开始')
+    })
+    .catch(err => {
+      ElMessage.error('下载失败：' + (err?.message || err))
+    })
 }
 
 // ============== AI 经验草稿（手动触发）==============

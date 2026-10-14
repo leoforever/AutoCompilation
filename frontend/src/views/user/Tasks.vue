@@ -18,8 +18,8 @@
 
       <el-table :data="tasks" stripe style="width: 100%">
         <el-table-column prop="task_id" label="ID" width="120" />
-        <el-table-column prop="software_name" label="软件" />
-        <el-table-column prop="system_name" label="系统" width="140" />
+        <el-table-column prop="software_name" label="软件" min-width="120" />
+        <el-table-column prop="system_name" label="系统" min-width="140" show-overflow-tooltip />
         <el-table-column label="模式" width="80">
           <template #default="{ row }">
             <el-tag :type="row.compile_mode === 'container' ? 'primary' : 'warning'" size="small">
@@ -37,12 +37,12 @@
             {{ row.duration_seconds ? row.duration_seconds + '秒' : '-' }}
           </template>
         </el-table-column>
-        <el-table-column label="产物" width="200">
+        <el-table-column label="产物" min-width="140">
           <template #default="{ row }">
-            <el-link v-if="row.artifact_path" type="primary" underline="never">
-              {{ row.artifact_path }}
-            </el-link>
-            <span v-else class="muted">—</span>
+            <span v-if="!row.artifact_path" class="muted">—</span>
+            <span v-else :title="row.artifact_path" style="cursor:help">
+              {{ artifactSummary(row.artifact_path) }}
+            </span>
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="时间" width="160">
@@ -177,6 +177,30 @@ function formatDate(dateStr: string) {
          `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// artifact_path 是 JSON 字符串：[{"name":"hello","path":"...","size":69696}]
+// 摘要：第一个文件名 + 文件数 + 总大小
+function artifactSummary(artifactPath: string): string {
+  try {
+    const arr = JSON.parse(artifactPath)
+    if (!Array.isArray(arr) || arr.length === 0) return '—'
+    const first = arr[0]
+    const name = first.name || '?'
+    const totalBytes = arr.reduce((s: number, a: any) => s + (a.size || 0), 0)
+    const sizeStr = formatSize(totalBytes)
+    if (arr.length === 1) return `${name} (${sizeStr})`
+    return `${name} +${arr.length - 1}个 (${sizeStr})`
+  } catch {
+    return '?'
+  }
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
 async function viewLog(task: any) {
   currentTask.value = task
   const res = await api.get(`/compile/tasks/${task.task_id}/log`)
@@ -190,7 +214,34 @@ async function viewLog(task: any) {
 }
 
 function downloadArtifact(task: any) {
-  ElMessage.info(`模拟下载：${task.artifact_path}`)
+  const taskId = task.task_id
+  if (!taskId) {
+    ElMessage.warning('无 task_id')
+    return
+  }
+  // 与 Workbench.vue 同样的 fetch+blob 下载流程
+  const token = localStorage.getItem('token') || ''
+  fetch(`/api/compile/tasks/${taskId}/artifacts/download`, {
+    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+  })
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.blob()
+    })
+    .then(blob => {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${taskId}-artifacts.tar.gz`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      ElMessage.success('下载已开始')
+    })
+    .catch(err => {
+      ElMessage.error('下载失败：' + (err?.message || err))
+    })
 }
 
 function reportTicket(task: any) {

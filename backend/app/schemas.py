@@ -76,6 +76,8 @@ class CompileTaskResponse(BaseModel):
     task_id: str
     user_id: int
     system_id: int
+    # 目标系统名（从 TargetSystem.name 拼进来，list/get 端点 join 后填）
+    system_name: Optional[str] = None
     software_name: str
     source_type: str
     source_path: Optional[str]

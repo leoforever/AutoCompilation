@@ -37,6 +37,16 @@ _ALLOWED_EXT = {".tar.gz", ".zip", ".tgz"}
 _ALLOWED_NAME_RE = re.compile(r"^[\w\-. ]+\.(tar\.gz|zip|tgz)$", re.IGNORECASE)
 
 
+def _system_names_for_tasks(db: Session, system_ids: list[int]) -> dict[int, str]:
+    """批量取 system_id → name 映射（一次查询，避免 N+1）"""
+    if not system_ids:
+        return {}
+    rows = db.query(TargetSystem.system_id, TargetSystem.name).filter(
+        TargetSystem.system_id.in_(set(system_ids))
+    ).all()
+    return {sid: name for sid, name in rows}
+
+
 @router.post("/submit", response_model=ApiResponse)
 async def submit_compile_task(
     task_data: CompileTaskCreate,
@@ -262,10 +272,19 @@ async def list_compile_tasks(
     tasks = query.order_by(CompileTask.created_at.desc()).offset(
         (page - 1) * page_size
     ).limit(page_size).all()
-    
+
+    # 批量取 system_name（一次 join 查所有 task 的 system_id 对应的 name）
+    sys_names = _system_names_for_tasks(db, [t.system_id for t in tasks])
+
     return CompileTaskListResponse(
         total=total,
-        tasks=[CompileTaskResponse.model_validate(t) for t in tasks]
+        tasks=[
+            CompileTaskResponse(
+                system_name=sys_names.get(t.system_id),
+                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name"}),
+            )
+            for t in tasks
+        ],
     )
 
 
@@ -283,7 +302,11 @@ async def get_compile_task(
     if current_user.role != "admin" and task.user_id != current_user.user_id:
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
-    return ApiResponse(data=CompileTaskResponse.model_validate(task).model_dump())
+    sys_names = _system_names_for_tasks(db, [task.system_id])
+    return ApiResponse(data=CompileTaskResponse(
+        system_name=sys_names.get(task.system_id),
+        **CompileTaskResponse.model_validate(task).model_dump(exclude={"system_name"}),
+    ).model_dump())
 
 
 @router.get("/tasks/{task_id}/log")
@@ -329,6 +352,48 @@ async def download_compile_log(
         path=str(log_file),
         media_type="text/plain",
         filename=f"{task_id}.log",
+    )
+
+
+@router.get("/tasks/{task_id}/artifacts/download")
+async def download_artifacts_bundle(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """下载全部产物（一个 .tar.gz 包）
+
+    优先级：
+      1. 优先用 stage6 预打的 artifacts/{task_id}.tar.gz（CPU 0 成本，瞬时返）
+      2. 缺失则实时打包（兜底，stage6 失败时也能下载）
+    """
+    from app.services.compile_engine import _artifacts_dir
+
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if current_user.role != "admin" and task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+
+    artifacts_root = _artifacts_dir()
+    bundle_path = artifacts_root / f"{task_id}.tar.gz"
+
+    if not bundle_path.exists():
+        # 兜底：实时打包（stage6 失败时也支持下载）
+        artifacts_dir = artifacts_root / task_id
+        if not artifacts_dir.exists() or not any(artifacts_dir.iterdir()):
+            raise HTTPException(
+                status_code=404,
+                detail=f"产物不存在（任务 {task_id} 未成功或产物已被清理）",
+            )
+        import tarfile
+        with tarfile.open(bundle_path, "w:gz") as tar:
+            tar.add(artifacts_dir, arcname=artifacts_dir.name)
+
+    return FileResponse(
+        path=str(bundle_path),
+        media_type="application/gzip",
+        filename=f"{task_id}-artifacts.tar.gz",
     )
 
 
