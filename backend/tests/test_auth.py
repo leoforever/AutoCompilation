@@ -88,10 +88,22 @@ def isolated_sqlite():
 
 
 # TestClient 在 fixture 之后初始化，确保所有请求走临时库
+# 本文件测试注册逻辑本身 → 放开开关（生产默认关闭，见 test_register_disabled_by_default）
+os.environ["ALLOW_SELF_REGISTER"] = "1"
 client = TestClient(app)
 
 
 # ===================== Tests =====================
+def test_register_disabled_by_default(monkeypatch):
+    """生产默认：不允许自助注册 → 403（开关是运行时 os.environ 读取，monkeypatch 即生效）"""
+    monkeypatch.delenv("ALLOW_SELF_REGISTER", raising=False)
+    response = client.post("/api/auth/register", json={
+        "username": "no_self_reg", "password": "pass1234", "role": "user"
+    })
+    assert response.status_code == 403
+    assert "暂不开放自助注册" in response.json()["detail"]
+
+
 def test_register_success():
     """测试用户注册成功"""
     response = client.post("/api/auth/register", json={

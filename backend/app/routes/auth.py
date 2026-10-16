@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+import os
 import jwt
 import bcrypt
 
@@ -20,7 +21,9 @@ settings = get_settings()
 
 @router.post("/register", response_model=ApiResponse)
 async def register(user_data: UserCreate, db: Session = Depends(get_db)):
-    """用户注册"""
+    """用户注册 — 默认关闭（ALLOW_SELF_REGISTER=1 才开放），账号由管理员在用户管理页创建"""
+    if os.environ.get("ALLOW_SELF_REGISTER", "0") != "1":
+        raise HTTPException(status_code=403, detail="暂不开放自助注册，请联系管理员创建账号")
     existing = db.query(User).filter(User.username == user_data.username).first()
     if existing:
         raise HTTPException(status_code=400, detail="用户名已被注册")
@@ -48,7 +51,10 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
-    
+    if user.deleted_at is not None or not user.password_hash:
+        # 软删用户或被恢复但未重置密码的占位账号
+        raise HTTPException(status_code=403, detail="账号已注销或未激活，请联系管理员")
+
     if not bcrypt.checkpw(form_data.password.encode(), user.password_hash.encode()):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     

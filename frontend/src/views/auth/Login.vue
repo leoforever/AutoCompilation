@@ -38,7 +38,8 @@
 
         <div class="login-options">
           <el-checkbox v-model="form.remember">记住我</el-checkbox>
-          <el-link type="primary" underline="never" @click="showRegister = true">注册账号</el-link>
+          <!-- 自助注册暂不开放：账号由管理员在用户管理页创建（后端 /auth/register 同步 403） -->
+          <el-link v-if="allowSelfRegister" type="primary" underline="never" @click="showRegister = true">注册账号</el-link>
         </div>
 
         <el-form-item>
@@ -56,7 +57,7 @@
     </div>
 
     <!-- 注册弹窗 -->
-    <el-dialog v-model="showRegister" title="注册账号" width="400px">
+    <el-dialog v-if="allowSelfRegister" v-model="showRegister" title="注册账号" width="400px">
       <el-form :model="registerForm" :rules="registerRules" ref="regFormRef">
         <el-form-item prop="username">
           <el-input v-model="registerForm.username" placeholder="用户名（3-50字符）" />
@@ -105,7 +106,8 @@ const rules = {
   ]
 }
 
-// 注册相关
+// 注册相关（allowSelfRegister=false 时入口与弹窗都不渲染）
+const allowSelfRegister = false
 const showRegister = ref(false)
 const registerLoading = ref(false)
 const regFormRef = ref()
