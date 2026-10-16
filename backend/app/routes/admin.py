@@ -14,7 +14,7 @@ from app.models import get_db, Ticket, Experience, Skill, User, TargetSystem, Co
 from app.schemas import (
     TargetSystemCreate, TargetSystemUpdate, TargetSystemResponse,
     SkillCreate, SkillUpdate, SkillResponse,
-    UserPasswordReset,
+    UserPasswordReset, UserAdminCreate, UserAdminUpdate,
     StatsOverview, ApiResponse
 )
 from app.dependencies import get_current_user
@@ -567,18 +567,24 @@ async def delete_system(
 
 @router.get("/users", response_model=ApiResponse)
 async def list_users(
-    db: Session = Depends(get_db)
+    include_deleted: bool = False,
+    db: Session = Depends(get_db),
 ):
-    """获取用户列表"""
-    users = db.query(User).order_by(User.created_at.desc()).all()
-    
+    """获取用户列表（默认不显示已软删）"""
+    query = db.query(User).order_by(User.created_at.desc())
+    if not include_deleted:
+        query = query.filter(User.deleted_at.is_(None))
+    users = query.all()
+
     return ApiResponse(data=[
         {
             "user_id": u.user_id,
             "username": u.username,
+            "original_username": u.original_username,  # 已软删用户回显真实名
             "role": u.role,
             "last_active": u.last_active.isoformat() if u.last_active else None,
-            "is_active": u.is_active
+            "is_active": u.is_active,
+            "deleted_at": u.deleted_at.isoformat() if u.deleted_at else None,
         }
         for u in users
     ])
@@ -607,3 +613,146 @@ async def reset_user_password(
 
     logger.info(f"[audit] admin user_id={current_user.user_id} 重置了 user_id={user_id} ({target.username}) 的密码")
     return ApiResponse(message=f"用户 {target.username} 密码已重置")
+
+
+@router.post("/users", response_model=ApiResponse)
+async def create_user(
+    body: UserAdminCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """管理员新增用户"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+
+    if db.query(User).filter(
+        User.username == body.username,
+        User.deleted_at.is_(None),  # 已软删的 username=deleted_* 不算占用（同名可重建）
+    ).first():
+        raise HTTPException(status_code=400, detail="用户名已被占用")
+
+    user = User(
+        username=body.username,
+        password_hash=bcrypt.hashpw(body.password.encode(), bcrypt.gensalt(rounds=12)).decode(),
+        role=body.role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info(f"[audit] admin user_id={current_user.user_id} 新增用户 {body.username} (role={body.role})")
+    return ApiResponse(data={"user_id": user.user_id}, message=f"用户 {user.username} 已创建")
+
+
+@router.put("/users/{user_id}", response_model=ApiResponse)
+async def update_user(
+    user_id: int,
+    body: UserAdminUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """管理员编辑用户：改角色 / 启用禁用（也兼容前端原有的 is_active 开关）"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+
+    target = db.query(User).filter(User.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    if body.role is None and body.is_active is None:
+        raise HTTPException(status_code=400, detail="没有需要修改的字段")
+
+    # 最后一个 admin 不可被降级或禁用（防止平台失去管理员）
+    admin_count = db.query(User).filter(User.role == "admin").count()
+    losing_admin = (target.role == "admin") and (
+        (body.role is not None and body.role != "admin") or (body.is_active is False)
+    )
+    if losing_admin and admin_count <= 1:
+        raise HTTPException(status_code=400, detail="必须保留至少一个可用管理员，不能降级/禁用最后一个 admin")
+
+    if body.role is not None:
+        target.role = body.role
+    if body.is_active is not None:
+        target.is_active = body.is_active
+    db.commit()
+    logger.info(
+        f"[audit] admin user_id={current_user.user_id} 编辑用户 {target.username}: "
+        f"role={body.role} is_active={body.is_active}"
+    )
+    return ApiResponse(message=f"用户 {target.username} 已更新")
+
+
+@router.delete("/users/{user_id}", response_model=ApiResponse)
+async def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """管理员软删用户：保留 user 行 + 所有 task/ticket/exp/audit 引用，统计/历史不丢。
+    处理：deleted_at=now + is_active=False + 改名 deleted_<uid>_<ts>（释放 unique）+ 清 password_hash"""
+    if user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="不能删除自己")
+
+    target = db.query(User).filter(User.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if target.deleted_at is not None:
+        raise HTTPException(status_code=400, detail="用户已注销")
+    if target.role == "admin":
+        raise HTTPException(status_code=400, detail=f"用户 {target.username} 是管理员，不可删除")
+
+    now = datetime.utcnow()
+    original_name = target.username
+    # 改名避开 unique（同一用户名注销后能重新注册）
+    target.username = f"deleted_{user_id}_{int(now.timestamp())}"
+    target.original_username = original_name
+    target.is_active = False
+    target.deleted_at = now
+    target.deleted_by = current_user.user_id
+    # 清 password_hash 防 hash 复用登录
+    target.password_hash = ""
+    db.commit()
+
+    logger.info(
+        f"[audit] admin user_id={current_user.user_id} 软删用户 {original_name} (id={user_id})"
+    )
+    return ApiResponse(message=f"用户 {original_name} 已注销（软删，可恢复）")
+
+
+@router.post("/users/{user_id}/restore", response_model=ApiResponse)
+async def restore_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """恢复已软删用户：用户名复位（同名冲突时给出明确报错）"""
+    target = db.query(User).filter(User.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if target.deleted_at is None:
+        raise HTTPException(status_code=400, detail="用户未注销，无需恢复")
+
+    restore_name = target.original_username or target.username
+    # 冲突检查：同名的另一未删用户
+    clash = db.query(User).filter(
+        User.username == restore_name,
+        User.deleted_at.is_(None),
+        User.user_id != user_id,
+    ).first()
+    if clash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"用户名 {restore_name} 已被其他用户占用，无法恢复；请先改名"
+        )
+
+    target.username = restore_name
+    target.original_username = None
+    target.is_active = True
+    target.deleted_at = None
+    target.deleted_by = None
+    # 密码留着空，让用户走"重置密码"流程
+    db.commit()
+
+    logger.info(
+        f"[audit] admin user_id={current_user.user_id} 恢复用户 {restore_name} (id={user_id})"
+    )
+    return ApiResponse(message=f"用户 {restore_name} 已恢复，请提醒其走'重置密码'流程")

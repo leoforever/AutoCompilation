@@ -23,6 +23,20 @@ class UserPasswordReset(BaseModel):
     new_password: str = Field(..., min_length=6)
 
 
+class UserAdminCreate(BaseModel):
+    """管理员新增用户（角色可选，默认普通用户）"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6)
+    role: str = Field(default="user", pattern="^(user|admin)$")
+
+
+class UserAdminUpdate(BaseModel):
+    """管理员编辑用户（角色 + 启用/禁用，均可选）"""
+    role: Optional[str] = Field(default=None, pattern="^(user|admin)$")
+    is_active: Optional[bool] = None
+
+
 class UserLogin(BaseModel):
     username: str
     password: str
