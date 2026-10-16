@@ -29,7 +29,7 @@ compile:
 # STAGE5_MAX_SECONDS: 整个 stage5 阶段硬上限（默认 1800 = 30 分钟）
 # DOCKER_EXEC_TIMEOUT: 单条 execute 命令 timeout（默认 3600 = 1 小时）
 stage5:
-  max_seconds: 1800    # 整个 stage5 阶段硬上限（秒）
+  max_seconds: 3600    # 整个 stage5 阶段硬上限（秒）
   loop_threshold: 5    # 死循环检测：连续快速失败次数
   loop_window: 5       # 死循环检测：单次失败间隔窗口（秒）
 docker_exec:

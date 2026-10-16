@@ -402,10 +402,46 @@ do_start() {
     info "  提示：其他网卡 IP 可手动拼接 http://<ip>:$FRONTEND_PORT/"
 }
 
+# ========== 清理孤儿编译 worker（worker.py 独立进程，已废弃架构） ==========
+# 2026-10-16 教训：手工 nohup 起的 worker.py 不占端口、PPID=1，kill_port 按端口杀够不到它。
+# 它与 uvicorn 内嵌 lifespan worker 同时轮询队列会抢任务——孤儿进程揣着启动时的旧 AI key，
+# 换模型/改 .env.compile 后它不会感知，抢到任务就 429/用错模型（T-20261016090418-F81929 实例）。
+# 因此 stop/restart 必须把它一并清掉。
+kill_legacy_workers() {
+    local pids
+    # [w]orker 方括号写法防止 pgrep 匹配到自身命令行
+    pids=$(pgrep -f '[w]orker\.py' 2>/dev/null | tr '\n' ' ' || true)
+    if [ -z "${pids// /}" ]; then
+        return 0
+    fi
+    warn "发现残留 worker.py 独立进程（已废弃架构，会抢任务用旧配置）: PID $pids — 清理"
+    for p in $pids; do
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    # 5s 优雅期，然后 SIGKILL 收尾
+    for _ in 1 2 3 4 5; do
+        sleep 1
+        pids=$(pgrep -f '[w]orker\.py' 2>/dev/null | tr '\n' ' ' || true)
+        [ -z "${pids// /}" ] && { info "worker.py 残留进程已清理"; return 0; }
+    done
+    for p in $pids; do
+        kill -KILL "$p" 2>/dev/null || true
+    done
+    sleep 1
+    pids=$(pgrep -f '[w]orker\.py' 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        error "worker.py 残留进程未能完全清理: $pids"
+    else
+        info "worker.py 残留进程已清理（SIGKILL 收尾）"
+    fi
+}
+
 # ========== 停止 ==========
 do_stop() {
     kill_port "$FRONTEND_PORT" "前端"
     kill_port "$BACKEND_PORT"  "后端"
+    # 手工 nohup 起的孤儿 worker.py 不在端口进程树里，必须显式清理（见上）
+    kill_legacy_workers
     # 清理陈旧 PID 文件（探活不再依赖它，留着只是干扰）
     rm -f "$PID_DIR/backend.pid" "$PID_DIR/frontend.pid"
 }

@@ -522,7 +522,16 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 1. 看 Skills 清单，找最匹配的（专用 Skill → generic 工具链 → generic 错误经验）
 2. 命中后 read_file 读全文，按攻略执行
 3. 编译失败再读通用错误类 Skill
-4. 产物生成后移动到输出目录
+
+## 产物输出（强制 — 系统约定）
+**所有编译产物必须最终放到 `/work/output/`，这是 worker 收集产物的唯一路径**。
+不论 Skill 攻略怎么写，编译完成后**必须**把产物复制过去，否则任务会被判定无产物。
+- cmake: `cmake --install build --prefix /work/output` 或 `cp -a build/bin/* /work/output/`
+- go build: `go build -o /work/output/<binary> .`
+- cargo: `cargo install --path . --root /work/output` 或 `cp -a target/release/* /work/output/`
+- make: `make install DESTDIR=/work/output` 或 `cp -a <产物> /work/output/`
+- nodejs: `cp -a dist/* /work/output/` 或 `cp -a build/* /work/output/`
+- 其他: 找到产物目录后 `mkdir -p /work/output && cp -a <产物>/* /work/output/`
 ## 边界
 - ✅ /work 目录内任意改、装编译依赖
 - ❌ /work 外操作、Docker 命令、重启容器
@@ -675,7 +684,8 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             _log(state, "error", state["last_error"], on_log)
 
         if state["status"] != TaskStatus.FAILED.value:
-            state["artifacts"] = _collect_artifacts(container, output_dir)
+            src_dir = f"{state['container_work_dir']}/src"
+            state["artifacts"] = _collect_artifacts(container, state["output_dir"], src_dir)
             _log(state, "info", f"[阶段5] 产物: {len(state['artifacts'])} 个", on_log)
     except Exception as e:
         state["status"] = TaskStatus.FAILED.value
@@ -798,25 +808,108 @@ def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Option
         })
 
 
-def _collect_artifacts(container, output_dir: str) -> list:
+# 排除扩展名（源码 + 中间产物 + 临时文件）
+_EXCLUDE_EXTS = (
+    # 源码
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
+    ".go", ".py", ".rs", ".js", ".ts", ".jsx", ".tsx",
+    ".java", ".kt", ".swift", ".m", ".mm",
+    # 中间产物
+    ".o", ".obj", ".a", ".lo", ".la", ".deps", ".libs",
+    # 临时 / 调试
+    ".log", ".tmp", ".cache", ".swp", ".bak", ".orig",
+    # 源码内嵌资源（不算产物）
+    ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+    # git 元数据
+    ".git", ".gitignore",
+)
+_EXCLUDE_PATHS = (
+    "/.git/", "/.github/", "/test/", "/tests/",
+    "/__pycache__/", "/node_modules/", "/.venv/",
+)
+
+
+def _find_files_smart(container, search_dir: str) -> list:
+    """在容器里扫 search_dir 下"最近 30 分钟修改 + size > 4KB + 非源码"的产物文件。
+
+    不依赖项目结构，扫所有可能位置 — 治本。
+    """
+    # 用 find 过滤：-mmin -30 (30 分钟内) + -size +4k (大于 4KB) + 排除路径
+    cmd = [
+        "find", search_dir, "-type", "f",
+        "-mmin", "-30", "-size", "+4k",
+        "-not", "-path", "*/.git/*",
+    ]
+    result = container.exec_run(cmd)
+    if result.exit_code != 0 or not result.output:
+        return []
+    raw = result.output.decode("utf-8", errors="replace") if isinstance(result.output, (bytes, bytearray)) else str(result.output or "")
+    files = []
+    for line in raw.split("\n"):
+        p = line.strip()
+        if not p:
+            continue
+        # 排除扩展名
+        if any(p.lower().endswith(ext) for ext in _EXCLUDE_EXTS):
+            continue
+        # 排除路径
+        if any(ex in p for ex in _EXCLUDE_PATHS):
+            continue
+        files.append(p)
+    return files[:50]  # 上限 50 个
+
+
+def _collect_artifacts(container, output_dir: str, source_dir: str = "") -> list:
+    """收集产物。
+    1) 先看 /work/output
+    2) 空就 fallback：扫 source_dir 下"编译期间生成 + 非源码"的文件，自动 cp 到 /work/output
+    """
     artifacts = []
     try:
+        # 1) 先看 /work/output
         r = container.exec_run(["find", output_dir, "-type", "f", "-maxdepth", "2"])
         if r.exit_code == 0 and r.output:
-            raw = r.output
-            output = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else (raw or "")
-            for line in output.split("\n"):
+            raw = r.output.decode("utf-8", errors="replace") if isinstance(r.output, (bytes, bytearray)) else (r.output or "")
+            for line in raw.split("\n"):
                 if not line.strip() or Path(line).name in (".", ".."):
                     continue
                 p = line.strip()
                 sr = container.exec_run(["stat", "-c", "%s", p])
                 size = 0
                 if sr.exit_code == 0 and sr.output:
-                    raw = sr.output
-                    s = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, (bytes, bytearray)) else str(raw or "").strip()
-                    size = int(s) if s.isdigit() else 0
+                    raw = sr.output.decode("utf-8", errors="replace").strip() if isinstance(sr.output, (bytes, bytearray)) else str(sr.output or "").strip()
+                    size = int(raw) if raw.isdigit() else 0
                 artifacts.append({"name": Path(p).name, "path": p, "size": size})
-    except Exception:
+        # 2) 空就 fallback
+        if not artifacts and source_dir:
+            # 看 source_dir 存不存在
+            check = container.exec_run(["bash", "-c", f"[ -d {source_dir} ] && echo OK || echo MISSING"])
+            check_out = check.output.decode("utf-8", errors="replace") if isinstance(check.output, (bytes, bytearray)) else str(check.output or "")
+            if "OK" in check_out:
+                candidates = _find_files_smart(container, source_dir)
+                if candidates:
+                    # 自动复制到 /work/output
+                    container.exec_run(["bash", "-c", f"mkdir -p {output_dir}"])
+                    # 用 xargs 批量复制
+                    cmd_str = " ".join(f"'{f}'" for f in candidates)
+                    container.exec_run(["bash", "-c",
+                        f"cp -a {cmd_str} {output_dir}/ 2>/dev/null || true"])
+                    # 重新扫 output_dir
+                    r2 = container.exec_run(["find", output_dir, "-type", "f", "-maxdepth", "3"])
+                    if r2.exit_code == 0 and r2.output:
+                        raw = r2.output.decode("utf-8", errors="replace") if isinstance(r2.output, (bytes, bytearray)) else (r2.output or "")
+                        for line in raw.split("\n"):
+                            if not line.strip() or Path(line).name in (".", ".."):
+                                continue
+                            p = line.strip()
+                            sr = container.exec_run(["stat", "-c", "%s", p])
+                            size = 0
+                            if sr.exit_code == 0 and sr.output:
+                                raw = sr.output.decode("utf-8", errors="replace").strip() if isinstance(sr.output, (bytes, bytearray)) else str(sr.output or "").strip()
+                                size = int(raw) if raw.isdigit() else 0
+                            artifacts.append({"name": Path(p).name, "path": p, "size": size})
+    except Exception as e:
+        # fallback 失败也不致命，返 0
         pass
     return artifacts[:10]
 
