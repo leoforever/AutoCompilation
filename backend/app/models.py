@@ -103,11 +103,16 @@ class User(Base):
 
     user_id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
+    original_username = Column(String(50), nullable=True)  # 软删时原名快照（用于恢复 / 审计 / 显示）
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), default="user", nullable=False)  # user | admin
     created_at = Column(DateTime, default=datetime.utcnow)
     last_active = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
+    # 软删：NULL = 正常；非 NULL = 注销时间（行不删、引用不断、统计可用）
+    # 删除时同时：is_active=False + 改名 deleted_<uid>_<ts>（释放 username unique）+ 清空 password_hash
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by = Column(Integer, ForeignKey("users.user_id"), nullable=True)  # 谁操作的（admin 注销他人/自己）
 
     # 关系
     compile_tasks = relationship("CompileTask", back_populates="user")
@@ -298,6 +303,10 @@ def init_db():
     # 2026-10-13: TargetSystem 简化（drop arch / tag，只用 name + base_image）
     _safe_drop_column("target_systems", "arch")
     _safe_drop_column("target_systems", "tag")
+    # 2026-10-16: User 软删（deleted_at + deleted_by + original_username）
+    _safe_add_column("users", "deleted_at", "TIMESTAMP NULL")
+    _safe_add_column("users", "deleted_by", "INTEGER NULL")
+    _safe_add_column("users", "original_username", "VARCHAR(50) NULL")
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
     _seed_default_target_systems()
     logger.info("Database initialized")
