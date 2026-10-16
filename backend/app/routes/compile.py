@@ -315,7 +315,7 @@ async def get_compile_log(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取编译日志（DB 文本字段，兼容老接口）"""
+    """获取编译日志 — 优先 build.log 文件全文（实时追加、含全部行），无文件回退 DB"""
     task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -323,6 +323,13 @@ async def get_compile_log(
     if current_user.role != "admin" and task.user_id != current_user.user_id:
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
+    from app.services.compile_engine import _artifacts_dir
+    log_file = _artifacts_dir() / task_id / "build.log"
+    if log_file.exists():
+        try:
+            return {"task_id": task_id, "log": log_file.read_text(encoding="utf-8", errors="replace")}
+        except Exception:
+            pass
     return {"task_id": task_id, "log": task.log_output or ""}
 
 

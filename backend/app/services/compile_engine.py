@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import tarfile
@@ -94,7 +95,7 @@ _PERIODIC_COMMIT_EVERY = 20
 
 
 def _log(state: TaskState, level: str, msg: str, on_log: Optional[LogCallback] = None):
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now().strftime("%m-%d %H:%M:%S")
     line = f"[{ts}] [{level.upper()}] {msg}"
     print(line)
     # 1) 内存累积（周期 commit 到 DB）
@@ -187,6 +188,12 @@ def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallbac
     print(f"[DEBUG stage1] task_id={task.task_id} source_type={state['source_type']!r} "
           f"task.source_path={task.source_path!r} state.source_path={state['source_path']!r} "
           f"task.id={task.id}", flush=True)
+    # 文件兜底日志：目录 + build.log 从阶段1就建立，保证阶段1/2 的行也进文件
+    # （历史 bug：host_log_path 到阶段3才赋值，build.log 缺阶段1/2）
+    base_dir = _artifacts_dir() / task.task_id
+    base_dir.mkdir(parents=True, exist_ok=True)
+    state["work_dir"] = str(base_dir)
+    state["host_log_path"] = str(base_dir / "build.log")
     _log(state, "info", f"[阶段1] 任务初始化: {task.task_id} / {task.software_name}", on_log)
     return state
 
@@ -598,6 +605,12 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         result = None
         prev_msg_count = 0
         chunk_count = 0
+        # 长命令心跳：chunk 间隔 > gap 秒时补一行"仍在跑"（现在 pip install 300s 期间日志静默像卡死）
+        try:
+            _hb_gap = float(os.environ.get("STAGE5_HEARTBEAT_SECONDS", "30"))
+        except ValueError:
+            _hb_gap = 30.0
+        _last_chunk_ts = start_ts
         # 死循环检测：连续快速失败计数器
         # "快速失败" = 上一条 tool result 距今 < _loop_window 秒 + tool result 内容是 error/traceback
         _recent_fast_fail_count = 0
@@ -609,6 +622,14 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         ):
             chunk_count += 1
             elapsed = time.time() - start_ts
+            # 心跳：距上一 chunk 静默 > _hb_gap 秒 → 补一行（stream 同步阻塞，心跳随下一 chunk 落地；
+            # 对 60s 静默 pip install 这类场景，用户至少能看到"刚才静默了 Xs，不是卡死"）
+            _gap = time.time() - _last_chunk_ts
+            if _gap > _hb_gap:
+                _log(state, "info",
+                     f"[阶段5] 💓 静默 {_gap:.0f}s 后恢复（长命令执行中，非卡死）",
+                     on_log)
+            _last_chunk_ts = time.time()
             # 上限检查
             if chunk_count > _max_chunks:
                 _log(state, "error",
@@ -758,8 +779,10 @@ def _truncate(s: str, n: int = 200) -> str:
     s = s.replace("\n", " ⏎ ").strip()
     if len(s) <= n:
         return s
-    h = (n - 5) // 2
-    return f"{s[:h]} ... {s[-h:]}"
+    # head 40% + tail 60%：报错/退出码通常在输出尾部，多留尾
+    h = int((n - 12) * 0.4)
+    t = n - 12 - h
+    return f"{s[:h]} …省略{len(s)-h-t}字… {s[-t:]}"
 
 
 def _classify_tool(name: str) -> str:
@@ -770,6 +793,19 @@ def _classify_tool(name: str) -> str:
     }.get(name, name)
 
 
+# docker exec 输出尾标 [Command failed with exit code N] / [Command succeeded...]
+_EXIT_RE = re.compile(r"\[Command (?:succeeded|failed) with exit code (\d+)\]")
+
+
+def _tool_arg(tool_args: dict, *keys: str, default: str = "") -> str:
+    """按优先级从 args 取第一个存在的 key — 兼容 path/file_path/command/cmd 等参数名差异"""
+    for k in keys:
+        v = tool_args.get(k)
+        if v:
+            return str(v)
+    return default
+
+
 def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Optional[LogCallback]):
     ts = time.time() - start_ts
     msg_type = getattr(msg, "type", None) or getattr(msg, "role", None) or msg.__class__.__name__
@@ -778,20 +814,24 @@ def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Option
         content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
         tool_calls = getattr(msg, "tool_calls", None) or []
         if content and content.strip():
-            _log(state, "info", f"[+{ts:5.1f}s] 💭 AI: {_truncate(content, 160)}", on_log)
+            _log(state, "info", f"[+{ts:.1f}s] 💭 AI: {_truncate(content, 160)}", on_log)
         for tc in tool_calls:
             tool_name = tc.get("name", "?")
-            tool_args = tc.get("args", {})
+            tool_args = tc.get("args", {}) or {}
             label = _classify_tool(tool_name)
+            # T4.1 配对短 id：并发多命令时 ▶[a3f2]/✓[a3f2] 能对上
+            _cid = (tc.get("id") or "")[-4:]
+            tag = f"[{_cid}]" if _cid else ""
             if tool_name == "execute":
-                preview = f"$ {_truncate(tool_args.get('command', ''), 200)}"
+                preview = f"$ {_truncate(_tool_arg(tool_args, 'command', 'cmd'), 300)}"
             elif tool_name in ("ls", "read_file"):
-                preview = tool_args.get("path", "")
+                # deepagents read_file/ls 参数名是 file_path/path 两种都兼容（历史 bug：只取 path 显示空）
+                preview = _tool_arg(tool_args, "file_path", "path") or _truncate(str(tool_args), 120)
             elif tool_name == "write_file":
-                preview = f"→ {tool_args.get('path', '')}"
+                preview = f"→ {_tool_arg(tool_args, 'file_path', 'path')}"
             else:
                 preview = _truncate(str(tool_args), 120)
-            _log(state, "info", f"[+{ts:5.1f}s] ▶ [{label}] {preview}", on_log)
+            _log(state, "debug", f"[+{ts:.1f}s] ▶{tag} [{label}] {preview}", on_log)
             state.setdefault("build_logs", []).append({
                 "ts": round(ts, 2), "kind": "tool_call",
                 "tool": tool_name, "args": tool_args,
@@ -799,9 +839,20 @@ def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Option
     elif msg_type == "tool":
         content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
         tool_name = getattr(msg, "name", "tool")
-        summary = _truncate(content, 200)
-        mark = "❌" if ("error:" in content.lower() or "traceback" in content.lower()) else "✓"
-        _log(state, "info", f"[+{ts:5.1f}s]   {mark} {summary}", on_log)
+        _tcid = (getattr(msg, "tool_call_id", "") or "")[-4:]
+        tag = f"[{_tcid}]" if _tcid else ""
+        # exit code 优先判定（docker exec 尾标 [Command failed with exit code N]），关键词猜仅作兜底
+        m = _EXIT_RE.search(content)
+        exit_code = int(m.group(1)) if m else None
+        if exit_code is not None:
+            mark = "✓" if exit_code == 0 else "❌"
+            tail = "" if exit_code == 0 else f" → exit={exit_code}"
+        else:
+            mark = "❌" if ("error:" in content.lower() or "traceback" in content.lower()) else "✓"
+            tail = ""
+        summary = _truncate(content, 400)
+        _log(state, "warn" if mark == "❌" else "info",
+             f"[+{ts:.1f}s]   {mark}{tag} {summary}{tail}", on_log)
         state.setdefault("build_logs", []).append({
             "ts": round(ts, 2), "kind": "tool_result",
             "tool": tool_name, "output_len": len(content),
@@ -923,6 +974,23 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
     state: TaskState = {}
     db: Session = SessionLocal()
     task = None
+    # 各阶段耗时（终态摘要用）；name 不带括号，渲染统一加
+    _durs: dict = {}
+    def _fin(name, fn):
+        s0 = time.time()
+        try:
+            return fn()
+        finally:
+            _durs[name] = time.time() - s0
+            _log(state, "debug", f"[{name}] 完成 (耗时 {time.time()-s0:.1f}s)", on_log)
+    def _summary():
+        parts = " ".join(f"{k}={v:.1f}s" for k, v in _durs.items())
+        _log(state, "info", "════════ 任务总结 ════════", on_log)
+        _log(state, "info", f"各阶段耗时: {parts}", on_log)
+        if state.get("status") == TaskStatus.FAILED.value:
+            _log(state, "error", f"根因: {_truncate(state.get('last_error') or '', 300)}", on_log)
+        else:
+            _log(state, "success", f"结果: {state.get('status')}，产物 {len(state.get('artifacts') or [])} 个", on_log)
     try:
         task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
         if not task:
@@ -933,33 +1001,39 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
         state["_task"] = task
         state["task_id"] = task_id
 
-        stage1_init(task, state, on_log)
+        _fin("阶段1", lambda: stage1_init(task, state, on_log))
         if state["status"] == TaskStatus.FAILED.value:
+            _summary()
             return _persist_and_return(db, task, state)
 
-        stage2_match_env(state, on_log)
+        _fin("阶段2", lambda: stage2_match_env(state, on_log))
         if state["status"] == TaskStatus.FAILED.value:
+            _summary()
             return _persist_and_return(db, task, state)
 
-        stage3_create_container(state, on_log)
+        _fin("阶段3", lambda: stage3_create_container(state, on_log))
         if state["status"] == TaskStatus.FAILED.value:
+            _summary()
             return _persist_and_return(db, task, state)
 
-        stage4a_fetch_source_on_host(state, on_log)
-        if state["status"] == TaskStatus.FAILED.value:
-            try: stage6_cleanup(state, on_log)
-            except Exception: pass
-            return _persist_and_return(db, task, state)
-
-        stage4_import_source(state, on_log)
+        _fin("阶段4a", lambda: stage4a_fetch_source_on_host(state, on_log))
         if state["status"] == TaskStatus.FAILED.value:
             try: stage6_cleanup(state, on_log)
             except Exception: pass
+            _summary()
             return _persist_and_return(db, task, state)
 
-        stage5_run_agent(state, on_log)
-        stage6_cleanup(state, on_log)
+        _fin("阶段4", lambda: stage4_import_source(state, on_log))
+        if state["status"] == TaskStatus.FAILED.value:
+            try: stage6_cleanup(state, on_log)
+            except Exception: pass
+            _summary()
+            return _persist_and_return(db, task, state)
 
+        _fin("阶段5", lambda: stage5_run_agent(state, on_log))
+        _fin("阶段6", lambda: stage6_cleanup(state, on_log))
+
+        _summary()
         return _persist_and_return(db, task, state)
     except Exception as e:
         state["status"] = TaskStatus.FAILED.value
@@ -968,6 +1042,7 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
         import traceback; traceback.print_exc()
         try: stage6_cleanup(state, on_log)
         except Exception: pass
+        _summary()
         return _persist_and_return(db, task, state)
     finally:
         db.close()

@@ -349,7 +349,7 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
       logLines.value = logText.split('\n')
         .filter((line: string) => line.trim())
         .map((line: string) => {
-          const m = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s+\[(\w+)\]\s+(.*)$/)
+          const m = line.match(/^\[(\d{2}-\d{2} \d{2}:\d{2}:\d{2}|(?:\d{2}:\d{2}:\d{2}))\]\s+\[(\w+)\]\s+(.*)$/)
           if (m) return { text: `${m[1]} ${m[3]}`, type: mapLevel(m[2]) }
           return { text: line, type: 'info' }
         })
@@ -636,6 +636,7 @@ function mapLevel(level: string): string {
     case 'warn':
     case 'warning': return 'warn'
     case 'success': return 'ok'
+    case 'debug': return 'dim'
     case 'info':
     default: return 'info'
   }

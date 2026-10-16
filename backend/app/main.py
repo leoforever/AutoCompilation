@@ -27,6 +27,26 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# T4.2: uvicorn access log 掩码 WS URL 里的 ?token=***（此前 JWT 明文 90+ 次进过 backend.log）
+import re as _re
+_TOKEN_QS_RE = _re.compile(r"([?&]token=)[^&\s]+")
+
+
+class _SensitiveQueryFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            if "token=" in msg:
+                record.msg = _TOKEN_QS_RE.sub(r"\1***", msg)
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_SensitiveQueryFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时 spawn N 个 worker 后台线程；结束时发停止信号

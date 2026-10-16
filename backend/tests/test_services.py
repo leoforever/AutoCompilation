@@ -28,7 +28,12 @@ def test_skill_loader_path():
 def test_skill_loader_count():
     from app.services.skill_loader import SKILLS_DIR_HOST
     md = list(SKILLS_DIR_HOST.rglob("SKILL.md"))
-    assert len(md) == 5, f"got {len(md)}: {md}"
+    # 曾硬编码 ==5，新增 skill 即碎 → 校验下限 + 已知 skill 全覆盖（数量随库增长自适应）
+    names = {p.parent.name for p in md}
+    assert len(md) >= 5, f"got {len(md)}: {md}"
+    for k in ("go-toolchain", "nodejs-toolchain", "python-environment",
+              "ollama-openeuler-2403", "python-package"):
+        assert k in names, f"缺失 skill: {k}"
 
 
 def test_skill_loader_sources():
@@ -82,7 +87,6 @@ def test_compile_engine_imports():
         run_task, stage1_init, stage2_match_env, stage3_create_container,
         stage4a_fetch_source_on_host, stage4_import_source,
         stage5_run_agent, stage6_cleanup,
-        ENV_BY_NAME,
     )
     assert callable(run_task)
     assert all(callable(f) for f in [
@@ -90,7 +94,7 @@ def test_compile_engine_imports():
         stage4a_fetch_source_on_host, stage4_import_source,
         stage5_run_agent, stage6_cleanup,
     ])
-    assert "openEuler 24.03 LTS" in ENV_BY_NAME
+    # ENV_BY_NAME 已随 stage2 改造为 DB 驱动（TargetSystem.base_image）删除，不再断言
 
 
 def test_stage4a_uses_subprocess_not_docker_exec():
@@ -315,8 +319,9 @@ def test_skills_middleware_in_container():
             type("R", (), {})(), {},
         )
         loaded = sorted(s["name"] for s in res["skills_metadata"])
-        expected = sorted(["go-toolchain", "nodejs-toolchain", "python-environment",
-                          "ollama-openeuler-2403", "llama-cpp-openeuler-2403"])
+        # 期望名单从磁盘推导（曾硬编码 5 个旧名字，llama-cpp 更名/新增 skill 即碎）
+        # 若有 skill 因 frontmatter 坏被 middleware skip，磁盘集合 ⊃ loaded 集合 → 本断言会失败报警
+        expected = sorted({p.parent.name for p in SKILLS_DIR_HOST.rglob("SKILL.md")})
         assert loaded == expected, f"got {loaded}"
         assert res["skills_load_errors"] == []
     finally:

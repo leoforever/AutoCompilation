@@ -206,11 +206,23 @@ async function viewLog(task: any) {
   const res = await api.get(`/compile/tasks/${task.task_id}/log`)
   // axios 拦截器已 unwrap response.data，res 直接是 {task_id, log}
   const log = res.log || res.data?.log || ''
-  currentLog.value = log.split('\n').filter(Boolean).map(line => ({
-    text: line,
-    type: line.includes('[OK]') ? 'ok' : line.includes('[ERROR]') ? 'err' : line.includes('[WARN]') ? 'warn' : 'dim'
-  }))
+  // 解析 [HH:MM:SS] [LEVEL] 前缀分级（与 Workbench mapLevel 对齐；旧版按 [OK] 关键词全对不上后端的 SUCCESS/DEBUG）
+  currentLog.value = log.split('\n').filter((l: string) => l.trim()).map((line: string) => {
+    const m = line.match(/^\[[^\]]*\d{2}:\d{2}:\d{2}[^\]]*\]\s+\[(\w+)\]\s+(.*)$/)
+    if (m) return { text: line, type: mapLevel(m[1]) }
+    return { text: line, type: 'info' }
+  })
   logDialogVisible.value = true
+}
+
+function mapLevel(level: string): string {
+  switch (level) {
+    case 'ERROR': return 'err'
+    case 'WARN': return 'warn'
+    case 'SUCCESS': return 'ok'
+    case 'DEBUG': return 'dim'
+    default: return 'info'
+  }
 }
 
 function downloadArtifact(task: any) {
@@ -398,4 +410,5 @@ onMounted(loadTasks)
 .log-line.err { color: #f87171 }
 .log-line.warn { color: #fbbf24 }
 .log-line.dim { color: #64748b }
+.log-line.info { color: #cbd5e1 }
 </style>
