@@ -6,7 +6,7 @@
         龙芯智能编译平台
         <small>LoongArch Smart Compile Platform</small>
       </div>
-      <div class="role-switch">
+      <div class="role-switch" v-if="authStore.isAdmin">
         <button 
           :class="{ active: role === 'user' }" 
           @click="setRole('user')"

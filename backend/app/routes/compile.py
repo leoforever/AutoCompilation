@@ -21,7 +21,7 @@ from datetime import datetime
 from app.dependencies import get_current_user
 from app.models import User
 
-from app.models import get_db, CompileTask, TaskStatus, TargetSystem
+from app.models import get_db, CompileTask, TaskStatus, TargetSystem, Skill
 from app.schemas import (
     CompileTaskCreate, CompileTaskResponse, CompileTaskListResponse,
     ApiResponse
@@ -236,6 +236,33 @@ async def upload_and_submit(
             "bytes": bytes_written,
         },
     )
+
+
+@router.get("/options/systems", response_model=ApiResponse)
+async def list_system_options(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """编译工作台公开的目标系统选项 — 仅 active，只给 system_id/name。
+    （base_image 是部署信息不外泄，admin 走 /admin/systems）"""
+    rows = db.query(TargetSystem).filter(TargetSystem.is_active == True).all()
+    return ApiResponse(data=[
+        {"system_id": s.system_id, "name": s.name, "is_active": True}
+        for s in rows
+    ])
+
+
+@router.get("/options/skills", response_model=ApiResponse)
+async def list_skill_options(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """编译工作台公开的已加载 Skill 清单 — 仅 name/type（正文与元数据走 /admin/skills）"""
+    rows = db.query(Skill).filter(Skill.is_active == True).all()
+    return ApiResponse(data=[
+        {"name": s.name, "type": s.type}
+        for s in rows
+    ])
 
 
 @router.get("/tasks", response_model=CompileTaskListResponse)

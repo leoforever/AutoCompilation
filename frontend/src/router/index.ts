@@ -113,9 +113,9 @@ router.beforeEach((to, from, next) => {
   
   // 检查角色权限
   if (requiredRole && authStore.user?.role !== requiredRole) {
-    // 角色不匹配，重定向到对应角色的首页
-    const redirect = requiredRole === 'admin' ? '/dashboard' : '/workbench'
-    return next(redirect)
+    // 权限不足 → 回用户前台首页
+    // （原逻辑 requiredRole==='admin' 时跳 /dashboard 本身就是 admin 路由，会死循环）
+    return next('/workbench')
   }
   
   next()
