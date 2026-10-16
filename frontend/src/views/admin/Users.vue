@@ -24,9 +24,10 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="140">
+          <el-table-column label="操作" width="220">
             <template #default="{ row }">
               <el-button size="small" @click="editUser(row)">编辑</el-button>
+              <el-button size="small" type="warning" plain @click="openResetPwd(row)">重置密码</el-button>
               <el-button 
                 v-if="row.is_active" 
                 size="small" 
@@ -55,6 +56,23 @@
         </el-table>
       </div>
     </div>
+
+    <!-- 重置密码对话框 -->
+    <el-dialog v-model="resetPwdVisible" :title="`🔑 重置密码 — ${resetPwdTarget?.username || ''}`" width="420px">
+      <el-form @submit.prevent="doResetPwd">
+        <el-form-item label="新密码">
+          <el-input v-model="newPassword" type="password" show-password
+            placeholder="至少 6 位" minlength="6" />
+        </el-form-item>
+        <div class="reset-hint">该用户当前密码将立即失效，用新密码登录。</div>
+      </el-form>
+      <template #footer>
+        <el-button @click="resetPwdVisible = false">取消</el-button>
+        <el-button type="primary" :loading="resetting" :disabled="newPassword.length < 6" @click="doResetPwd">
+          确认重置
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -65,6 +83,10 @@ import { ElMessage } from 'element-plus'
 
 const users = ref<any[]>([])
 const auditLogs = ref<any[]>([])
+const resetPwdVisible = ref(false)
+const resetPwdTarget = ref<any>(null)
+const newPassword = ref('')
+const resetting = ref(false)
 
 function formatDate(dateStr: string) {
   if (!dateStr) return '-'
@@ -94,6 +116,29 @@ function editUser(user: any) {
   ElMessage.info(`编辑用户 ${user.username}`)
 }
 
+function openResetPwd(user: any) {
+  resetPwdTarget.value = user
+  newPassword.value = ''
+  resetPwdVisible.value = true
+}
+
+async function doResetPwd() {
+  if (!resetPwdTarget.value || newPassword.value.length < 6) return
+  resetting.value = true
+  try {
+    const res: any = await api.put(
+      `/admin/users/${resetPwdTarget.value.user_id}/password`,
+      { new_password: newPassword.value }
+    )
+    ElMessage.success(res?.message || `用户 ${resetPwdTarget.value.username} 密码已重置`)
+    resetPwdVisible.value = false
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '重置失败')
+  } finally {
+    resetting.value = false
+  }
+}
+
 async function toggleUser(user: any, isActive: boolean) {
   await api.put(`/admin/users/${user.user_id}`, { is_active: isActive })
   ElMessage.success(isActive ? '用户已启用' : '用户已禁用')
@@ -114,4 +159,5 @@ onMounted(() => {
 .grid { display: grid; gap: 16px }
 .g2 { grid-template-columns: 1fr 1fr }
 @media (max-width: 1100px) { .g2 { grid-template-columns: 1fr } }
+.reset-hint { color: var(--text3); font-size: 12px; margin-top: 4px }
 </style>

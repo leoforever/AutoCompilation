@@ -7,14 +7,17 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
 import json
+import bcrypt
 
 from app.models import get_db, Ticket, Experience, Skill, User, TargetSystem, CompileTask, \
     TicketStatus, ExperienceStatus, UserRole
 from app.schemas import (
     TargetSystemCreate, TargetSystemUpdate, TargetSystemResponse,
     SkillCreate, SkillUpdate, SkillResponse,
+    UserPasswordReset,
     StatsOverview, ApiResponse
 )
+from app.dependencies import get_current_user
 from app.services.skill_loader import write_skill_to_disk, remove_skill_from_disk
 import logging
 
@@ -579,3 +582,28 @@ async def list_users(
         }
         for u in users
     ])
+
+
+@router.put("/users/{user_id}/password", response_model=ApiResponse)
+async def reset_user_password(
+    user_id: int,
+    body: UserPasswordReset,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """管理员重置指定用户密码（bcrypt rounds=12，与注册/改密一致）"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+
+    target = db.query(User).filter(User.user_id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    target.password_hash = bcrypt.hashpw(
+        body.new_password.encode(),
+        bcrypt.gensalt(rounds=12)
+    ).decode()
+    db.commit()
+
+    logger.info(f"[audit] admin user_id={current_user.user_id} 重置了 user_id={user_id} ({target.username}) 的密码")
+    return ApiResponse(message=f"用户 {target.username} 密码已重置")

@@ -17,6 +17,12 @@ class UserCreate(BaseModel):
     role: UserRole = UserRole.USER
 
 
+class UserPasswordReset(BaseModel):
+    """管理员重置指定用户密码"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    new_password: str = Field(..., min_length=6)
+
+
 class UserLogin(BaseModel):
     username: str
     password: str
