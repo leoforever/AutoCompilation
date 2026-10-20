@@ -78,6 +78,7 @@ class TaskState(TypedDict, total=False):
     work_dir: str
     container_work_dir: str
     host_log_path: str  # 宿主机 build.log 路径（兜底双写用）
+    _matched_skills: list  # Skill 命中收口：agent 实际读取过的 SKILL.md 名（有序去重）
     build_logs: list
     current_attempt: int
     last_error: str
@@ -614,13 +615,16 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         # 默认 200 chunk / 30 分钟（ollama cmake --build 要 15+ 分钟，10 分钟不够）
         # 死循环启发式：连续 5 次快速 execute 失败 → 强退（区别真编译 vs 死循环）
         try:
-            _max_chunks = int(os.environ.get("STAGE5_MAX_CHUNKS", "200"))
+            _max_chunks = int(os.environ.get("STAGE5_MAX_CHUNKS", "500"))
         except ValueError:
-            _max_chunks = 200
+            _max_chunks = 500
         try:
-            _max_seconds = int(os.environ.get("STAGE5_MAX_SECONDS", "1800"))  # 30 分钟
+            _max_seconds = int(os.environ.get("STAGE5_MAX_SECONDS", "10800"))  # 3 小时
+            # 2026-10-20：1800→10800。教训：torch 源码编译 ninja 一步就 ~30min+，
+            # 任务 233 被 1800s 一刀切打死（"超时 2292s"非编译失败）；
+            # 死循环仍由 chunk 上限 + 连续快速失败启发式兜底
         except ValueError:
-            _max_seconds = 1800
+            _max_seconds = 10800
         try:
             _loop_threshold = int(os.environ.get("STAGE5_LOOP_THRESHOLD", "5"))  # 连续快速失败次数
         except ValueError:
@@ -835,6 +839,27 @@ def _classify_tool(name: str) -> str:
 # docker exec 输出尾标 [Command failed with exit code N] / [Command succeeded...]
 _EXIT_RE = re.compile(r"\[Command (?:succeeded|failed) with exit code (\d+)\]")
 
+# Skill 命中收口（2026-10-20）：agent read_file 读 /skills/{generic|specific}/<name>/SKILL.md 即算命中。
+# 命中名单进 state["_matched_skills"]（有序去重）→ WS 实时推 skills_matched 事件 + 终态落 CompileTask.matched_skills
+_SKILL_READ_RE = re.compile(r"/skills/(?:generic|specific)/([a-z0-9][a-z0-9-]*)/SKILL\.md")
+
+
+def _record_skill_match(state: "TaskState", name: str, on_log=None) -> None:
+    """登记一次 Skill 命中：内存集合 + 日志行（进 build.log/DB，mount 恢复可解析）+ WS 实时事件"""
+    matched = state.setdefault("_matched_skills", [])
+    if name in matched:
+        return
+    matched.append(name)
+    _log(state, "info", f"[阶段5] ✅ 命中 Skill: {name}", on_log)
+    try:
+        from app.services.ws_broadcaster import BROADCASTER
+        tid = state.get("task_id")
+        if tid:
+            BROADCASTER.publish(tid, {"type": "skills_matched", "name": name,
+                                      "names": list(matched), "ts": time.time()})
+    except Exception:
+        pass  # WS 推失败不影响编译主流程（日志行已落，mount 恢复兜底）
+
 
 def _tool_arg(tool_args: dict, *keys: str, default: str = "") -> str:
     """按优先级从 args 取第一个存在的 key — 兼容 path/file_path/command/cmd 等参数名差异"""
@@ -866,6 +891,10 @@ def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Option
             elif tool_name in ("ls", "read_file"):
                 # deepagents read_file/ls 参数名是 file_path/path 两种都兼容（历史 bug：只取 path 显示空）
                 preview = _tool_arg(tool_args, "file_path", "path") or _truncate(str(tool_args), 120)
+                if tool_name == "read_file":
+                    _m = _SKILL_READ_RE.search(preview)
+                    if _m:
+                        _record_skill_match(state, _m.group(1), on_log)
             elif tool_name == "write_file":
                 preview = f"→ {_tool_arg(tool_args, 'file_path', 'path')}"
             else:
@@ -1094,6 +1123,10 @@ def _persist_and_return(db: Session, task: Optional[CompileTask], state: TaskSta
             task.status = state.get("status", TaskStatus.FAILED.value)
             task.log_output = state.get("log_output", "")
             task.error_message = state.get("last_error", "")
+            # Skill 命中收口落库（2026-10-20）：agent 实际读过的 SKILL.md 名单，DB=权威
+            _ms = state.get("_matched_skills") or []
+            if _ms:
+                task.matched_skills = json.dumps(_ms, ensure_ascii=False)
             artifacts = state.get("artifacts", [])
             task.artifact_path = json.dumps(artifacts, ensure_ascii=False) if artifacts else (task.artifact_path or None)
             now = datetime.utcnow()

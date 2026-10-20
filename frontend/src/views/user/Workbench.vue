@@ -352,9 +352,14 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
           if (m) return { text: `${m[1]} ${m[3]}`, type: mapLevel(m[2]) }
           return { text: line, type: 'info' }
         })
-      // 重新从历史日志里扫匹配的 skill（之前只在 WS 流式 append 时实时扫，
-      // 重新 mount 时没回放，matchedSkills 一直空）
-      // 用整段 log 文本扫更稳（不依赖行格式解析）
+      // Skill 命中恢复（2026-10-20）：DB matched_skills（后端收口落库，权威）优先，
+      // 历史任务列空 → 回退日志文本解析（路径正则兼容 torch 233 这类老任务）
+      if (t.matched_skills) {
+        try {
+          const arr = JSON.parse(t.matched_skills)
+          if (Array.isArray(arr)) for (const n of arr) addMatchedSkill(n)
+        } catch { /* 老数据非 JSON 形态，忽略 */ }
+      }
       extractSkillsFromText(logText)
     }
     // 状态
@@ -393,8 +398,9 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
 
 onMounted(async () => {
   loadSystems()
-  // 0) 立即拉可用 skills（页面打开就知道知识库有哪几个）
-  fetchAvailableSkills()
+  // 0) 先确保 skills 全量到位（await：restore 解析命中名单要用它做存在性校验，
+  //    不 await 会竞态——availableSkills 空时所有解析结果被误过滤）
+  await fetchAvailableSkills()
   // 1) 优先 sessionStorage（用户切走再切回）
   const savedTid = sessionStorage.getItem(TASK_STORAGE_KEY)
   if (savedTid) {
@@ -586,6 +592,12 @@ function subscribeWS(task_id: string) {
       return
     }
 
+    if (payload.type === 'skills_matched') {
+      // 后端收口实时推送：agent 读了哪个 SKILL.md（names=全量已命中名单）
+      for (const n of (payload.names || [])) addMatchedSkill(n)
+      return
+    }
+
     if (payload.type === 'log') {
       const level = payload.level || 'info'
       appendLog(mapLevel(level), payload.msg)
@@ -641,29 +653,36 @@ function mapLevel(level: string): string {
   }
 }
 
-// 从日志文本里提取已命中的 skill 名（按 SKILL.md 名字列表匹配）
+// 从日志提取命中的 skill（2026-10-20 重构：删写死的 known 名单——
+// 它每加一个 skill 就瞎一个，还把 llama-cpp 名字都配错过）。
+// 名单动态来自 availableSkills（/compile/options/skills 拉的全量），匹配两种日志形态：
+//   ① 后端收口行 "[阶段5] ✅ 命中 Skill: <name>"（新任务）
+//   ② read_file 路径 "/skills/generic|specific/<name>/SKILL.md"（历史日志兼容，torch 233 等）
+const _SKILL_PATH_RE = /\/skills\/(?:generic|specific)\/([a-z0-9][a-z0-9-]*)\/SKILL\.md/
+function _matchSkillName(raw: string): string | null {
+  const m = raw.match(/命中 Skill: ([a-z0-9][a-z0-9-]*)/) || raw.match(_SKILL_PATH_RE)
+  if (!m) return null
+  // 必须是真实存在的 skill（防误伤：agent 也可能读到别的路径/文字提及）
+  return availableSkills.value.some(a => a.name === m[1]) ? m[1] : null
+}
+function addMatchedSkill(name: string) {
+  if (matchedSkills.value.some(m => m.name === name)) return
+  const meta = availableSkills.value.find(a => a.name === name)
+  matchedSkills.value.push({ name, type: (meta?.type as any) || 'generic' })
+}
 function extractSkillsFromLine(text: string) {
   if (!text) return
-  const known = [
-    // 通用 Skill（实际 SKILL.md name）
-    { name: 'go-toolchain', type: 'generic' },
-    { name: 'nodejs-toolchain', type: 'generic' },
-    { name: 'python-environment', type: 'generic' },
-    // 专用 Skill
-    { name: 'ollama-openeuler-2403', type: 'specific' },
-    { name: 'llama-cpp-openeuler-2403', type: 'specific' },
-  ]
-  for (const s of known) {
-    if (text.includes(s.name) && !matchedSkills.value.some(m => m.name === s.name)) {
-      matchedSkills.value.push(s)
-    }
-  }
+  const n = _matchSkillName(text)
+  if (n) addMatchedSkill(n)
 }
 
-// 整段文本扫（重新 mount 时用，log 拼成一行搜更稳）
-function extractSkillsFromText(text: string) {
+// 整段文本扫（重新 mount 时用）：逐行匹配 + WS skills_matched 名单并入
+function extractSkillsFromText(text: string, wsNames?: string[]) {
   if (!text) return
-  extractSkillsFromLine(text)
+  for (const line of text.split('\n')) {
+    const n = _matchSkillName(line)
+    if (n) addMatchedSkill(n)
+  }
 }
 
 function appendLog(type: string, text: string) {

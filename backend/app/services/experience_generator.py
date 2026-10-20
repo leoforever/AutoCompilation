@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -304,8 +305,15 @@ def generate_draft(db: "Session", task_id: int) -> dict:
     try:
         ms = task.matched_skills
         if ms:
-            matched_skills_obj = ms if isinstance(ms, list) else []
-            matched_skills = ", ".join(str(s) for s in matched_skills_obj)
+            # 2026-10-20 起该列=JSON list[str]（agent 读过的 SKILL.md）；老数据可能是别的形态，解析失败不炸
+            try:
+                parsed = json.loads(ms) if isinstance(ms, str) else ms
+                if isinstance(parsed, list):
+                    matched_skills = ", ".join(str(s) for s in parsed)
+                else:
+                    matched_skills = str(ms)[:200]
+            except (ValueError, TypeError):
+                matched_skills = str(ms)[:200]
     except Exception:
         pass
 

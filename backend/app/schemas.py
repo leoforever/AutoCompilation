@@ -107,7 +107,9 @@ class CompileTaskResponse(BaseModel):
     # status 用 str 而非 TaskStatus 枚举：支持 cancelled（用户主动取消）
     # 是合法状态但不在原枚举里，序列化用 str 避免 500
     status: str
-    matched_skills: Optional[dict]
+    # matched_skills 列是 Text（JSON 字符串 list[str]，2026-10-20 起落 agent 实际读过的 SKILL.md 名单）
+    # 声明成 dict 会在非空值时 Pydantic 校验 500——用 str，前端 JSON.parse
+    matched_skills: Optional[str]
     depend_tree: Optional[dict]
     artifact_path: Optional[str]
     error_message: Optional[str]
