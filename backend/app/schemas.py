@@ -144,7 +144,8 @@ class TicketCreate(BaseModel):
     task_id: int
     source: str = Field(..., pattern="^(cloud|client)$")
     title: str = Field(..., min_length=1, max_length=255)
-    description: Optional[str] = None
+    description: Optional[str] = None  # 选填（用户可以留空，附 build.log 末 50 行兜底）
+    include_log_tail: bool = True       # 描述空时是否附日志
 
 
 class TicketMessageCreate(BaseModel):

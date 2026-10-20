@@ -1,99 +1,260 @@
 """
-Ticket routes
-Based on design doc section 11.1: POST /api/tickets/report, GET /api/tickets/my
+工单路由：用户提交编译失败工单 + AI 总结草稿 + admin 列表/详情/改状态 + 对话消息
+
+设计（2026-10-16 报错工单 P0）：
+- POST /api/tickets/draft  LLM 总结日志（不入库，返回草稿）
+- POST /api/tickets/report  用户提交（已有，改为真接 get_current_user）
+- GET  /api/tickets/my      用户查自己工单
+- GET  /api/tickets/{id}    工单详情（自己/admin）
+- POST /api/tickets/{id}/message   对话消息（自己/admin）
+- POST /api/tickets/{id}/close     用户关闭自己 pending/processing 工单
+- GET  /api/admin/tickets   admin 列表（4 tab）
+- GET  /api/admin/tickets/{id}  admin 详情
+- POST /api/admin/tickets/{id}/status  admin 改状态
 """
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime
 
 from app.models import get_db, Ticket, TicketMessage, CompileTask, User, TicketStatus
-from app.schemas import (
-    TicketCreate, TicketResponse, ApiResponse
-)
+from app.schemas import TicketCreate, ApiResponse
+from app.dependencies import get_current_user
 
 router = APIRouter()
 
 
+# ============== 共享：ORM Ticket → dict（避开 Pydantic 对 ORM 关系字段的校验陷阱）==============
+def _ticket_to_dict(t: "Ticket", include_messages: bool = False, db: "Session | None" = None) -> dict:
+    """把 Ticket ORM 对象序列化成 dict（手动组装，绕开 model_validate(orm) 对 relationship 字段的炸）
+
+    为什么不用 TicketResponse.model_validate(t)（见 §55 Pydantic 500/200 陷阱 #1）：
+    - TicketResponse.messages: List[dict] 期望 list[dict]
+    - Ticket.messages 是 relationship，拉回是 list[TicketMessage] ORM 对象
+    - Pydantic 看到 ORM 对象喂给 dict 字段 → ValidationError → 500
+
+    include_messages=False：list 端点用，避免 N+1（前端 Tickets.vue 也不读 messages）
+    include_messages=True：详情端点用，需传 db 拿 user.username
+    """
+    # §55 #2: Column[str] + enum 双继承时 DB 拉回是裸 str，.value 会 AttributeError → hasattr 兜底
+    status_str = str(t.status) if not hasattr(t.status, "value") else t.status.value
+
+    result = {
+        "ticket_id": t.ticket_id,
+        "task_id": t.task_id,
+        "user_id": t.user_id,
+        "source": t.source,
+        "status": status_str,
+        "title": t.title,
+        "description": t.description,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        "resolved_at": t.resolved_at.isoformat() if t.resolved_at else None,
+        "messages": [],
+    }
+    if include_messages:
+        # 详情端点：直接读 t.messages（已 eager load，无 N+1）
+        result["messages"] = [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "user_id": m.user_id,
+                "username": m.user.username if m.user else "已注销",
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in t.messages
+        ]
+    return result
+
+
+# ============== 共享：读 build.log 末尾 ==============
+def _tail_log(log_file_path, max_lines: int = 200) -> str:
+    """读 build.log 最后 N 行（AI 总结 / 详情页用）"""
+    try:
+        with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:]) if lines else ""
+    except Exception as e:
+        return f"[日志读取失败: {e}]"
+
+
+# ============== 1) AI 草稿（不入库）==============
+@router.post("/draft", response_model=ApiResponse)
+async def draft_ticket_from_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """读 task 失败日志，调用 LLM 生成问题描述草稿（不入库，给前端填到对话框）"""
+    task = db.query(CompileTask).filter(CompileTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="只能对自己任务生成草稿")
+
+    # 读失败日志（artifacts/{task_id}/build.log）
+    from app.services.compile_engine import _artifacts_dir
+    log_path = _artifacts_dir() / task.task_id / "build.log"
+    log_text = _tail_log(log_path, 200)
+    if not log_text:
+        return ApiResponse(data={
+            "title": f"[失败] {task.software_name}",
+            "description": "（无日志可总结，请手动描述）",
+            "ai_summary": None,
+            "task_id": task.id,
+            "task_status": task.status,
+        }, message="无日志，已返回空草稿")
+
+    # 调 LLM（复用 compile_engine 已配的 MiniMax key）
+    from app.services.compile_engine import _summarize_log_for_ticket
+    title, summary, description = _summarize_log_for_ticket(
+        software_name=task.software_name,
+        task_status=task.status or "failed",
+        log_tail=log_text,
+    )
+
+    return ApiResponse(data={
+        "title": title,
+        "summary": summary,
+        "description": description,  # 用户可改
+        "task_id": task.id,
+        "task_status": task.status,
+    })
+
+
+# ============== 2) 提交工单 ==============
 @router.post("/report", response_model=ApiResponse)
 async def report_ticket(
     ticket_data: TicketCreate,
     db: Session = Depends(get_db),
-    current_user_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(get_current_user),
 ):
-    """上报问题工单"""
-    # 验证任务存在
+    """用户提交报错工单（基于 AI 草稿 + 用户编辑）"""
     task = db.query(CompileTask).filter(CompileTask.id == ticket_data.task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="关联任务不存在")
-    
-    # 创建工单
+    if task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="只能为自己的任务提工单")
+
     ticket = Ticket(
         task_id=ticket_data.task_id,
-        user_id=current_user_id,
+        user_id=current_user.user_id,
         source=ticket_data.source,
         title=ticket_data.title,
         description=ticket_data.description,
-        status=TicketStatus.PENDING
+        status=TicketStatus.PENDING,
     )
     db.add(ticket)
+    db.flush()  # 先 flush 拿 ticket_id
+
+    # 不管用户有没有填描述，include_log_tail=true 时都把 build.log 末 50 行附到 description 末尾
+    include_log = getattr(ticket_data, "include_log_tail", True)
+    if include_log:
+        from app.services.compile_engine import _artifacts_dir
+        log_path = _artifacts_dir() / task.task_id / "build.log"
+        if log_path.exists():
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                tail = "\n".join(lines[-50:])
+                if tail:
+                    log_block = f"\n\n--- build.log 末尾 50 行（自动附）---\n```\n{tail}\n```"
+                    desc = (ticket_data.description or "").strip()
+                    if desc:
+                        ticket.description = desc + log_block
+                    else:
+                        ticket.description = f"（用户未填描述，自动附 build.log 末 50 行）\n```\n{tail}\n```"
+                    db.flush()
+            except Exception:
+                pass  # 读不到就不附，不阻塞
+
     db.commit()
     db.refresh(ticket)
-    
     return ApiResponse(
-        code=200,
-        message="工单已提交",
-        data={"ticket_id": ticket.ticket_id, "status": ticket.status.value}
+        data={"ticket_id": ticket.ticket_id, "status": str(ticket.status)},
+        message="工单已提交，等待管理员处理",
     )
 
 
+# ============== 3) 我的工单 ==============
 @router.get("/my", response_model=ApiResponse)
 async def list_my_tickets(
     status: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(get_current_user),
 ):
-    """获取我的工单列表"""
-    query = db.query(Ticket).filter(Ticket.user_id == current_user_id)
-    
+    q = db.query(Ticket).filter(Ticket.user_id == current_user.user_id)
     if status:
-        query = query.filter(Ticket.status == TicketStatus(status))
-    
-    tickets = query.order_by(Ticket.created_at.desc()).all()
-    
-    return ApiResponse(data=[TicketResponse.model_validate(t).model_dump() for t in tickets])
+        q = q.filter(Ticket.status == TicketStatus(status))
+    tickets = q.order_by(Ticket.created_at.desc()).all()
+    return ApiResponse(data=[_ticket_to_dict(t) for t in tickets])
 
 
+# ============== 4) 工单详情 ==============
 @router.get("/{ticket_id}", response_model=ApiResponse)
 async def get_ticket(
     ticket_id: int,
     db: Session = Depends(get_db),
-    current_user_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(get_current_user),
 ):
-    """获取工单详情（含对话消息）"""
     ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
-    
-    # 权限检查：用户只能查看自己的工单，管理员可查看所有
-    if ticket.user_id != current_user_id:
-        # TODO: 检查管理员权限
-        pass
-    
-    # 获取消息列表
-    messages = db.query(TicketMessage).filter(
-        TicketMessage.ticket_id == ticket_id
-    ).order_by(TicketMessage.created_at.asc()).all()
-    
-    result = TicketResponse.model_validate(ticket).model_dump()
-    result["messages"] = [
-        {
-            "id": m.id,
-            "role": m.role,
-            "content": m.content,
-            "created_at": m.created_at.isoformat()
-        }
-        for m in messages
-    ]
-    
-    return ApiResponse(data=result)
+    if ticket.user_id != current_user.user_id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权查看此工单")
+
+    return ApiResponse(data=_ticket_to_dict(ticket, include_messages=True, db=db))
+
+
+# ============== 5) 追加消息（用户/admin） ==============
+@router.post("/{ticket_id}/message", response_model=ApiResponse)
+async def add_ticket_message(
+    ticket_id: int,
+    content: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """用户/admin 追加消息。role 字段按当前用户角色写"""
+    if not content or not content.strip():
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if ticket.user_id != current_user.user_id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权回复此工单")
+    if ticket.status == TicketStatus.CLOSED:
+        raise HTTPException(status_code=400, detail="工单已关闭，无法追加消息")
+
+    role = "admin" if current_user.role == "admin" else "user"
+    msg = TicketMessage(
+        ticket_id=ticket_id,
+        user_id=current_user.user_id,
+        role=role,
+        content=content.strip(),
+    )
+    db.add(msg)
+    # pending 状态下用户回复 = 重新激活，admin 看得到
+    if ticket.status == TicketStatus.PENDING and role == "admin":
+        ticket.status = TicketStatus.PROCESSING
+    db.commit()
+    return ApiResponse(data={"id": msg.id}, message="已发送")
+
+
+# ============== 6) 用户关闭自己的工单 ==============
+@router.post("/{ticket_id}/close", response_model=ApiResponse)
+async def close_my_ticket(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if ticket.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="只能关闭自己的工单")
+    if ticket.status == TicketStatus.CLOSED:
+        raise HTTPException(status_code=400, detail="工单已关闭")
+    ticket.status = TicketStatus.CLOSED
+    db.commit()
+    return ApiResponse(message="工单已关闭")

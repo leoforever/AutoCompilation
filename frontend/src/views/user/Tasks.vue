@@ -54,7 +54,12 @@
           <template #default="{ row }">
             <el-button size="small" @click="viewLog(row)">日志</el-button>
             <el-button v-if="row.status === 'success'" size="small" @click="downloadArtifact(row)">下载</el-button>
-            <el-button v-if="row.status === 'failed'" size="small" type="danger" @click="reportTicket(row)">一键上报</el-button>
+            <el-button
+              v-if="row.status === 'failed'"
+              size="small"
+              :type="existingTicketByTask.get(row.id) ? 'info' : 'danger'"
+              :disabled="existingTicketByTask.has(row.id)"
+              @click="reportTicket(row)">{{ existingTicketByTask.get(row.id) ? `已反馈 #${existingTicketByTask.get(row.id)}` : '一键上报' }}</el-button>
             <el-button
               v-if="row.status === 'success' || row.status === 'failed'"
               size="small"
@@ -85,6 +90,37 @@
       </div>
       <template #footer>
         <el-button @click="logDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 报错工单提交（选填描述，附日志可选） -->
+    <el-dialog v-model="ticketDraftVisible" title="📨 反馈问题" width="720px" :close-on-click-modal="false">
+      <el-form label-width="100px">
+        <el-form-item label="关联任务">
+          <el-tag>#{{ ticketDraftForm.task_id }} · {{ ticketDraftForm.software_name }}</el-tag>
+          <span class="muted" style="margin-left:8px;font-size:12px">管理员复现时需要这些信息</span>
+        </el-form-item>
+        <el-form-item label="标题" required>
+          <el-input v-model="ticketDraftForm.title" maxlength="60" show-word-limit />
+        </el-form-item>
+        <el-form-item label="问题描述">
+          <el-input v-model="ticketDraftForm.description" type="textarea" :rows="8" resize="vertical"
+                    placeholder="可留空 —— 留空时自动附 build.log 末 50 行" />
+        </el-form-item>
+        <el-form-item>
+          <el-checkbox v-model="ticketDraftIncludeLog">
+            描述为空时自动附 build.log 末 50 行（默认勾选）
+          </el-checkbox>
+        </el-form-item>
+        <el-form-item>
+          <div class="muted" style="font-size:12px;line-height:1.5">
+            💡 提示：管理员会在容器内启动编译 agent，能实际改源码、跑命令验证、生成经验
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="ticketDraftVisible = false">取消</el-button>
+        <el-button type="primary" :loading="ticketDrafting" @click="submitTicketDraft">提交工单</el-button>
       </template>
     </el-dialog>
 
@@ -256,9 +292,72 @@ function downloadArtifact(task: any) {
     })
 }
 
-function reportTicket(task: any) {
-  ElMessage.info(`已为任务 #${task.task_id} 生成工单`)
-  window.location.href = '/tickets'
+const ticketDraftVisible = ref(false)
+const ticketDrafting = ref(false)
+const ticketDraftIncludeLog = ref(true)
+const ticketDraftForm = reactive({
+  task_id: 0 as number,
+  software_name: '',
+  title: '',
+  description: '',
+})
+const existingTicketByTask = ref<Map<number, number>>(new Map())  // task.id → ticket_id
+
+// 查 task 是否已有 pending/processing 工单（决定按钮文案）
+async function loadExistingTickets() {
+  try {
+    const r: any = await api.get('/tickets/my')
+    const map = new Map<number, number>()
+    for (const t of (r.data || [])) {
+      if ((t.status === 'pending' || t.status === 'processing') && t.task_id) {
+        map.set(t.task_id, t.ticket_id)
+      }
+    }
+    existingTicketByTask.value = map
+  } catch {}
+}
+
+async function reportTicket(task: any) {
+  // 已有工单 → 跳过去看
+  const existing = existingTicketByTask.value.get(task.id)
+  if (existing) {
+    ElMessage.info(`任务 #${task.task_id} 已有工单 #${existing}，跳转到工单中心`)
+    window.location.href = `/tickets#${existing}`
+    return
+  }
+  // 直接打开提交对话框（不去 AI 草稿端点）
+  ticketDrafting.value = false
+  ticketDraftForm.task_id = task.id
+  ticketDraftForm.software_name = task.software_name
+  ticketDraftForm.title = `[失败] ${task.software_name}`
+  ticketDraftForm.description = ''  // 选填（留空会自动附 build.log 末 50 行）
+  ticketDraftIncludeLog.value = true
+  ticketDraftVisible.value = true
+}
+
+async function submitTicketDraft() {
+  if (!ticketDraftForm.title.trim()) {
+    ElMessage.warning('标题不能为空')
+    return
+  }
+  try {
+    const r: any = await api.post('/tickets/report', {
+      task_id: ticketDraftForm.task_id,
+      source: 'client',
+      title: ticketDraftForm.title.trim(),
+      description: ticketDraftForm.description.trim() || undefined,  // 选填
+      include_log_tail: ticketDraftIncludeLog.value,
+    })
+    if (r?.code === 200) {
+      ElMessage.success(`工单 #${r.data.ticket_id} 已提交，等待管理员处理`)
+      ticketDraftVisible.value = false
+      loadExistingTickets()
+    } else {
+      ElMessage.error(r?.message || '提交失败')
+    }
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '提交失败')
+  }
 }
 
 async function cancelTask(task: any) {
@@ -397,7 +496,10 @@ async function onSubmitDraft() {
   }
 }
 
-onMounted(loadTasks)
+onMounted(() => {
+  loadTasks()
+  loadExistingTickets()
+})
 </script>
 
 <style scoped>

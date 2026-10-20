@@ -50,6 +50,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import api from '@/utils/request'
 
 const tickets = ref<any[]>([])
@@ -97,26 +98,31 @@ async function openChat(ticket: any) {
 
 async function sendMessage() {
   if (!newMessage.value.trim() || !currentTicket.value) return
-  
+
   const content = newMessage.value
   newMessage.value = ''
-  
-  // 添加用户消息
+
+  // 本地乐观显示用户消息
   messages.value.push({ role: 'user', content, created_at: new Date().toISOString() })
   scrollToBottom()
-  
-  // 发送请求
-  await api.post(`/tickets/${currentTicket.value.ticket_id}/messages`, { content })
-  
-  // 模拟管理员回复
-  setTimeout(() => {
-    messages.value.push({
-      role: 'admin',
-      content: '收到，正在处理...',
-      created_at: new Date().toISOString()
-    })
+
+  // 调真接口（/tickets/{id}/message，单数）
+  try {
+    const r: any = await api.post(
+      `/tickets/${currentTicket.value.ticket_id}/message`,
+      null,
+      { params: { content } }
+    )
+    if (r?.code && r.code !== 200) {
+      ElMessage.error(r?.message || '发送失败')
+    }
+    // 拉一次详情刷新消息列表（拿到 id/timestamp）
+    const det: any = await api.get(`/tickets/${currentTicket.value.ticket_id}`)
+    messages.value = det.data?.messages || []
     scrollToBottom()
-  }, 800)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '发送失败')
+  }
 }
 
 function scrollToBottom() {
