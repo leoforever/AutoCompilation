@@ -337,14 +337,24 @@ do_start() {
         info "启动后端 (mode=$mode)..."
         cd "$BACKEND_DIR"
         set -a; source "$ENV_FILE"; set +a
+        # 选解释器：PATH 的 python3 可能没装依赖（本机 3.13 无 uvicorn，3.11 有）
+        # 逐个试 import uvicorn，取第一个能用的；全都不行才回退 python3（报原来的错）
+        PYBIN=""
+        for cand in python3 /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3; do
+            if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import uvicorn' >/dev/null 2>&1; then
+                PYBIN="$cand"; break
+            fi
+        done
+        [ -z "$PYBIN" ] && PYBIN=python3
+        info "后端解释器: $PYBIN ($($PYBIN --version 2>&1))"
         # 按模式决定是否加 --reload
         if [ "$mode" = "dev" ]; then
-            nohup python3 -m uvicorn app.main:app \
+            nohup "$PYBIN" -m uvicorn app.main:app \
                 --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
                 --reload-dir app \
                 >> "$LOG_DIR/backend.log" 2>&1 &
         else
-            nohup python3 -m uvicorn app.main:app \
+            nohup "$PYBIN" -m uvicorn app.main:app \
                 --host 0.0.0.0 --port "$BACKEND_PORT" \
                 >> "$LOG_DIR/backend.log" 2>&1 &
         fi

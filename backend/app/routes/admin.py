@@ -278,6 +278,17 @@ async def resolve_ticket(
     ))
     db.commit()
 
+    # resolve 终态：agent 使命完成 → 停容器（stop 不删，重新接单可 docker start 复用）
+    # 经验草稿/审计都不依赖活容器；孤儿扫描兜底漏网
+    if sess is not None:
+        import asyncio
+        async def _stop_agent():
+            try:
+                await MANAGER.destroy(ticket_id, stop_only=True)
+            except Exception as e:
+                print(f"[resolve] agent 容器停止失败: {e}")
+        asyncio.create_task(_stop_agent())
+
     # 可选：自动生成经验草稿 —— 不再同步调 LLM（60-240s 会撞超时），
     # 起后台预览 job，前端 resolve 成功后直接开预览弹窗（复用 job 秒开进度态）
     draft_job_started = False
@@ -335,6 +346,18 @@ async def admin_change_ticket_status(
     ))
     db.commit()
 
+    # 关闭工单 → 终态回收容器（stop+rm，异步不卡关闭接口）；work_dir/checkpoint/对话记录保留
+    if target == TicketStatus.CLOSED:
+        import asyncio
+        from app.services.ticket_agent import MANAGER
+        async def _recycle():
+            try:
+                r = await MANAGER.recycle(ticket_id)
+                print(f"[closed] tkt={ticket_id} 容器回收: {r}")
+            except Exception as e:
+                print(f"[closed] tkt={ticket_id} 回收异常: {e}")
+        asyncio.create_task(_recycle())
+
     # 接单（pending→processing）→ 异步启动 agent session
     msg_extra = ""
     if (old == TicketStatus.PENDING and target == TicketStatus.PROCESSING):
@@ -350,6 +373,22 @@ async def admin_change_ticket_status(
         msg_extra = "，agent session 正在创建（容器 + 拉源码 + DeepAgent 启动）"
 
     return ApiResponse(message=f"工单状态已变更为 {target.value}{msg_extra}")
+
+
+def _task_has_log(t) -> bool:
+    """详情懒加载判断：build.log 文件非空 或 DB log_output 非空 → 前端才给"展开日志"入口。
+    纯 stat/length 判断不读全文，成本可忽略；任何异常按"无日志"处理（宁缺勿错）。"""
+    try:
+        from app.services.compile_engine import _artifacts_dir
+        lf = _artifacts_dir() / t.task_id / "build.log"
+        if lf.is_file() and lf.stat().st_size > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(t.log_output and t.log_output.strip())
+    except Exception:
+        return False
 
 
 @router.get("/tickets/{ticket_id}", response_model=ApiResponse)
@@ -397,6 +436,7 @@ async def admin_get_ticket(
         task_info = {
             "task_str_id": t.task_id,  # T-20261016-...
             "db_id": t.id,
+            "has_log_content": _task_has_log(t),  # 懒加载用：日志区默认折叠，有此标记才给"展开"按钮
             "software_name": t.software_name,
             "system_id": t.system_id,
             "system_name": sys_name,
@@ -1119,11 +1159,28 @@ async def get_agent_status(
         ticket = s.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
         s.close()
         if ticket and ticket.status == "processing":
-            # 已接单但 session 丢了（后端重启过 / accept 没成功 / retry 失败）
+            # 内存没有但工单在处理中 → DB 有现场（容器/checkpoint）→ 自动恢复，不再让用户手点"重新启动"
+            # 幂等：get_or_create 内部有锁+双重检查；这里再挡并发触发（docker 慢，恢复一次要几十秒）
+            import asyncio
+            from app.services.ticket_agent import RESTORING
+            if ticket_id not in RESTORING:
+                RESTORING.add(ticket_id)
+                async def _restore():
+                    try:
+                        ss = _SL()
+                        t = ss.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+                        await MANAGER.get_or_create(t, ss)
+                        ss.close()
+                    except Exception as e:
+                        import traceback; traceback.print_exc()
+                        MANAGER._errors[ticket_id] = f"{type(e).__name__}: {e}"
+                    finally:
+                        RESTORING.discard(ticket_id)
+                asyncio.create_task(_restore())
             return ApiResponse(data={
                 "active": False,
-                "phase": "session_lost",
-                "error": "session 已丢失（后端重启过）。请点「重新启动」按钮",
+                "phase": "restoring",
+                "error": "正在自动恢复 agent 现场（复用容器 + 接回对话），请稍候…",
             })
         # 还没接单 / 正在建
         return ApiResponse(data={"active": False, "phase": "starting"})
@@ -1268,6 +1325,24 @@ async def post_agent_message(
     sess = MANAGER.get(ticket_id)
     if not sess:
         print(f"{_marker} !!! no session, abort 400", flush=True)
+        # A 方案：顺手触发自动恢复（内存没 session 但 DB 有现场 → 后台重建），前端提示稍后再发
+        ticket_now = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+        if ticket_now and str(getattr(ticket_now.status, "value", ticket_now.status)) == "processing":
+            import asyncio
+            async def _kick_restore():
+                try:
+                    from app.services.ticket_agent import RESTORING
+                    if ticket_id in RESTORING:
+                        return
+                    RESTORING.add(ticket_id)
+                    try:
+                        await MANAGER.get_or_create(ticket_now, db)
+                    finally:
+                        RESTORING.discard(ticket_id)
+                except Exception as e:
+                    MANAGER._errors[ticket_id] = f"{type(e).__name__}: {e}"
+            asyncio.create_task(_kick_restore())
+            raise HTTPException(status_code=400, detail="agent 现场恢复中（后端重启过，自动重建约 30-90 秒），请稍候再发消息")
         raise HTTPException(status_code=400, detail="agent session 未启动，请先接单")
 
     # 存 admin 消息（用户/管理员互相对话需要持久化；agent 内部消息不存）
@@ -1427,6 +1502,67 @@ async def post_agent_message(
         },
         message="agent 工具不可用（仅 LLM 答疑）" if agent_unavailable else "agent 已回复",
     )
+
+
+def _persist_round(ticket_id: int, content: str, full_response: str,
+                   tool_calls_log: list, user_id: int) -> None:
+    """SSE stream 收尾持久化：checkpoint + agent 历史 + 审计（在 worker 线程调用，
+    与 HTTP 连接生死无关 —— 客户端断开也不丢本轮）。失败仅记日志不抛。"""
+    from app.models import SessionLocal, TicketAgent as _TAgent, AuditLog as _AL
+    from app.services.ticket_agent import MANAGER
+    _log = logging.getLogger("ticket_agent_stream")
+    s = SessionLocal()
+    try:
+        MANAGER.save_checkpoint(ticket_id, s)
+        # B3：agent 完整消息序列（含 ToolMessage 结果 → 重开抽屉时穿插显示）存 JSON blob
+        sess = MANAGER.get(ticket_id)
+        if sess and sess.config:
+            state_msgs = []
+            try:
+                st = sess.agent.get_state(sess.config)
+                state_msgs = (st.values or {}).get("messages", []) if st else []
+            except Exception as ge:
+                _log.warning(f"[ticket={ticket_id}] get_state for B3 失败: {ge}")
+            if state_msgs:
+                msgs_for_db = []
+                for m in state_msgs:
+                    entry = {"type": getattr(m, "type", None) or "unknown"}
+                    c = getattr(m, "content", None)
+                    entry["content"] = (c if isinstance(c, str) else str(c or ""))[:4000]
+                    tcs = getattr(m, "tool_calls", None)
+                    if tcs:
+                        entry["tool_calls"] = [
+                            {"name": tc.get("name", "?"),
+                             "id": tc.get("id"),
+                             "args": {k: str(v)[:600] for k, v in (tc.get("args") or {}).items()}}
+                            for tc in tcs
+                        ]
+                    tcid = getattr(m, "tool_call_id", None)
+                    if tcid:
+                        entry["tool_call_id"] = tcid
+                    mname = getattr(m, "name", None)
+                    if mname:
+                        entry["name"] = mname
+                    msgs_for_db.append(entry)
+                rec = s.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
+                if rec:
+                    rec.last_messages_json = json.dumps(msgs_for_db, ensure_ascii=False)
+                    _log.info(f"[ticket={ticket_id}] B3: saved {len(msgs_for_db)} msgs to last_messages_json")
+        s.add(_AL(
+            user_id=user_id,
+            action="ticket_agent_message_stream",
+            target_type="ticket",
+            target_id=ticket_id,
+            details=f"stream: {content.strip()[:100]} | tools={len(tool_calls_log)} | len={len(full_response)}",
+        ))
+        s.commit()
+        _log.info(f"[ticket={ticket_id}] [persist] round saved (checkpoint+B3)")
+    except Exception as e:
+        _log.warning(f"[ticket={ticket_id}] persist 失败: {type(e).__name__}: {e}")
+        try: s.rollback()
+        except Exception: pass
+    finally:
+        s.close()
 
 
 @router.post("/tickets/{ticket_id}/agent/stream")
@@ -1632,6 +1768,13 @@ async def stream_agent_message(
                 _tool_summary = ", ".join(f"{k}×{v}" for k, v in sorted(_tool_count.items(), key=lambda x: -x[1])[:5])
                 _safe_put(None)
                 _log.info(f"[ticket={ticket_id}] [stream done] elapsed={time.time()-_t0:.2f}s chunks={_n_llm_chunks} tools={len(tool_calls_log)} [{_tool_summary}] resp_len={len(full_response)} agent_unavailable={agent_unavailable} dropped={_n_dropped}")
+                # 2026-10-20：持久化挪进 worker 线程收尾（原先在 event_gen 协程里，
+                # 客户端断连 → 协程被 cancel → checkpoint/历史不落库，"agent 跑完了但
+                # 回来看不见这轮回复"）。sentinel 先发不卡 UI，DB 写慢无所谓。
+                try:
+                    _persist_round(ticket_id, content, full_response, tool_calls_log, current_user.user_id)
+                except Exception as pe:
+                    _log.error(f"[ticket={ticket_id}] persist-round 失败: {type(pe).__name__}: {pe}")
 
         # 在默认 ThreadPoolExecutor 跑 worker（不阻塞 event loop）
         loop = _asyncio.get_event_loop()
@@ -1658,60 +1801,7 @@ async def stream_agent_message(
             # 但 worker 跑完会把 _q 填满 → 自然 GC；下次新 stream 会创新 _q
             raise
 
-        # 3) 持久化 checkpoint + B3 历史（2026-10-19：SSE 端点此前漏存 last_messages_json，
-        # 导致关抽屉再开时本轮 agent/tool 消息全丢——只有旧 sync /agent/message 端点存）
-        s = SessionLocal()
-        try:
-            MANAGER.save_checkpoint(ticket_id, s)
-            # B3：agent 完整消息序列（含 ToolMessage 结果 → 重开抽屉时穿插显示）存 JSON blob
-            try:
-                from app.models import TicketAgent as _TAgent
-                from langchain_core.messages import AIMessage as _AIM2
-                state_msgs = []
-                try:
-                    st = sess.agent.get_state(sess.config)
-                    state_msgs = (st.values or {}).get("messages", []) if st else []
-                except Exception as ge:
-                    _log.warning(f"[ticket={ticket_id}] get_state for B3 失败: {ge}")
-                if state_msgs:
-                    msgs_for_db = []
-                    for m in state_msgs:
-                        entry = {"type": getattr(m, "type", None) or "unknown"}
-                        c = getattr(m, "content", None)
-                        entry["content"] = (c if isinstance(c, str) else str(c or ""))[:4000]
-                        tcs = getattr(m, "tool_calls", None)
-                        if tcs:
-                            entry["tool_calls"] = [
-                                {"name": tc.get("name", "?"),
-                                 "id": tc.get("id"),
-                                 "args": {k: str(v)[:600] for k, v in (tc.get("args") or {}).items()}}
-                                for tc in tcs
-                            ]
-                        tcid = getattr(m, "tool_call_id", None)
-                        if tcid:
-                            entry["tool_call_id"] = tcid
-                        mname = getattr(m, "name", None)
-                        if mname:
-                            entry["name"] = mname
-                        msgs_for_db.append(entry)
-                    rec = s.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
-                    if rec:
-                        rec.last_messages_json = json.dumps(msgs_for_db, ensure_ascii=False)
-                        _log.info(f"[ticket={ticket_id}] B3: saved {len(msgs_for_db)} msgs to last_messages_json")
-            except Exception as be:
-                _log.warning(f"[ticket={ticket_id}] B3 save warning: {type(be).__name__}: {be}")
-                try: s.rollback()
-                except Exception: pass
-            s.add(AuditLog(
-                user_id=current_user.user_id,
-                action="ticket_agent_message_stream",
-                target_type="ticket",
-                target_id=ticket_id,
-                details=f"stream: {content.strip()[:100]} | tools={len(tool_calls_log)} | len={len(full_response)}",
-            ))
-            s.commit()
-        finally:
-            s.close()
+        # 3) 持久化已在 worker 线程收尾完成（_persist_round，2026-10-20 挪出协程避免断连丢历史）
 
         # 4) 收尾
         yield f"data: {json.dumps({'type': 'done', 'response': full_response, 'tool_calls': tool_calls_log, 'agent_unavailable': agent_unavailable}, ensure_ascii=False)}\n\n"
@@ -1725,11 +1815,11 @@ async def cleanup_ticket_container(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """admin 手动清理 agent 容器（保留磁盘 artifacts/）"""
+    """admin 手动清理 agent 容器（stop 不删，重新接单可复用；保留磁盘 artifacts/）"""
     from app.services.ticket_agent import MANAGER
     from app.models import AuditLog
 
-    ok = await MANAGER.destroy(ticket_id)
+    ok = await MANAGER.destroy(ticket_id, stop_only=True)
     if not ok:
         return ApiResponse(message="无活跃 agent session")
 

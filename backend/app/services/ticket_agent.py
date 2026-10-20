@@ -165,9 +165,13 @@ class TicketAgentManager:
             print(f"[ticket_agent] save_checkpoint 失败: {e}")
             return False
 
-    async def destroy(self, ticket_id: int) -> bool:
-        """销毁 in-memory session；容器停但 work_dir / checkpoint / DB 记录保留
-        （解决"退出后再进恢复"问题，DB 记录被下次 get_or_create 自动复用）"""
+    async def destroy(self, ticket_id: int, stop_only: bool = False) -> bool:
+        """销毁 in-memory session。
+
+        - stop_only=True（resolve 场景）：只停容器，容器对象保留 → 重新接单可 docker start 复用
+        - stop_only=False（cleanup 场景）：stage6 停+删容器（历史行为）
+        两种都保留 work_dir / checkpoint / DB 记录（对话历史要能恢复）
+        """
         async with self._lock:
             sess = self._sessions.pop(ticket_id, None)
         if not sess:
@@ -179,6 +183,8 @@ class TicketAgentManager:
             cli_sess.container_id = sess.container_id
             cli_sess.agent_state = sess.agent_state or {}
             cli_sess.agent_state["status"] = "success"  # 不影响 cleanup 路径
+            if stop_only:
+                cli_sess.agent_state["_stop_only"] = True
             stage6_cleanup(sess.agent_state, on_log=lambda *a, **k: None)
         except Exception as e:
             print(f"[ticket_agent] 容器清理异常: {e}")
@@ -188,14 +194,132 @@ class TicketAgentManager:
             s = SessionLocal()
             rec = s.query(TicketAgent).filter(TicketAgent.ticket_id == ticket_id).first()
             if rec:
-                rec.container_id = None  # 容器停了
+                if stop_only:
+                    pass  # 容器对象还在（只 stopped）→ 保留 container_id 让 stage3 复用（docker start）
+                else:
+                    rec.container_id = None  # 容器已删
                 s.commit()
             s.close()
         except Exception as e:
             print(f"[ticket_agent] destroy DB 同步异常: {e}")
         return True
 
-    # ============== 内部：建 session ==============
+    async def recycle(self, ticket_id: int) -> str:
+        """工单关闭终态回收：删容器（stop+rm）+ 清 DB container_id；保留 work_dir/checkpoint/对话记录。
+        没有内存 session 也能回收（从 DB 拿 container_id 直删）→ 解决孤儿容器。
+        返回描述：'no-container' / 'removed' / 'remove-failed: ...'"""
+        # 1) 内存 session（可能没有——重启后就是孤儿）
+        async with self._lock:
+            sess = self._sessions.pop(ticket_id, None)
+        # 2) DB 记录拿容器 ID（内存没有时兜底）
+        from app.models import SessionLocal, TicketAgent, AuditLog
+        s = SessionLocal()
+        container_id = (sess.container_id if sess else None)
+        rec = s.query(TicketAgent).filter(TicketAgent.ticket_id == ticket_id).first()
+        if not container_id and rec:
+            container_id = rec.container_id
+        result = "no-container"
+        if container_id:
+            try:
+                cli = __import__("app.services.compile_engine", fromlist=["get_docker_client"]).get_docker_client()
+                if cli:
+                    c = cli.containers.get(container_id)
+                    try:
+                        c.stop(timeout=5)
+                    except Exception:
+                        pass
+                    c.remove()
+                    result = "removed"
+            except Exception as e:
+                result = f"remove-failed: {e}"
+        if rec:
+            rec.container_id = None
+            s.commit()
+        s.close()
+        return result
+
+    # ============== 孤儿扫描（启动 + 定期） ==============
+    async def sweep_orphans(self) -> dict:
+        """对账 docker ↔ DB：
+        1) DB 引用但容器已不存在 → 清 container_id（下次重建走全新路径）
+        2) 容器还活着/残留 但工单已 closed → remove（回收）
+        3) 工单 resolved 且容器 Up → stop（resolve 时应已 stop，漏网兜底）
+        4) 带 compile.ticket label 但 DB 无记录（force-cleanup 漏删）→ closed 才删，其余只记日志
+        返回 {checked, removed, stopped, stale_cleared}
+        """
+        from app.models import SessionLocal, TicketAgent, Ticket
+        stats = {"checked": 0, "removed": 0, "stopped": 0, "stale_cleared": 0}
+        cli = __import__("app.services.compile_engine", fromlist=["get_docker_client"]).get_docker_client()
+        if cli is None:
+            return stats
+        s = SessionLocal()
+        try:
+            recs = s.query(TicketAgent).filter(TicketAgent.container_id.isnot(None)).all()
+            for rec in recs:
+                stats["checked"] += 1
+                t = s.query(Ticket).filter(Ticket.ticket_id == rec.ticket_id).first()
+                status = t.status if t else "closed"
+                if hasattr(status, "value"):
+                    status = status.value
+                try:
+                    c = cli.containers.get(rec.container_id)
+                    live = c.status == "running"
+                except Exception:
+                    c = None
+                    live = False
+                if c is None:
+                    # 容器已被外部删除 → DB 记 stale
+                    rec.container_id = None
+                    s.commit()
+                    stats["stale_cleared"] += 1
+                    continue
+                if status == "closed":
+                    try:
+                        if live:
+                            c.stop(timeout=5)
+                        c.remove()
+                        stats["removed"] += 1
+                    except Exception as e:
+                        print(f"[sweep] tkt={rec.ticket_id} remove 失败: {e}")
+                    rec.container_id = None
+                    s.commit()
+                elif status == "resolved" and live:
+                    try:
+                        c.stop(timeout=5)
+                        stats["stopped"] += 1
+                    except Exception as e:
+                        print(f"[sweep] tkt={rec.ticket_id} stop 失败: {e}")
+            # 带 ticket label 但 DB 无记录：force-cleanup 删了记录但容器 remove 失败漏网 → 只删终态的
+            try:
+                for c in cli.containers.list(all=True):
+                    lbl = (c.labels or {}).get("compile.ticket")
+                    if not lbl or not lbl.isdigit():
+                        continue
+                    tid = int(lbl)
+                    if s.query(TicketAgent).filter(TicketAgent.ticket_id == tid).first():
+                        continue
+                    t = s.query(Ticket).filter(Ticket.ticket_id == tid).first()
+                    st = t.status if t else "closed"
+                    if hasattr(st, "value"):
+                        st = st.value
+                    if st in ("closed", "resolved"):
+                        try:
+                            if c.status == "running":
+                                c.stop(timeout=5)
+                            c.remove()
+                            stats["removed"] += 1
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[sweep] label 扫描异常: {e}")
+        finally:
+            s.close()
+        if any(stats[k] for k in stats):
+            print(f"[sweep] 孤儿对账: {stats}")
+        return stats
+
+
+# ============== 内部：建 session ==============
     async def _create_session(self, ticket: Ticket, db: Session,
                               on_event: Optional[Callable] = None) -> _Session:
         task: CompileTask = ticket.task  # relationship
@@ -223,6 +347,7 @@ class TicketAgentManager:
             "container_work_dir": "/work",
             "docker_image": docker_image,
             "status": "submitted",
+            "extra_labels": {"compile.ticket": str(ticket.ticket_id)},  # 孤儿扫描按工单归属反查
             "_task": None,  # 不复用 task 行
         }
         log_cb = lambda level, msg: on_event and on_event({"type": "log", "level": level, "msg": msg}) if on_event else None
@@ -523,5 +648,8 @@ class _PatchRecorderMiddleware(AgentMiddleware):
         return call(request)
 
 
-# ============== 全局实例 ==============
+# 全局单例
 MANAGER = TicketAgentManager()
+
+# 正在自动恢复中的工单（防 status 轮询并发重复触发 get_or_create）
+RESTORING: set = set()

@@ -123,10 +123,37 @@ async def lifespan(app: FastAPI):
 
     # 注：reconcile 不在后台跑，改为前端进入 SkillLib 页面时按需触发
     # （见 admin.py /admin/skills/reconcile 接口 + SkillLib.vue onMounted）
+    import asyncio
+
+    # A 方案配套：agent 容器对账 —— 启动跑一次（回收 closed 残留/清 stale），之后每小时兜底
+    # （内存 _sessions 重启即丢，孤儿回收必须以 docker/DB 为准）
+    async def _sweep_loop():
+        import asyncio
+        from app.services.ticket_agent import MANAGER
+        while True:
+            try:
+                stats = await MANAGER.sweep_orphans()
+                if any(stats.values()):
+                    logger.info(f"[sweep] 孤儿对账: {stats}")
+            except Exception:
+                logger.exception("[sweep] 对账异常")
+            # 草稿 job 表 GC：done/error 超 1h 清掉（防长期不重启内存增长）
+            try:
+                from app.services.skill_draft import _PREVIEW_JOBS
+                cutoff = __import__('time').time() - 3600
+                for k in [k for k, v in _PREVIEW_JOBS.items()
+                          if v.get('status') in ('done', 'error') and v.get('started_at', 0) < cutoff]:
+                    _PREVIEW_JOBS.pop(k, None)
+            except Exception:
+                pass
+            await asyncio.sleep(3600)
+
+    _sweep_task = asyncio.create_task(_sweep_loop())
 
     try:
         yield
     finally:
+        _sweep_task.cancel()
         logger.info("[lifespan] 收到关闭信号，停止所有 worker")
         stop_event.set()
         # 等所有 worker 退出（最多 30s）

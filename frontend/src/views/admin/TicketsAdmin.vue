@@ -126,18 +126,27 @@
           <strong>✅ 解决说明：</strong>{{ current.resolution }}
         </div>
 
-        <!-- 3. 失败日志（进抽屉自动加载全文，下方显眼的"刷新"按钮兜底） -->
-        <h4>
-          📄 失败日志全文
-          <el-tag v-if="logLoading" type="info" size="small" effect="plain" style="margin-left:8px">加载中…</el-tag>
-          <el-button v-else-if="current.task" link type="primary" size="small" @click="loadFullLog(current.task.db_id)">
-            🔄 刷新
-          </el-button>
-        </h4>
-        <pre v-if="fullLog" class="log">{{ fullLog }}</pre>
-        <div v-else-if="logLoaded && !fullLog" class="log-hint">（build.log 为空或无文件）</div>
-        <div v-else-if="logLoading" class="log-hint">⏳ 正在从磁盘读取 build.log…</div>
-        <div v-else class="log-hint">⚠️ 未加载，请点击右上角"🔄 刷新"</div>
+        <!-- 3. 失败日志（懒加载：默认折叠不请求；has_log_content 才给展开入口；任何状态都不弹错） -->
+        <template v-if="current.task">
+          <h4>
+            📄 失败日志
+            <template v-if="current.task.has_log_content">
+              <el-button v-if="!logExpanded" link type="primary" size="small" style="margin-left:8px" @click="expandLog">
+                ▶ 展开
+              </el-button>
+              <template v-else>
+                <el-tag v-if="logLoading" type="info" size="small" effect="plain" style="margin-left:8px">加载中…</el-tag>
+                <el-button v-else link type="primary" size="small" style="margin-left:8px" @click="loadFullLog(current.task.db_id)">
+                  🔄 刷新
+                </el-button>
+                <el-button link size="small" style="margin-left:6px" @click="logExpanded = false">收起</el-button>
+              </template>
+            </template>
+            <span v-else class="log-hint" style="margin-left:8px">（暂无日志）</span>
+          </h4>
+          <pre v-if="logExpanded && fullLog" class="log">{{ fullLog }}</pre>
+          <div v-else-if="logExpanded && !logLoading && !fullLog" class="log-hint">（日志为空）</div>
+        </template>
 
         <!-- 4. Agent 工作台（醒目卡片；pending 也显示占位，admin 一眼看到） -->
         <div class="agent-board">
@@ -161,7 +170,9 @@
             show-icon
             style="margin-bottom:10px"
           >
-            <strong>Agent 启动中…</strong>（容器创建 + 拉源码 + DeepAgent 初始化，5-30 秒）
+            <strong v-if="current.agent_restoring">Agent 现场恢复中…</strong>
+            <strong v-else>Agent 启动中…</strong>
+            （{{ current.agent_restoring ? '自动复用容器 + 接回对话' : '容器创建 + 拉源码 + DeepAgent 初始化' }}，约 5-90 秒，请稍候）
           </el-alert>
           <el-alert
             v-else-if="!current.agent_active && current.status === 'processing' && current.agent_error"
@@ -313,6 +324,7 @@ const newMessage = ref('')
 const fullLog = ref('')
 const logLoaded = ref(false)
 const logLoading = ref(false)
+const logExpanded = ref(false)  // 懒加载：默认折叠，点"展开"才发请求
 const agentThinking = ref('')
 const sendingAgent = ref(false)
 const counts = reactive({ all: 0, pending: 0, processing: 0, resolved: 0, closed: 0 })
@@ -377,6 +389,18 @@ async function loadTickets() {
 async function openDetail(row: any) {
   const r: any = await api.get(`/admin/tickets/${row.ticket_id}`)
   current.value = r.data
+  // A 方案：进入 processing 工单即对账——内存 session 丢了（后端重启过）后端会自动恢复，
+  // 这里轮询到 ready 为止，用户不再需要手点"重新启动"
+  if (r.data?.status === 'processing') {
+    try {
+      const st: any = await api.get(`/admin/tickets/${row.ticket_id}/agent/status`)
+      const p = st.data?.phase
+      if (p === 'restoring' || p === 'starting') {
+        current.value.agent_restoring = true
+        pollAgentStart(row.ticket_id)
+      }
+    } catch { /* status 探测失败不阻塞打开 */ }
+  }
   logLoaded.value = false
   fullLog.value = ''
   newMessage.value = ''
@@ -450,10 +474,11 @@ async function openDetail(row: any) {
   currentPhaseClass.value = 'phase-progress'
   // 2026-10-19 方案 2：起 phase 轮询（拉工单调试实时阶段提示）
   startPhasePolling(row.ticket_id)
-  // 自动加载失败日志全文（用户反馈：原来"展开"链接太隐蔽，根本不会点）
-  if (r.data.task?.db_id) {
-    loadFullLog(r.data.task.db_id)
-  }
+  // 2026-10-20：失败日志改为懒加载（默认折叠，点"展开"才请求；进抽屉不再自动拉全文）
+  fullLog.value = ''
+  logLoaded.value = false
+  logLoading.value = false
+  logExpanded.value = false
   // 如果已接单但 agent 未启动，轮询等它起来
   if (r.data.status === 'processing' && !r.data.agent_active) {
     pollAgentStart(row.ticket_id)
@@ -530,7 +555,8 @@ function stopPhasePolling() {
 }
 
 async function pollAgentStart(ticketId: number) {
-  for (let i = 0; i < 15; i++) {
+  // restoring（重启后自动恢复现场：docker start + agent 重建）可能要 30-90s，窗口放宽
+  for (let i = 0; i < 45; i++) {
     await new Promise(r => setTimeout(r, 2000))
     const r: any = await api.get(`/admin/tickets/${ticketId}/agent/status`)
     const d = r.data || {}
@@ -538,6 +564,7 @@ async function pollAgentStart(ticketId: number) {
       const det: any = await api.get(`/admin/tickets/${ticketId}`)
       current.value = det.data
       current.value.agent_error = null
+      current.value.agent_restoring = false
       ElMessage.success('Agent session 已就绪')
       return
     }
@@ -548,13 +575,19 @@ async function pollAgentStart(ticketId: number) {
       return
     }
     if (d.phase === 'session_lost') {
-      // session 已丢失（后端重启过）— 明确告诉用户点重新启动
+      // 兼容老后端：仍提示手动重新启动
       current.value.agent_error = d.error
       ElMessage.warning(`Session 已丢失，请点「重新启动」按钮`)
       return
     }
+    // starting / restoring → 顶部给个状态提示继续等
+    if (d.phase === 'restoring' && i === 0) {
+      current.value = current.value || {}
+      current.value.agent_restoring = true
+    }
   }
   // 超时但没明确错误 — 多查一次 /agent/phase 拿真因
+  current.value.agent_restoring = false
   try {
     const r2: any = await api.get(`/admin/tickets/${ticketId}/agent/phase`, { params: { since_seq: 0 } })
     const data = r2.data || {}
@@ -607,7 +640,6 @@ async function quickStatus(row: any, newStatus: string) {
     if (newStatus === 'processing' && detailVisible.value) {
       const det: any = await api.get(`/admin/tickets/${row.ticket_id}`)
       current.value = det.data
-      if (current.value.task?.db_id) loadFullLog(current.value.task.db_id)
       pollAgentStart(row.ticket_id)
     } else if (newStatus === 'closed') {
       // 关闭：关抽屉
@@ -837,16 +869,20 @@ async function loadFullLog(taskId: number) {
     const log = r.data?.log ?? ''
     fullLog.value = log
     logLoaded.value = true
-    if (!log) {
-      ElMessage.warning('build.log 为空（任务可能没运行）')
-    }
+    if (log) logExpanded.value = true  // 刷新后若当前折叠则自动展开显示
   } catch (e: any) {
+    // 懒加载场景静默失败：模板里显示"（日志为空）"占位，不打扰用户（控制台留痕便于排查）
     fullLog.value = ''
     logLoaded.value = true
-    ElMessage.error('日志加载失败：' + (e?.response?.data?.detail || e?.message))
+    console.warn('[log] 加载失败:', e?.response?.status, e?.message)
   } finally {
     logLoading.value = false
   }
+}
+
+function expandLog() {
+  logExpanded.value = true
+  if (!logLoaded.value) loadFullLog(current.value?.task?.db_id)
 }
 
 async function cleanupContainer() {

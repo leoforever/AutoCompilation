@@ -290,7 +290,7 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback] = No
             detach=True,
             working_dir=state["container_work_dir"],
             volumes=volumes,
-            labels={"task_id": state["task_id"], "phase": "infrastructure"},
+            labels={**state.get("extra_labels", {}), "task_id": state["task_id"], "phase": "infrastructure"},
             # 2026-10-19 改：改用 host 网络模式
             # 原因：bridge 容器在 firewalld + Docker daemon iptables 规则异常下外网不通
             # host 模式共享 host 网络栈，无 NAT，localhost = host localhost
@@ -749,6 +749,16 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 # ==================== 阶段 6 ====================
 def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
     cli = get_docker_client()
+
+    # _stop_only：只停容器，不归档不删除不碰 work_dir（工单 resolved/cleanup-container 复用恢复路径）
+    if state.get("_stop_only") and state.get("container_id") and cli:
+        try:
+            c = cli.containers.get(state["container_id"])
+            c.stop(timeout=10)
+            _log(state, "info", "[阶段6] 容器已停止（仅停止，可复用）", on_log)
+        except Exception as e:
+            _log(state, "warn", f"[阶段6] 容器停止失败: {e}", on_log)
+        return state
 
     if state.get("status") == TaskStatus.SUCCESS.value and state.get("container_id"):
         try:

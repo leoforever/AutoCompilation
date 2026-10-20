@@ -257,4 +257,14 @@ async def close_my_ticket(
         raise HTTPException(status_code=400, detail="工单已关闭")
     ticket.status = TicketStatus.CLOSED
     db.commit()
+    # 终态回收 agent 容器（异步；work_dir/checkpoint/记录保留）
+    import asyncio
+    from app.services.ticket_agent import MANAGER
+    async def _recycle():
+        try:
+            r = await MANAGER.recycle(ticket_id)
+            print(f"[closed] tkt={ticket_id} 容器回收: {r}")
+        except Exception as e:
+            print(f"[closed] tkt={ticket_id} 回收异常: {e}")
+    asyncio.create_task(_recycle())
     return ApiResponse(message="工单已关闭")
