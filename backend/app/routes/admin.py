@@ -11,7 +11,7 @@ import time
 import bcrypt
 
 from app.models import get_db, Ticket, Experience, Skill, User, TargetSystem, CompileTask, \
-    TicketStatus, ExperienceStatus, UserRole, TaskStatus
+    TicketStatus, ExperienceStatus, UserRole, TaskStatus, AuditLog
 from app.schemas import (
     TargetSystemCreate, TargetSystemUpdate, TargetSystemResponse,
     SkillCreate, SkillUpdate, SkillResponse,
@@ -30,56 +30,120 @@ logger = logging.getLogger(__name__)
 
 @router.get("/stats/overview", response_model=ApiResponse)
 async def get_stats_overview(db: Session = Depends(get_db)):
-    """获取统计看板数据"""
-    # 本月编译成功率
+    """统计看板数据 — 2026-10-20 重构：全部字段来自真实表聚合，无任何写死兜底。
+
+    返回：
+    - kpi: 本月/上月成功率+环比、任务总数/本周新增、工单解决率/平均时长、待审经验、Agent 对话本周、活跃用户
+    - trend: 近 7 天每日 {date,total,success,failed}（1 次 group by，替代原 60 次循环 SQL；样本少时前端自行标注）
+    - top_errors: 失败原因归类 TOP（关键词规则基于真实 error_message 形态；空消息归"未记录错误"）
+    - ticket_pipeline: 工单四段状态分布
+    - experience_funnel: 工单解决→经验提交→审批通过→Skill 落盘 闭环漏斗
+    """
+    from pathlib import Path as _P
+    from sqlalchemy import func as _f
     now = datetime.utcnow()
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
+    prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
+    week_start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    # created_at 是 naive datetime（utcnow 默认），与本地表一致直接用 Python 边界过滤
+
+    def _task_stats(lo, hi):
+        total = db.query(CompileTask).filter(CompileTask.created_at >= lo, CompileTask.created_at < hi).count()
+        succ = db.query(CompileTask).filter(CompileTask.created_at >= lo, CompileTask.created_at < hi,
+                                            CompileTask.status == "success").count()
+        return total, succ
+
+    def _rate(total, succ):
+        return round(succ / total * 100, 1) if total > 0 else 0.0
+
+    m_total, m_succ = _task_stats(month_start, now + timedelta(days=1))
+    p_total, p_succ = _task_stats(prev_month_start, month_start)
+    m_rate, p_rate = _rate(m_total, m_succ), _rate(p_total, p_succ)
+
     total_tasks = db.query(CompileTask).count()
-    success_tasks = db.query(CompileTask).filter(
-        CompileTask.status == "success"
-    ).count()
-    
-    # 近30天趋势
+    week_new_tasks = db.query(CompileTask).filter(CompileTask.created_at >= week_start).count()
+
+    # ---- 工单 ----
+    t_counts = {str(k): int(v) for k, v in db.query(Ticket.status, _f.count(Ticket.ticket_id)).group_by(Ticket.status).all()}
+    t_total = sum(t_counts.values())
+    t_solved = t_counts.get("resolved", 0) + t_counts.get("closed", 0)
+    # 平均解决时长：resolved_at 有值的工单（秒→小时，1 位小数）
+    avg_solve_h = db.query(_f.avg(_f.extract("epoch", Ticket.resolved_at) - _f.extract("epoch", Ticket.created_at))).filter(
+        Ticket.resolved_at.isnot(None)).scalar()
+    # PG avg 返回 Decimal → 必须转 float，否则 JSON 序列化成字符串 "19.6"
+    avg_solve_hours = round(float(avg_solve_h) / 3600, 1) if avg_solve_h else None
+
+    # ---- 经验 / Skill ----
+    pending_exp = db.query(Experience).filter(Experience.status == "submitted").count()
+    approved_exp = db.query(Experience).filter(Experience.status == "approved").count()
+    from app.services.skill_loader import SKILLS_DIR_HOST
+    disk_specific = len([d for d in (_P(SKILLS_DIR_HOST) / "specific").iterdir() if d.is_dir()]) if (_P(SKILLS_DIR_HOST) / "specific").is_dir() else 0
+
+    # ---- Agent 活跃度（本周对话轮次 = 两条审计 action 之和）----
+    agent_msgs_week = db.query(AuditLog).filter(AuditLog.created_at >= week_start,
+                                                AuditLog.action.in_(["ticket_agent_message", "ticket_agent_message_stream"])).count()
+
+    active_users = db.query(User).filter(User.last_active >= week_start, User.is_active == True).count()  # noqa: E712
+
+    # ---- 近 7 天趋势：1 次 group by（date_trunc 用 UTC 与 created_at 存储一致）----
+    trend_rows = db.query(
+        _f.date_trunc("day", CompileTask.created_at).label("d"),
+        _f.count().label("total"),
+        _f.count().filter(CompileTask.status == "success").label("succ"),
+        _f.count().filter(CompileTask.status == "failed").label("fail"),
+    ).filter(CompileTask.created_at >= (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+     ).group_by("d").all()
+    by_day = {r.d.strftime("%m-%d"): r for r in trend_rows}
     trend = []
-    for i in range(30):
-        day = now - timedelta(days=29-i)
-        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
-        
-        day_total = db.query(CompileTask).filter(
-            CompileTask.created_at >= day_start,
-            CompileTask.created_at <= day_end
-        ).count()
-        day_success = db.query(CompileTask).filter(
-            CompileTask.created_at >= day_start,
-            CompileTask.created_at <= day_end,
-            CompileTask.status == "success"
-        ).count()
-        
-        rate = (day_success / day_total * 100) if day_total > 0 else 0
-        trend.append({
-            "date": day.strftime("%m-%d"),
-            "rate": round(rate, 1),
-            "total": day_total
-        })
-    
-    # 活跃用户数（最近7天有活动的用户）
-    week_ago = now - timedelta(days=7)
-    active_users = db.query(User).filter(
-        User.last_active >= week_ago,
-        User.is_active == True
-    ).count()
-    
+    for i in range(7):
+        day = (now - timedelta(days=6 - i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        key = day.strftime("%m-%d")
+        r = by_day.get(key)
+        trend.append({"date": key, "total": (r.total if r else 0), "success": (r.succ if r else 0), "failed": (r.fail if r else 0)})
+
+    # ---- 失败原因归类（关键词规则源自真实 error_message 形态；按优先级首个命中）----
+    failed_msgs = [m or "" for (m,) in db.query(CompileTask.error_message).filter(CompileTask.status == "failed").all()]
+    _RULES = [
+        ("LLM 限流（429/Token Plan）", lambda e: "429" in e or "rate_limit" in e),
+        ("编译超时", lambda e: "超时" in e or "timeout" in e.lower()),
+        ("源码获取失败（git/下载）", lambda e: "git clone" in e or "仓库" in e or "Repository not found" in e or "下载失败" in e),
+        ("内存溢出（OOM）", lambda e: "OOM" in e or "out of memory" in e.lower() or "内存不足" in e),
+        ("依赖缺失", lambda e: "devel" in e or "依赖" in e or "not found" in e.lower() and "repo" not in e.lower()),
+    ]
+    bucket = {}
+    for e in failed_msgs:
+        label = next((name for name, fn in _RULES if fn(e)), "未记录错误信息" if not e.strip() else "其它")
+        bucket[label] = bucket.get(label, 0) + 1
+    n_failed = len(failed_msgs)
+    top_errors = sorted(
+        [{"error_type": k, "count": v, "percentage": round(v / n_failed * 100, 1)} for k, v in bucket.items()],
+        key=lambda x: -x["count"])[:5] if n_failed else []
+
     return ApiResponse(data={
-        "success_rate": round(success_tasks / total_tasks * 100, 1) if total_tasks > 0 else 0,
-        "total_tasks": total_tasks,
-        "total_experiences": db.query(Experience).count(),
-        "active_users": active_users,
-        "recent_success_rate_trend": trend[-7:],  # 最近7天
-        "top_errors": [],  # TODO: 实现错误统计
-        "cluster_nodes": [],  # TODO: 实现节点状态
-        "skill_sync_summary": {}  # TODO: 实现 Skill 同步统计
+        "kpi": {
+            "month_success_rate": m_rate,
+            "month_delta": round(m_rate - p_rate, 1),
+            "month_has_data": m_total > 0,
+            "total_tasks": total_tasks,
+            "week_new_tasks": week_new_tasks,
+            "ticket_total": t_total,
+            "ticket_solve_rate": _rate(t_total, t_solved),
+            "ticket_avg_solve_hours": avg_solve_hours,
+            "pending_experiences": pending_exp,
+            "agent_msgs_week": agent_msgs_week,
+            "active_users": active_users,
+        },
+        "recent_success_rate_trend": trend,
+        "top_errors": top_errors,
+        "failed_samples": n_failed,  # TOP 归类样本数（<10 前端显示"样本积累中"）
+        "ticket_pipeline": [{"status": s, "count": t_counts.get(s, 0)} for s in ("pending", "processing", "resolved", "closed")],
+        "experience_funnel": [
+            {"stage": "工单解决", "count": t_solved},
+            {"stage": "经验提交", "count": db.query(Experience).count()},
+            {"stage": "审批通过", "count": approved_exp},
+            {"stage": "Skill 落盘", "count": disk_specific},
+        ],
+        "generated_at": now.isoformat(),
     })
 
 
@@ -1287,7 +1351,9 @@ async def get_agent_phase(
         return ApiResponse(data={
             "events": [],
             "latest_seq": 0,
-            "done": False,
+            # 无 session 且无 error = 没有可等的启动过程（pending 查看 / resolve·close 后 session 已移除），
+            # done=True 让前端退出轮询；接单启动期 session 从 starting 起就存在于 _sessions，不受影响
+            "done": err is None,
             "error": err,
         })
     events = [e for e in sess.phase_events if e.get("seq", 0) > since_seq]

@@ -473,7 +473,11 @@ async function openDetail(row: any) {
   currentPhaseLabel.value = ''
   currentPhaseClass.value = 'phase-progress'
   // 2026-10-19 方案 2：起 phase 轮询（拉工单调试实时阶段提示）
-  startPhasePolling(row.ticket_id)
+  // 2026-10-20 修复：仅 processing 工单轮询——pending/resolved/closed 无启动过程，
+  // 后端 done=False 永等导致 1.5s/次无限刷屏
+  if (r.data.status === 'processing') {
+    startPhasePolling(row.ticket_id)
+  }
   // 2026-10-20：失败日志改为懒加载（默认折叠，点"展开"才请求；进抽屉不再自动拉全文）
   fullLog.value = ''
   logLoaded.value = false
