@@ -47,6 +47,10 @@ api.interceptors.response.use(
       const authStore = useAuthStore()
       authStore.logout()
       window.location.href = '/login'
+    } else if (!error.response && /ECONNABORTED|ETIMEDOUT|timeout/i.test(error.code || error.message || '')) {
+      ElMessage.error('请求超时：AI 生成较慢，请稍候重试')
+    } else if (!error.response) {
+      ElMessage.error('网络错误：无法连接服务器')
     } else {
       ElMessage.error(messages[status] || '网络错误')
     }

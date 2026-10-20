@@ -212,8 +212,13 @@ def _validate_draft(content: str) -> tuple[bool, str]:
 
 # ==================== LLM 调用 ====================
 
-def _call_llm(system: str, user: str, temperature: float = 0.3) -> str:
-    """调 LLM，返回文本输出。无 key 则抛 RuntimeError"""
+def _call_llm(system: str, user: str, temperature: float = 0.3,
+              max_tokens: int | None = None) -> str:
+    """调 LLM，返回文本输出。无 key 则抛 RuntimeError
+
+    max_tokens：输出上限。思考型模型（reasoning token 计入输出预算）写长文档时
+    2048 会被 reasoning 吃光导致 content 为空——攻略生成用更大值。
+    """
     from langchain_openai import ChatOpenAI  # lazy：避免 module-load 时拉无关依赖
 
     key = _ai_api_key()
@@ -225,7 +230,7 @@ def _call_llm(system: str, user: str, temperature: float = 0.3) -> str:
         api_key=key,
         base_url=_ai_base_url() or None,
         temperature=temperature,
-        max_completion_tokens=_MAX_TOKENS,
+        max_completion_tokens=max_tokens or _MAX_TOKENS,
     )
     resp = llm.invoke([
         SystemMessage(content=system),

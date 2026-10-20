@@ -246,6 +246,7 @@ class Experience(Base):
     status = Column(String(20), default="submitted")
     skill_content = Column(Text)  # SKILL.md 内容
     rejection_reason = Column(Text)
+    ticket_id = Column(Integer, ForeignKey("tickets.ticket_id"), nullable=True)  # 来源工单（工单经验专用）
     submitted_at = Column(DateTime, default=datetime.utcnow)
     reviewed_at = Column(DateTime)
     reviewer_id = Column(Integer, ForeignKey("users.user_id"))
@@ -340,6 +341,8 @@ def init_db():
     _safe_add_column("users", "deleted_at", "TIMESTAMP NULL")
     _safe_add_column("users", "deleted_by", "INTEGER NULL")
     _safe_add_column("users", "original_username", "VARCHAR(50) NULL")
+    # 2026-10-20: 工单经验统一走 experience 审批流（ticket_id 标识来源工单）
+    _safe_add_column("experiences", "ticket_id", "INTEGER NULL")
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
     _seed_default_target_systems()
     logger.info("Database initialized")

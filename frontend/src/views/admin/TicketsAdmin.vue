@@ -234,8 +234,8 @@
           <el-button
             v-if="current.status === 'resolved'"
             size="small"
-            @click="generateSkill(current)"
-          >📚 生成 Skill（进审核）</el-button>
+            @click="openSkillPreview(current)"
+          >📚 生成经验（预览后进审批）</el-button>
           <el-button @click="quickStatus(current, 'closed')">关闭工单</el-button>
           <el-button @click="closeDetail">← 返回工单列表</el-button>
         </div>
@@ -251,18 +251,48 @@
         </el-form-item>
         <el-form-item>
           <el-checkbox v-model="resolveForm.autoSkill">
-            同时生成 SKILL.md 经验（进 SkillLib 待审核）
+            同时生成经验草稿（提交后进「审批」页，预览确认再入库）
           </el-checkbox>
         </el-form-item>
         <el-form-item>
           <div class="muted" style="font-size:12px;line-height:1.5">
-            💡 勾选后：自动从工单+容器内修改记录拼 SKILL.md 草稿，admin 审核后用户下次编译自动成功
+            💡 勾选后：自动从工单+解决说明拼 SKILL.md 草稿并提审，与用户提交经验同一条审批流
           </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="resolveDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="resolving" @click="confirmResolve">确认解决</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 经验草稿预览弹窗（编辑 + 确认后提交审批） -->
+    <el-dialog v-model="skillPreviewVisible" title="📚 经验草稿预览（确认前可编辑）" width="760px" :close-on-click-modal="false" @close="stopDraftPolling()">
+      <div v-if="skillDraft">
+        <div style="margin-bottom:8px">
+          <el-tag v-if="skillDraft.generated_by === 'llm'" type="success" size="small" effect="plain">🤖 AI 总结（同用户经验提示词）</el-tag>
+          <el-tag v-else type="warning" size="small" effect="plain">📋 模板拼装（AI 不可用：{{ skillDraft.llm_error || '未知原因' }}）</el-tag>
+        </div>
+        <el-form label-width="80px" style="margin-bottom:8px">
+          <el-form-item label="Skill 名称">
+            <el-input v-model="skillDraft.skill_name" />
+          </el-form-item>
+        </el-form>
+        <el-form-item label-width="0">
+          <el-input v-model="skillDraft.skill_content" type="textarea" :rows="18" class="draft-editor" />
+        </el-form-item>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          提交后进「审批」列表（与用户经验同流程）：通过=写 Skill 表+落盘 SKILL.md 生效；驳回=留痕不入库
+        </div>
+      </div>
+      <div v-else class="chat-wait" style="text-align:center;padding:60px 0">
+        <div style="font-size:28px" class="spin">🛠️</div>
+        <div style="margin-top:12px;font-weight:600">AI 正在生成攻略草稿…</div>
+        <div class="muted" style="margin-top:6px">已等待 {{ draftElapsed }} 秒（思考模型生成约需 1-3 分钟，可关窗稍后再点）</div>
+      </div>
+      <template #footer>
+        <el-button @click="skillPreviewVisible = false">取消</el-button>
+        <el-button type="primary" :loading="submittingDraft" :disabled="!skillDraft" @click="submitSkillDraft">提交审批</el-button>
       </template>
     </el-dialog>
   </div>
@@ -610,13 +640,17 @@ async function confirmResolve() {
     const r: any = await api.post(
       `/admin/tickets/${resolveTarget.value.ticket_id}/resolve`,
       null,
-      { params: { resolution: resolveForm.resolution.trim(), auto_generate_skill: resolveForm.autoSkill } }
+      // 勾选自动生成经验时后端同步调 LLM（60s+），放宽超时
+      { params: { resolution: resolveForm.resolution.trim(), auto_generate_skill: resolveForm.autoSkill }, timeout: 240000 }
     )
     ElMessage.success(r?.message || '已解决')
     resolveDialogVisible.value = false
     const d = r.data || {}
     if (d.new_task_id) ElMessage.info(`新 task: ${d.new_task_id}（admin 可下载产物）`)
-    if (d.skill_id) ElMessage.success(`Skill 草稿 #${d.skill_id} 已生成，请到 SkillLib 审核`)
+    if (d.draft_job_started) {
+      // 后台已在生成草稿 → 直接开预览弹窗轮询（不卡 HTTP）
+      openSkillPreview(resolveTarget.value)
+    }
     detailVisible.value = false
     loadTickets()
   } catch (e: any) {
@@ -829,12 +863,66 @@ async function cleanupContainer() {
   }
 }
 
-async function generateSkill(row: any) {
+// 经验草稿预览 → 编辑 → 提交审批（走 experience 流程）
+const skillPreviewVisible = ref(false)
+const skillDraft = ref<any>(null)
+const submittingDraft = ref(false)
+const draftElapsed = ref(0)  // 等待秒数（异步生成进度感）
+
+async function openSkillPreview(row: any) {
+  skillDraft.value = null
+  skillPreviewVisible.value = true
+  draftElapsed.value = 0
   try {
-    const r: any = await api.post(`/admin/tickets/${row.ticket_id}/generate-skill`)
-    ElMessage.success(r?.message || '已生成')
+    // 异步任务：秒回，后台 LLM 生成（60-240s），轮询状态——避免 HTTP 超时
+    await api.post(`/admin/tickets/${row.ticket_id}/generate-skill/preview-job`)
+    pollDraftJob(row.ticket_id)
   } catch (e: any) {
-    ElMessage.error(e?.response?.data?.detail || '生成失败')
+    ElMessage.error(e?.response?.data?.detail || '草稿生成启动失败')
+    skillPreviewVisible.value = false
+  }
+}
+
+let _draftPollTimer: any = null
+function stopDraftPolling() {
+  if (_draftPollTimer) { clearInterval(_draftPollTimer); _draftPollTimer = null }
+}
+async function pollDraftJob(ticketId: number) {
+  if (_draftPollTimer) clearInterval(_draftPollTimer)
+  _draftPollTimer = setInterval(async () => {
+    try {
+      const r: any = await api.get(`/admin/tickets/${ticketId}/generate-skill/preview-job/status`)
+      const d = r.data || {}
+      draftElapsed.value = Math.round(d.elapsed || 0)
+      if (d.status === 'done' && d.result) {
+        clearInterval(_draftPollTimer); _draftPollTimer = null
+        skillDraft.value = d.result
+      } else if (d.status === 'error') {
+        clearInterval(_draftPollTimer); _draftPollTimer = null
+        ElMessage.error('草稿生成失败：' + (d.error || '未知错误'))
+        skillPreviewVisible.value = false
+      }
+    } catch {
+      clearInterval(_draftPollTimer); _draftPollTimer = null
+      ElMessage.error('草稿状态查询失败')
+    }
+  }, 3000)
+}
+
+async function submitSkillDraft() {
+  if (!skillDraft.value || !current.value) return
+  submittingDraft.value = true
+  try {
+    const r: any = await api.post(`/admin/tickets/${current.value.ticket_id}/generate-skill`, {
+      skill_content: skillDraft.value.skill_content,
+      skill_name: skillDraft.value.skill_name,
+    })
+    ElMessage.success(r?.message || '已提交审批')
+    skillPreviewVisible.value = false
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '提交失败')
+  } finally {
+    submittingDraft.value = false
   }
 }
 
@@ -847,6 +935,8 @@ onMounted(loadTickets)
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px }
 .muted { color: var(--text3); font-size: 12px }
 .resolution-cell { color: var(--el-color-success, #67c23a); font-size: 13px }
+.spin { display: inline-block; animation: spin 1.6s linear infinite }
+@keyframes spin { to { transform: rotate(360deg) } }
 .toolbar { display: flex; gap: 12px; margin-bottom: 14px; align-items: center; flex-wrap: wrap }
 .detail h4 { margin: 18px 0 8px; font-size: 14px; font-weight: 600 }
 /* 2026-10-19：返回工单列表 bar（明显放顶部左侧） */

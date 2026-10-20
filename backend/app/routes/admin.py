@@ -2,7 +2,7 @@
 Admin routes
 Based on design doc section 11.2: stats, tickets management, skill CRUD, users, systems
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -216,12 +216,18 @@ async def resolve_ticket(
     # 归档 agent 容器产物（如果 session 还活着）
     new_task_id = None
     from app.services.ticket_agent import MANAGER
+    # 修复 DetachedInstanceError：上方 db.expunge_all()（或 commit 后 expire）会让
+    # 老 ticket 对象访问关系属性爆炸 → 重新取一份绑定当前 session 的
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
     sess = MANAGER.get(ticket_id)
-    if sess is not None:
+    if sess is not None and ticket:
         try:
             from app.services.compile_engine import _artifacts_dir
+            # sess.task 是接单时那个 request session 的对象，已 Detached →
+            # 用当前 session 重新 join 的 ticket.task（同一行，绑定本 session）
+            src_task = ticket.task
             # 计算 task_id 后缀 R{N}
-            base = sess.task.task_id
+            base = src_task.task_id
             existing = db.query(CompileTask).filter(
                 CompileTask.task_id.like(f"{base}-R%")
             ).count()
@@ -249,13 +255,13 @@ async def resolve_ticket(
             # 写新 task 行（继承原 task 的 user_id/system/source）
             new_task = CompileTask(
                 task_id=new_task_id,
-                user_id=sess.task.user_id,
-                system_id=sess.task.system_id,
-                software_name=sess.task.software_name,
-                source_type=sess.task.source_type,
-                git_url=sess.task.git_url,
-                git_branch=sess.task.git_branch,
-                source_path=sess.task.source_path,
+                user_id=src_task.user_id,
+                system_id=src_task.system_id,
+                software_name=src_task.software_name,
+                source_type=src_task.source_type,
+                git_url=src_task.git_url,
+                git_branch=src_task.git_branch,
+                source_path=src_task.source_path,
                 status=TaskStatus.SUCCESS.value if (host_out.exists() and any(host_out.iterdir())) else TaskStatus.FAILED.value,
                 artifact_path=str(host_out),
             )
@@ -272,24 +278,24 @@ async def resolve_ticket(
     ))
     db.commit()
 
-    # 可选：自动生成 SKILL.md
-    skill_id = None
-    if auto_generate_skill:
-        from app.services.skill_draft import generate_skill_from_ticket
+    # 可选：自动生成经验草稿 —— 不再同步调 LLM（60-240s 会撞超时），
+    # 起后台预览 job，前端 resolve 成功后直接开预览弹窗（复用 job 秒开进度态）
+    draft_job_started = False
+    if auto_generate_skill and ticket.resolution:
+        from app.services.skill_draft import start_preview_job
+        from app.models import SessionLocal
         try:
-            skill_id = generate_skill_from_ticket(
-                db=db, ticket_id=ticket_id, current_user=current_user,
-            )
-            db.commit()
+            start_preview_job(SessionLocal, ticket_id)
+            draft_job_started = True
         except Exception as e:
-            print(f"[resolve] 生成 skill 失败: {e}")
+            print(f"[resolve] 草稿 job 启动失败: {e}")
 
     return ApiResponse(
         data={
             "new_task_id": new_task_id,
-            "skill_id": skill_id,
+            "draft_job_started": draft_job_started,
         },
-        message="工单已标记为已解决" + ("，已生成 Skill 草稿" if skill_id else ""),
+        message="工单已标记为已解决" + ("，经验草稿生成中，请在预览窗口确认" if draft_job_started else ""),
     )
 
 
@@ -1827,26 +1833,99 @@ async def retry_ticket_agent(
 # ============== 生成 SKILL.md（手动 / 自动）=============
 @router.post("/tickets/{ticket_id}/generate-skill")
 async def generate_skill_endpoint(
+    request: Request,
     ticket_id: int,
     skill_name: Optional[str] = None,
     skill_type: str = "layer2-lessons",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """从工单生成 SKILL.md 草稿（进 SkillLib pending 列表）"""
+    """工单经验提交审核（预览确认后走 experience 审批流）
+
+    body（可选）：{"skill_content": "...", "skill_name": "..."}
+    - 带 skill_content：admin 在预览弹窗编辑过的草稿，用它提交
+    - 不带：后端按模板现生成（resolve+勾选时的快捷路径）
+    """
     from app.services.skill_draft import generate_skill_from_ticket
+    payload = {}
     try:
-        skill_id = generate_skill_from_ticket(
+        payload = await request.json()
+    except Exception:
+        pass
+    edited_content = payload.get("skill_content")
+    edited_name = payload.get("skill_name") or skill_name
+    try:
+        exp_id = generate_skill_from_ticket(
             db=db, ticket_id=ticket_id, current_user=current_user,
-            skill_name=skill_name, skill_type=skill_type,
+            skill_name=edited_name, skill_type=skill_type,
+            skill_content_override=edited_content,
         )
         db.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成失败: {e}")
     return ApiResponse(
-        data={"skill_id": skill_id},
-        message="Skill 草稿已生成，请到 SkillLib 审核",
+        data={"experience_id": exp_id},
+        message=f"经验草稿已提交审核（#{exp_id}），请到「审批」页预览确认",
     )
+
+
+@router.get("/tickets/{ticket_id}/generate-skill/preview")
+async def preview_skill_draft(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """预览工单经验草稿（不写 DB）—— 同步版：LLM 要 1-4 分钟，前端一般走 /preview-job 异步轮询"""
+    from app.services.skill_draft import build_skill_draft_preview
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if not ticket.resolution:
+        raise HTTPException(status_code=400, detail="工单还没有解决说明，请先标记已解决再生成经验")
+    try:
+        draft = build_skill_draft_preview(db, ticket)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"草稿生成失败: {e}")
+    return ApiResponse(data=draft)
+
+
+@router.post("/tickets/{ticket_id}/generate-skill/preview-job")
+async def start_preview_job(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """异步起 LLM 草稿生成任务（秒回，前端轮询 /preview-job/status）。
+
+    LLM 思考模型生成 60-240s+，同步等待会撞 HTTP 超时；改后台线程 + 轮询。
+    """
+    from app.services.skill_draft import start_preview_job
+    from app.models import SessionLocal
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if not ticket.resolution:
+        raise HTTPException(status_code=400, detail="工单还没有解决说明，请先标记已解决再生成经验")
+    job = start_preview_job(SessionLocal, ticket_id)
+    return ApiResponse(data={"status": job["status"]}, message="草稿生成中" if job["status"] == "running" else "任务已存在")
+
+
+@router.get("/tickets/{ticket_id}/generate-skill/preview-job/status")
+async def preview_job_status(
+    ticket_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    """轮询草稿生成任务：running / done(result) / error(message) / none(未启动)"""
+    from app.services.skill_draft import get_preview_job
+    job = get_preview_job(ticket_id)
+    if not job:
+        return ApiResponse(data={"status": "none"})
+    return ApiResponse(data={
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "elapsed": round(__import__("time").time() - job["started_at"], 1),
+    })
 
 
 # ============== 工单详情：join task 返完整信息（admin 复现需要）=============

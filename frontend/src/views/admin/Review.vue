@@ -12,7 +12,12 @@
         </h3>
         <el-table :data="pendingExperiences" stripe style="width: 100%">
           <el-table-column prop="experience_id" label="ID" width="80" />
-          <el-table-column prop="skill_name" label="软件" />
+          <el-table-column label="软件" min-width="140">
+            <template #default="{ row }">
+              {{ row.skill_name }}
+              <el-tag v-if="row.ticket_id" type="info" size="small" effect="plain" style="margin-left:6px">工单#{{ row.ticket_id }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column label="类型" width="80">
             <template #default="{ row }">
               <el-tag :type="row.skill_type === 'generic' ? 'primary' : 'warning'" size="small">

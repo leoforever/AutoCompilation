@@ -189,6 +189,8 @@ class ExperienceResponse(BaseModel):
     status: ExperienceStatus
     submitted_at: datetime
     reviewed_at: Optional[datetime]
+    # 来源工单（工单经验专用；用户经验为 None）
+    ticket_id: Optional[int] = None
     # SKILL.md 内容（经验贡献核心字段，列表接口也返方便前端预览）
     # 体量：单条经验 markdown 通常 < 10KB，可接受
     skill_content: Optional[str] = None
