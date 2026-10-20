@@ -204,7 +204,8 @@ const fileInput = ref<HTMLInputElement>()
 const systems = ref<any[]>([])
 async function loadSystems() {
   try {
-    const res = await api.get('/admin/systems', { params: { is_active: true } })
+    // 登录级只读端点（旧版调 /admin/systems，普通用户 403 → 拦截器不停弹 toast）
+    const res = await api.get('/compile/options/systems')
     const data = (res.data && (res.data.data || res.data)) || []
     systems.value = data
     if (data.length && !form.systemId) {
@@ -215,17 +216,15 @@ async function loadSystems() {
   }
 }
 
-// 拉所有 active skills 填入 availableSkills（用 /admin/skills 因为有 system_names 字段也好用）
-// 注：/admin/skills 要求 admin role，普通用户可能被 403；退路用 /experience/my
+// 拉所有 active skills 填入 availableSkills（登录级只读端点，只含 name/type）
 async function fetchAvailableSkills() {
   try {
-    const res = await api.get('/admin/skills', { params: { is_active: true } })
+    const res = await api.get('/compile/options/skills')
     const data = (res.data && (res.data.data || res.data)) || []
-    // 只保留 name + type
     availableSkills.value = data.map((s: any) => ({ name: s.name, type: s.type }))
   } catch (e) {
-    console.error('加载 Skills 列表失败（需要 admin 权限）', e)
-    // 普通用户 403 时静默留空
+    console.error('加载 Skills 列表失败', e)
+    // 失败静默留空，不打断工作台
   }
 }
 
@@ -234,7 +233,7 @@ const compiling = ref(false)
 const logLines = ref<{ text: string; type: string }[]>([])
 const compileResult = ref<{ status: 'success' | 'failed'; task_id?: string; artifact?: string } | null>(null)
 const matchedSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
-// 已加载的 Skills（知识库全量，从 /api/admin/skills 拉）
+// 已加载的 Skills（知识库全量，从 /api/compile/options/skills 拉，登录级只读）
 // 与 matchedSkills 的区别：availableSkills 是"实际可用"，matchedSkills 是"log 命中"
 const availableSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
 let ws: WebSocket | null = null
