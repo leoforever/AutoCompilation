@@ -181,11 +181,13 @@ class Ticket(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     resolved_at = Column(DateTime)
+    resolution = Column(Text)  # 管理员填的解决方案（必填，admin 标记已解决时写）
 
     # 关系
     task = relationship("CompileTask", back_populates="ticket")
     user = relationship("User", back_populates="tickets")
     messages = relationship("TicketMessage", back_populates="ticket", order_by="TicketMessage.created_at")
+    agent_record = relationship("TicketAgent", back_populates="ticket", uselist=False, cascade="all, delete-orphan")
 
 
 class TicketMessage(Base):
@@ -200,6 +202,36 @@ class TicketMessage(Base):
 
     ticket = relationship("Ticket", back_populates="messages")
     user = relationship("User")
+
+
+class TicketAgent(Base):
+    """工单答疑 agent 持久化记录（容器 + work_dir + checkpoint）
+
+    设计目的：解决"每次接单都重新 git clone + docker run 5-30s"问题
+    - container_id: 上次的容器 ID（复用时 docker start）
+    - work_dir: artifacts/{task_id}-TKT{n}/ 路径（永不删；agent checkpoint 在这里）
+    - checkpoint_path: langgraph state 序列化文件路径
+    - skills_snapshot: 接单时一次注入的 skills 列表（resume 时一致）
+    - last_error: 启动失败时记这里（admin 端可见）
+    """
+    __tablename__ = "ticket_agents"
+
+    ticket_id = Column(Integer, ForeignKey("tickets.ticket_id"), primary_key=True)
+    container_id = Column(String(64))
+    work_dir = Column(Text)
+    checkpoint_path = Column(Text)
+    # checkpoint_state: langgraph state 序列化 JSON（跨进程/重启恢复多轮对话）
+    checkpoint_state = Column(Text)
+    # 2026-10-19 B3：agent 消息持久化（解决"退出再进 agent 消息丢"问题）
+    # 存最近一轮的 messages list JSON（不存 DB ticket_messages，遵循 §62 决策）
+    # admin 抽屉打开时 GET /agent/messages 拉取
+    last_messages_json = Column(Text)
+    skills_snapshot = Column(Text)  # JSON list[str]
+    last_error = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    ticket = relationship("Ticket", back_populates="agent_record")
 
 
 class Experience(Base):
@@ -298,6 +330,7 @@ def init_db():
     # 幂等迁移：新增字段（老库升级用）
     _safe_add_column("skills", "source", "VARCHAR(20) DEFAULT 'admin'")
     _safe_add_column("skills", "deleted_at", "TIMESTAMP NULL")
+    _safe_add_column("tickets", "resolution", "TEXT")
     # 幂等迁移：删字段
     _safe_drop_column("skills", "sync_status")
     # 2026-10-13: TargetSystem 简化（drop arch / tag，只用 name + base_image）

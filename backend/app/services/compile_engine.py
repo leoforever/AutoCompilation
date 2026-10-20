@@ -233,7 +233,13 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 
 
 # ==================== 阶段 3 ====================
-def stage3_create_container(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
+def stage3_create_container(state: TaskState, on_log: Optional[LogCallback] = None,
+                             existing_container_id: Optional[str] = None) -> TaskState:
+    """阶段 3：建容器 / 复用现有容器
+
+    - existing_container_id 传了 + 容器还活着 → 复用（docker start 重新启动）
+    - 否则：全新创建
+    """
     cli = get_docker_client()
     if cli is None:
         state["status"] = TaskStatus.FAILED.value
@@ -248,6 +254,24 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback]) -> 
     state["work_dir"] = str(base_dir)
     # 文件兜底日志：每个 task 一份 build.log，_log() 双写（DB 仍写）
     state["host_log_path"] = str(base_dir / "build.log")
+
+    # 复用现有容器：避免 5-10s 的 docker run
+    if existing_container_id:
+        try:
+            existing = cli.containers.get(existing_container_id)
+            if existing.status == "running":
+                state["container_id"] = existing.id
+                _log(state, "info", f"[阶段3] 复用现有容器 {existing.id[:12]}（状态 running）", on_log)
+                return state
+            # 容器存在但停了，start 它
+            existing.start()
+            # 重新绑定 volume（容器 stop 时还在）
+            state["container_id"] = existing.id
+            _log(state, "info", f"[阶段3] 重启容器 {existing.id[:12]}（状态 {existing.status}）", on_log)
+            return state
+        except Exception as e:
+            # 容器不存在/不可用，fallback 全新创建
+            _log(state, "warn", f"[阶段3] 复用容器失败 ({e})，将创建新容器", on_log)
 
     try:
         # 镜像名从 stage2 读 DB 拿（admin 在 /admin/systems 配的）
@@ -267,6 +291,11 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback]) -> 
             working_dir=state["container_work_dir"],
             volumes=volumes,
             labels={"task_id": state["task_id"], "phase": "infrastructure"},
+            # 2026-10-19 改：改用 host 网络模式
+            # 原因：bridge 容器在 firewalld + Docker daemon iptables 规则异常下外网不通
+            # host 模式共享 host 网络栈，无 NAT，localhost = host localhost
+            # 副作用：容器能看 host 所有端口（安全权衡）
+            network_mode="host",
         )
         state["container_id"] = container.id
         # 落库：cancel API 用 container_id 调 docker stop
@@ -1074,3 +1103,66 @@ def _persist_and_return(db: Session, task: Optional[CompileTask], state: TaskSta
         "error_log": state.get("last_error", ""),
         "artifacts": state.get("artifacts", []),
     }
+
+
+# ============== 报错工单 AI 总结（用于 /api/tickets/draft）==============
+def _summarize_log_for_ticket(software_name: str, task_status: str, log_tail: str) -> tuple:
+    """
+    调 LLM 总结 build.log 末尾，生成工单草稿。
+    返回 (title, summary, description) 三元组；LLM 失败时降级到简单模板。
+    """
+    # 1) 提取结构化信号（exit code / 阶段 / 关键错）—— 模板兜底
+    fallback_title = f"[失败] {software_name}"
+    fallback_summary = None
+    fallback_desc = (
+        f"软件名：{software_name}\n"
+        f"任务状态：{task_status}\n\n"
+        f"日志末尾：\n```\n{log_tail[-3000:]}\n```\n\n"
+        f"（AI 总结未启用，请根据上述日志人工描述）"
+    )
+    if not _ai_api_key():
+        return fallback_title, fallback_summary, fallback_desc
+
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        llm = ChatOpenAI(
+            model=_ai_model(),
+            api_key=_ai_api_key(),
+            base_url=_ai_base_url() or None,
+            temperature=0.0,  # 总结任务要确定
+            max_tokens=600,
+        )
+        # 日志太长截断（保险）
+        log_for_llm = log_tail[-6000:] if len(log_tail) > 6000 else log_tail
+        prompt = (
+            f"你是编译平台的报错分析助手。根据以下 build.log 末尾内容，"
+            f"为用户生成工单草稿。\n\n"
+            f"软件名：{software_name}\n"
+            f"任务状态：{task_status}\n\n"
+            f"```\n{log_for_llm}\n```\n\n"
+            f"请严格按以下 JSON 输出（不要任何多余文字）：\n"
+            f'{{"title": "一句中文标题，不超过 30 字", '
+            f'"summary": "2-4 句中文，定位失败原因/阶段/关键错误，控制在 150 字内", '
+            f'"description": "中文完整描述，含：失败阶段、关键错误片段、可能原因建议（200-400 字）"}}'
+        )
+        resp = llm.invoke([
+            SystemMessage(content="你只输出 JSON。"),
+            HumanMessage(content=prompt),
+        ])
+        raw = (resp.content or "").strip()
+        # 解析 JSON（容错：去 markdown fence）
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        import json as _json
+        d = _json.loads(raw)
+        return (
+            d.get("title", fallback_title)[:60],
+            d.get("summary"),
+            d.get("description", fallback_desc),
+        )
+    except Exception as e:
+        # 失败兜底：返回简单模板，前端可编辑
+        return fallback_title, f"AI 总结失败：{type(e).__name__}", fallback_desc
