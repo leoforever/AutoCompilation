@@ -119,7 +119,19 @@ async def get_stats_overview(db: Session = Depends(get_db)):
         [{"error_type": k, "count": v, "percentage": round(v / n_failed * 100, 1)} for k, v in bucket.items()],
         key=lambda x: -x["count"])[:5] if n_failed else []
 
+    # 入库健康（Step 0）：persist 失败计数 + 上轮对账结果 + 滞留任务数 —— 消灭静默失败
+    from app.services.task_writer import persist_error_stats
+    from app.services.task_reconciler import last_result as _recon_last
+    _stuck_n = db.query(_f.count(CompileTask.id)).filter(
+        CompileTask.status == TaskStatus.COMPILING.value,
+        CompileTask.updated_at < now - timedelta(seconds=600)).scalar() or 0
+    _health = {
+        "persist_errors": persist_error_stats(),
+        "last_reconcile": _recon_last,
+        "stale_compiling_count": int(_stuck_n),
+    }
     return ApiResponse(data={
+        "health": _health,
         "kpi": {
             "month_success_rate": m_rate,
             "month_delta": round(m_rate - p_rate, 1),

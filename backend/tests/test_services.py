@@ -31,8 +31,9 @@ def test_skill_loader_count():
     # 曾硬编码 ==5，新增 skill 即碎 → 校验下限 + 已知 skill 全覆盖（数量随库增长自适应）
     names = {p.parent.name for p in md}
     assert len(md) >= 5, f"got {len(md)}: {md}"
-    for k in ("go-toolchain", "nodejs-toolchain", "python-environment",
-              "ollama-openeuler-2403", "python-package"):
+    # 只校验 generic 工具链类（平台基建，稳定）；specific 随审批流增删改名，进名单必碎
+    # （2026-10-21 教训：ollama/llama-cpp 被审批删除、pytorch 重命名后本测试即挂）
+    for k in ("go-toolchain", "nodejs-toolchain", "python-environment", "python-package"):
         assert k in names, f"缺失 skill: {k}"
 
 

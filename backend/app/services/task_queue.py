@@ -70,13 +70,26 @@ def dequeue(worker_id: str) -> Optional[str]:
                 CompileTask.updated_at.asc()
             ).first()
             if stale and stale.updated_at and stale.updated_at < threshold:
-                # 标 failed 而非继续执行
-                stale.status = TaskStatus.FAILED.value
-                stale.error_message = (
-                    f"任务超时无心跳（{HEARTBEAT_TIMEOUT}s 无更新），"
-                    f"worker 崩溃，自动标记失败"
-                )
-                db.commit()
+                # 看门狗分流（2026-10-21 Step 0 教训 223BFD）：
+                # "写库断了"（有 .persist_error 哨兵）≠ "进程死了"——前者留给 task_reconciler
+                # 按磁盘现场恢复，绝不能再补刀"worker 崩溃"；后者才标 failed。
+                has_sentinel = False
+                try:
+                    from pathlib import Path
+                    from app.services.compile_engine import _artifacts_dir
+                    if stale.task_id:
+                        has_sentinel = (_artifacts_dir() / stale.task_id / ".persist_error").is_file()
+                except Exception:
+                    pass
+                if has_sentinel:
+                    pass  # 不动 status：交给下一轮对账自愈（RECONCILE_AUTO）
+                else:
+                    stale.status = TaskStatus.FAILED.value
+                    stale.error_message = (
+                        f"任务超时无心跳（{HEARTBEAT_TIMEOUT}s 无更新），"
+                        f"worker 崩溃，自动标记失败"
+                    )
+                    db.commit()
                 # 不返回这个 task，让 worker 继续 dequeue 新任务
                 task = None
             else:

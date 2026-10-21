@@ -96,6 +96,10 @@ _PERIODIC_COMMIT_EVERY = 20
 
 
 def _log(state: TaskState, level: str, msg: str, on_log: Optional[LogCallback] = None):
+    # 源头净化 NUL(\x00)：PG text 字段禁止 0x00。教训（T-20261021163147-223BFD）：
+    # agent 跑"看日志尾部"类命令把二进制零带进流 → persist 整块失败 → 成功任务被看门狗误标"worker 崩溃"。
+    # 唯一日志入口在此拦，log_output/文件/WS 三路同时干净，日志可读性无损。
+    msg = str(msg).replace("\x00", "")
     ts = datetime.now().strftime("%m-%d %H:%M:%S")
     line = f"[{ts}] [{level.upper()}] {msg}"
     print(line)
@@ -146,14 +150,14 @@ def _periodic_persist(state: TaskState):
                 state["_external_error"] = cur.error_message or ""
         finally:
             fresh.close()
-        # 写 log
+        # 写 log（统一入口：净化+失败静默不连坐，2026-10-21 Step 0）
         from app.models import SessionLocal as _SL
         s = _SL()
         try:
             t = s.query(CompileTask).filter(CompileTask.task_id == state.get("task_id")).first()
             if t:
-                t.log_output = state.get("log_output", "")
-                s.commit()
+                from app.services.task_writer import write_log_cache
+                write_log_cache(s, t, state.get("log_output", ""))
         finally:
             s.close()
     except Exception:
@@ -1167,28 +1171,14 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
 
 
 def _persist_and_return(db: Session, task: Optional[CompileTask], state: TaskState) -> dict:
-    """写回 DB 的字段对齐 CompileTask（spec 6.1: status 严格用 TaskStatus 枚举值）"""
+    """写回 DB 的字段对齐 CompileTask（spec 6.1: status 严格用 TaskStatus 枚举值）
+
+    2026-10-21 Step 0：落库逻辑收编至 task_writer.write_terminal（唯一终态写入口）——
+    字段分级（核心状态必须落/日志缓存可放弃）、净化、分块提交、哨兵+WS 告警全在那边。
+    """
     if task is not None:
-        try:
-            task.status = state.get("status", TaskStatus.FAILED.value)
-            task.log_output = state.get("log_output", "")
-            task.error_message = state.get("last_error", "")
-            # Skill 命中收口落库（2026-10-20）：agent 实际读过的 SKILL.md 名单，DB=权威
-            _ms = state.get("_matched_skills") or []
-            if _ms:
-                task.matched_skills = json.dumps(_ms, ensure_ascii=False)
-            artifacts = state.get("artifacts", [])
-            task.artifact_path = json.dumps(artifacts, ensure_ascii=False) if artifacts else (task.artifact_path or None)
-            now = datetime.utcnow()
-            if task.started_at is None:
-                task.started_at = now
-            task.completed_at = now
-            if task.started_at:
-                task.duration_seconds = int((task.completed_at - task.started_at).total_seconds())
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"[persist error] {e}")
+        from app.services.task_writer import write_terminal
+        write_terminal(db, task, dict(state))
 
     return {
         "status": state.get("status"),

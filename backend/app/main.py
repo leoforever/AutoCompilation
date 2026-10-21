@@ -155,6 +155,14 @@ async def lifespan(app: FastAPI):
                     logger.info(f"[sweep] 孤儿对账: {stats}")
             except Exception:
                 logger.exception("[sweep] 对账异常")
+            # 任务对账自愈（2026-10-21 Step 0）：入库断链滞留的 compiling，按磁盘现场恢复
+            try:
+                from app.services.task_reconciler import reconcile_stuck_tasks
+                rs = reconcile_stuck_tasks()
+                if any(k != "at" and v for k, v in rs.items()):
+                    logger.info(f"[reconcile] 任务对账: {rs}")
+            except Exception:
+                logger.exception("[reconcile] 任务对账异常")
             # 草稿 job 表 GC：done/error 超 1h 清掉（防长期不重启内存增长）
             try:
                 from app.services.skill_draft import _PREVIEW_JOBS
