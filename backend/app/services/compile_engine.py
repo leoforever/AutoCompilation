@@ -608,7 +608,13 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 源码已克隆到 {src_dir}。
 
 请执行完整的编译流程：先用 read_file 读 Skills 清单中匹配的 SKILL.md，再按攻略执行。
-完成后输出编译结果摘要（中文，包含"编译成功"或"编译失败"）。"""
+完成后输出编译结果摘要（中文，包含"编译成功"或"编译失败"）。
+
+【强制】现场记录 BUILD_NOTES.md：
+- 源码就绪后第一件事：read_file 读 /skills/generic/build-notes-standard/SKILL.md，按其模板 write_file 创建 /work/output/BUILD_NOTES.md 骨架（含环境探测结果）
+- 每过一个里程碑（依赖/configure/编译/install/打包/验证）重写补全对应节；每次踩坑换路实时记入"踩坑与修复"
+- 无论成功失败，收尾前确保该文件完整（失败时重点：死在哪步、试过什么路线）
+- 该文件与编译产物同等重要，缺失视为流程未完成（简单小包按其 10 行豁免规则写）"""
 
     try:
         # 阶段5 上限：避免 AI 死循环调 API（教训：9/30 932B3C 任务卡 stage5 26 分钟）
@@ -751,6 +757,39 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 
 
 # ==================== 阶段 6 ====================
+def _rescue_build_notes(state: TaskState, container, on_log=None) -> None:
+    """BUILD_NOTES 落定到任务目录固定路径（与 build.log 同级，供工单/经验流消费）。
+    成功任务：从 stage6 归档产物树拷；失败任务：容器将删，单独 get_archive 抢救。
+    任何异常静默（消费端容忍缺失）。"""
+    try:
+        task_dir = Path(state.get("work_dir", ""))
+        if not task_dir.is_dir():
+            return
+        dest = task_dir / "BUILD_NOTES.md"
+        # 成功路径：归档树里已有（output/BUILD_NOTES.md）
+        src = task_dir / "artifacts" / "output" / "BUILD_NOTES.md"
+        if src.is_file():
+            import shutil
+            shutil.copyfile(src, dest)
+            _log(state, "info", f"[阶段6] BUILD_NOTES 已落定: {dest} ({dest.stat().st_size}B)", on_log)
+            return
+        # 失败路径：容器还活着就单独拉一份
+        if container is not None:
+            chunks, _ = container.get_archive("/work/output/BUILD_NOTES.md")
+            with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
+                for ch in chunks:
+                    tmp.write(ch.encode("utf-8") if isinstance(ch, str) else ch)
+                tpath = tmp.name
+            with tarfile.open(tpath) as tar:
+                member = tar.extractfile(tar.getmember("BUILD_NOTES.md"))
+                if member:
+                    dest.write_bytes(member.read())
+                    _log(state, "info", f"[阶段6] BUILD_NOTES 已从容器抢救: {dest} ({dest.stat().st_size}B)", on_log)
+            os.unlink(tpath)
+    except Exception as e:
+        _log(state, "debug", f"[阶段6] BUILD_NOTES 落定跳过: {type(e).__name__}", on_log)
+
+
 def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
     cli = get_docker_client()
 
@@ -791,8 +830,19 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
                      f"[阶段6] 产物打包: {bundle_path} ({bundle_size // 1024} KB)", on_log)
             except Exception as e:
                 _log(state, "warn", f"[阶段6] 产物打包失败（下载时将实时打包）: {e}", on_log)
+            # BUILD_NOTES 落定固定路径（从归档树拷）
+            _rescue_build_notes(state, None, on_log)
         except Exception as e:
             _log(state, "warn", f"[阶段6] 产物归档失败: {e}", on_log)
+    else:
+        # 非 success（failed/cancelled）：容器马上被删，先抢救 BUILD_NOTES（工单流原料）
+        _fail_c = None
+        try:
+            if state.get("container_id"):
+                _fail_c = cli.containers.get(state["container_id"])
+        except Exception:
+            _fail_c = None
+        _rescue_build_notes(state, _fail_c, on_log)
 
     if state.get("container_id"):
         try:
@@ -1149,7 +1199,7 @@ def _persist_and_return(db: Session, task: Optional[CompileTask], state: TaskSta
 
 
 # ============== 报错工单 AI 总结（用于 /api/tickets/draft）==============
-def _summarize_log_for_ticket(software_name: str, task_status: str, log_tail: str) -> tuple:
+def _summarize_log_for_ticket(software_name: str, task_status: str, log_tail: str, build_notes: str = "") -> tuple:
     """
     调 LLM 总结 build.log 末尾，生成工单草稿。
     返回 (title, summary, description) 三元组；LLM 失败时降级到简单模板。
@@ -1174,16 +1224,22 @@ def _summarize_log_for_ticket(software_name: str, task_status: str, log_tail: st
             api_key=_ai_api_key(),
             base_url=_ai_base_url() or None,
             temperature=0.0,  # 总结任务要确定
-            max_tokens=600,
+            max_tokens=2048,  # 思考型模型 reasoning 吃预算，600 实测 content 空→静默回退模板（2026-10-21 同 2048 病根）
         )
         # 日志太长截断（保险）
         log_for_llm = log_tail[-6000:] if len(log_tail) > 6000 else log_tail
+        # BUILD_NOTES 优先：agent 现场记录（死在哪步/已排除路线）比原始日志尾部信息密度高
+        notes_block = (
+            f"以下是编译 agent 的现场记录 BUILD_NOTES.md（重点参考其踩坑与修复、步骤、已知限制节）：\n"
+            f"{build_notes[:6000]}\n\n"
+        ) if build_notes else ""
         prompt = (
-            f"你是编译平台的报错分析助手。根据以下 build.log 末尾内容，"
+            f"你是编译平台的报错分析助手。根据以下内容，"
             f"为用户生成工单草稿。\n\n"
             f"软件名：{software_name}\n"
             f"任务状态：{task_status}\n\n"
-            f"```\n{log_for_llm}\n```\n\n"
+            f"{notes_block}"
+            f"build.log 末尾：\n```\n{log_for_llm}\n```\n\n"
             f"请严格按以下 JSON 输出（不要任何多余文字）：\n"
             f'{{"title": "一句中文标题，不超过 30 字", '
             f'"summary": "2-4 句中文，定位失败原因/阶段/关键错误，控制在 150 字内", '

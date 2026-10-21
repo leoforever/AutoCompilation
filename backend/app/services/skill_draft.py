@@ -185,7 +185,17 @@ def _collect_ticket_evidence(db: Session, ticket: Ticket, task: CompileTask) -> 
     err_lines = [ln for ln in log_output.splitlines()
                  if re.search(r"error|Error|ERROR|failed|Failed|FAILED|fatal|Traceback|No such|not found|undefined", ln)][:30]
 
-    return {"trajectory": trajectory, "patches": patches, "error_lines": "\n".join(err_lines)}
+    # 4) agent 编译现场记录（stage6 落定，与 build.log 同级）——命令实录/踩坑/差异对照，最高密度素材
+    build_notes = ""
+    try:
+        np = _artifacts_dir() / task.task_id / "BUILD_NOTES.md"
+        if np.is_file():
+            build_notes = np.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    return {"trajectory": trajectory, "patches": patches, "error_lines": "\n".join(err_lines),
+            "build_notes": build_notes}
 
 
 def _extract_resolution_trajectory(db: Session, ticket_id: int) -> str:
@@ -244,6 +254,11 @@ _TICKET_USER_PROMPT = """你是龙芯 LoongArch 编译平台的攻略整理助�
 ## 失败症状（原日志的报错特征行，写"踩坑点"时引用原文用）
 ```
 {error_lines}
+```
+
+## 编译现场记录 BUILD_NOTES（agent 实操实录：实际命令/踩坑修复/与攻略差异——优先级最高的素材，与轨迹互证）
+```
+{build_notes}
 ```
 
 ## 成功解决轨迹（核心素材！按时间序，含实际执行过的每条命令和输出）
@@ -307,6 +322,7 @@ def _llm_generate_ticket_draft(db: Session, ticket: Ticket, task: CompileTask, s
         system=system_name,
         git_info=git_info,
         error_lines=ev["error_lines"] or "(无报错特征行)",
+        build_notes=(ev.get("build_notes") or "(无现场记录)")[:8000],
         trajectory=trajectory,
         patches=patches_txt,
         resolution=ticket.resolution or "(无)",

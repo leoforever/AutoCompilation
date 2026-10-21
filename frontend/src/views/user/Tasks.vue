@@ -416,7 +416,7 @@ const pendingMsg = ref<any>(null)
 function showPendingMsg(taskId: number) {
     hidePendingMsg()
     pendingMsg.value = ElMessage({
-        message: `正在为任务 #${taskId} 生成 AI 经验草稿（5~30 秒，请稍候）…`,
+        message: `正在为任务 #${taskId} 生成 AI 经验草稿（约 1~4 分钟，请稍候）…`,
         type: 'info',
         duration: 0,
         showClose: false,
@@ -453,7 +453,8 @@ async function onGenerateDraft(task: any) {
   showPendingMsg(task.id)
   try {
     const dbId = await fetchTaskDbId(task.task_id)
-    const r: any = await api.post('/experience/generate-draft', { task_id: dbId })
+    // 草稿生成 LLM 要 1-4 分钟，默认 30s 超时不够 → 5 分钟
+    const r: any = await api.post('/experience/generate-draft', { task_id: dbId }, { timeout: 300000 })
     const data = r?.data ?? r
     draftForm.skill_name = data?.skill_name || ''
     draftForm.skill_type = (data?.skill_type === 'generic' || data?.skill_type === 'specific') ? data.skill_type : 'specific'

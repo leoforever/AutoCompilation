@@ -108,11 +108,20 @@ async def draft_ticket_from_task(
         }, message="无日志，已返回空草稿")
 
     # 调 LLM（复用 compile_engine 已配的 MiniMax key）
+    # agent 现场记录（stage6 落定，与 build.log 同级）；缺失传空串回退旧行为
+    notes_path = _artifacts_dir() / task.task_id / "BUILD_NOTES.md"
+    build_notes = ""
+    try:
+        if notes_path.is_file():
+            build_notes = notes_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     from app.services.compile_engine import _summarize_log_for_ticket
     title, summary, description = _summarize_log_for_ticket(
         software_name=task.software_name,
         task_status=task.status or "failed",
         log_tail=log_text,
+        build_notes=build_notes,
     )
 
     return ApiResponse(data={

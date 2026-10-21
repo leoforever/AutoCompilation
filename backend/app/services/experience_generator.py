@@ -46,7 +46,11 @@ logger = logging.getLogger(__name__)
 _LOG_TRUNCATE_CHARS = 12000
 
 # 单次 LLM 输出上限
-_MAX_TOKENS = 2048
+# 思考型模型（qwen3.8-flash 等）reasoning 计入 max_completion_tokens 预算：
+# 2048 实测 finish=length、content=0（写长文档必空）→ 默认给足（2026-10-21 复现实验：
+# 同 prompt 2048→content_len=0 / 8192→14102）。skill_draft 早已显式 8192，这里补齐默认值。
+# 2026-10-21 用户拍板 8192*8=65536：长攻略+大思考量场景留足头寸（API 实测接受 65536）。
+_MAX_TOKENS = 65536
 
 
 # ==================== Prompt ====================
@@ -124,6 +128,57 @@ description 不写"怎么修"或"怎么用"——那是正文干的活。
 """
 
 
+def _sample_log_material(log: str, budget: int = _LOG_TRUNCATE_CHARS) -> str:
+    """长日志智能采样（替代纯尾截断）。
+
+    教训（2026-10-21 用户报）：尾部截断把前段的"主编译命令"掐掉了，LLM 只能产出
+    "主编译命令不可见"的半截攻略。采样三段保序：
+      ① 工具调用行（▶[执行命令]/[写入文件] 等——实际命令实录，全留）
+      ② 错误特征行（error/failed/❌/Traceback）
+      ③ 尾部 1/3 预算（结果汇总/产物清单）
+    """
+    if not log:
+        return ""
+    if len(log) <= budget:
+        return log
+    import re as _re
+    cmd_re = _re.compile(r"▶\[[0-9a-f]{4}\]|\[(执行命令|写入文件|读取文件|查看目录|启动子任务)\]")
+    err_re = _re.compile(r"error|failed|fatal|traceback|❌", _re.IGNORECASE)
+    lines = log.splitlines()
+    tail_budget = max(budget // 3, 500)
+    # ③ 尾段
+    tail: list[str] = []
+    acc = 0
+    for ln in reversed(lines):
+        remaining = tail_budget - acc
+        if remaining <= 0:
+            break
+        if len(ln) + 1 > remaining:
+            # 超长行按剩余预算切，防尾段单行爆预算（ad-hoc 边界用例逮到的）
+            tail.insert(0, ln[:max(remaining - 10, 50)] + " …[截]")
+            acc = tail_budget
+            break
+        tail.insert(0, ln)
+        acc += len(ln) + 1
+    tail_start_idx = len(lines) - len(tail)
+    head_budget = budget - acc - 200
+    # ①② 前中段按行序采样（跳过已进尾段的行）
+    picked: list[str] = []
+    used = 0
+    for ln in lines[:tail_start_idx]:
+        if cmd_re.search(ln) or err_re.search(ln):
+            cut = ln if len(ln) <= 300 else ln[:300] + " …[截]"
+            if used + len(cut) + 1 > head_budget:
+                picked.append("...[前中段超预算，后续执行行从略]...")
+                break
+            picked.append(cut)
+            used += len(cut) + 1
+    out = "\n".join(picked)
+    out += "\n...[中段省略，以下为尾部]...\n" if tail_start_idx else ""
+    out += "\n".join(tail)
+    return out
+
+
 def _build_user_prompt(
     software_name: str,
     system_name: str,
@@ -133,10 +188,10 @@ def _build_user_prompt(
     matched_skills: str,
     error_message: str,
     log_output: str,
+    build_notes: str = "",
 ) -> str:
-    log_truncated = (log_output or "")[-_LOG_TRUNCATE_CHARS:]
-    if log_output and len(log_output) > _LOG_TRUNCATE_CHARS:
-        log_truncated = "...[日志前段已截断]...\n" + log_truncated
+    # 智能采样（执行行+错误行+尾段），不再纯尾截断丢主编译命令
+    log_truncated = _sample_log_material(log_output or "")
 
     return f"""# 任务元信息
 - 软件：{software_name}
@@ -145,6 +200,11 @@ def _build_user_prompt(
 - 最终状态：{status}
 - 命中的 Skill：{matched_skills or "(无)"}
 - 错误摘要：{error_message or "(无)"}
+
+# 编译现场记录 BUILD_NOTES（agent 实操实录：命令/踩坑/与攻略差异——优先级最高的素材）
+```
+{(build_notes or "(无现场记录)")[:8000]}
+```
 
 # 完整日志（可能已截断尾部）
 ```
@@ -317,6 +377,16 @@ def generate_draft(db: "Session", task_id: int) -> dict:
     except Exception:
         pass
 
+    # agent 现场记录（stage6 落定于任务目录；缺失回退旧行为）
+    build_notes = ""
+    try:
+        from app.services.compile_engine import _artifacts_dir
+        np = _artifacts_dir() / task.task_id / "BUILD_NOTES.md"
+        if np.is_file():
+            build_notes = np.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     user_prompt = _build_user_prompt(
         software_name=task.software_name,
         system_name=system_name,
@@ -326,6 +396,7 @@ def generate_draft(db: "Session", task_id: int) -> dict:
         matched_skills=matched_skills,
         error_message=task.error_message or "",
         log_output=task.log_output or "",
+        build_notes=build_notes,
     )
 
     # 调 LLM（重试 1 次）
