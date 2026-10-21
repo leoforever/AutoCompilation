@@ -96,7 +96,25 @@ async def lifespan(app: FastAPI):
                         "task_id": task_id, "ts": __import__("time").time(),
                     })
                     on_log = _publish_log(worker_id, task_id)
-                    result = run_task(task_id, on_log=on_log)
+                    # 心跳线程（2026-10-20 修复）：task_queue.heartbeat() 此前是死代码（从未被调用），
+                    # updated_at 只靠日志行到达才前进 → torch submodule/pip 等 30min+ 静默长命令期间
+                    # DB 时钟冻结 → dequeue 看门狗误判"worker 崩溃"直接标 failed 杀任务
+                    # （T-20261020183119-20EF38 实证：stage5 明明活着，1867s 时被看门狗处死）。
+                    # 线程活着 = 任务活着；线程死（进程崩/线程炸）→ 心跳停 → 30min 后看门狗回收，语义回归正确
+                    _hb_stop = threading.Event()
+                    def _hb_loop(_tid=task_id, _stop=_hb_stop):
+                        while not _stop.wait(60):
+                            try:
+                                task_queue.heartbeat(_tid)
+                            except Exception:
+                                pass  # 单次心跳失败不影响（下次再来）
+                    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+                    _hb_thread.start()
+                    try:
+                        result = run_task(task_id, on_log=on_log)
+                    finally:
+                        _hb_stop.set()
+                        _hb_thread.join(timeout=5)
                     BROADCASTER.publish(task_id, {
                         "type": "status", "status": result.get("status"),
                         "task_id": task_id, "ts": __import__("time").time(),

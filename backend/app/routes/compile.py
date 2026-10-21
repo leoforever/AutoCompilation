@@ -147,7 +147,9 @@ async def upload_and_submit(
     settings = get_settings()
     artifact_dir = Path(os.environ.get("ARTIFACTS_DIR") or settings.artifact_dir)
     if not artifact_dir.is_absolute():
-        artifact_dir = Path("/root/.openclaw/workspace/compile-platform/backend").parent / artifact_dir
+        # 相对路径按仓库根解析（routes/compile.py → parents[2]=backend → parents[3]=仓库根），
+        # 与 compile_engine._artifacts_dir() 同款，换部署目录不失效（教训：旧版写死绝对路径）
+        artifact_dir = Path(__file__).resolve().parents[3] / artifact_dir
     sources_dir = artifact_dir / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
 

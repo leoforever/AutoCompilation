@@ -102,10 +102,6 @@
                 <span v-if="isMatched(skill)" style="margin-left: 4px;">✓</span>
               </el-tag>
             </div>
-            <div v-if="unmatchedSpecifics.length" style="margin-top: 8px; color: #e6a23c; font-size: 12px;">
-              ⚠ 专用 Skill 加载了但未命中：<b>{{ unmatchedSpecifics.map(s => s.name).join(', ') }}</b>
-              <span style="color: #909399;">（DeepAgent 本次没引用这些专用攻略）</span>
-            </div>
           </div>
         </div>
 
@@ -435,10 +431,6 @@ const genericSkills = computed(() => matchedSkills.value.filter(s => s.type === 
 const specificSkills = computed(() => matchedSkills.value.filter(s => s.type === 'specific'))
 const availableGenericCount = computed(() => availableSkills.value.filter(s => s.type === 'generic').length)
 const availableSpecificCount = computed(() => availableSkills.value.filter(s => s.type === 'specific').length)
-// 未命中的专用 skill（用户能看到 DeepAgent 没优先用它们）
-const unmatchedSpecifics = computed(() =>
-  availableSkills.value.filter(s => s.type === 'specific' && !matchedSkills.value.some(m => m.name === s.name))
-)
 // 判断某个 available skill 是否被 log 命中
 function isMatched(skill: { name: string }): boolean {
   return matchedSkills.value.some(m => m.name === skill.name)

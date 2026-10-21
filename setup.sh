@@ -285,19 +285,52 @@ do_install() {
     do_init
 }
 
-# ========== 初始化（建表 + 默认账号） ==========
+# ========== 后端解释器探测（init 用；需 sqlalchemy+bcrypt） ==========
+# PATH 的 python3 可能没装依赖（本机 3.13 无 sqlalchemy/bcrypt，3.11 有），逐个试取第一个可用的
+detect_init_pybin() {
+    local cand
+    for cand in python3 /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sqlalchemy, bcrypt' >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo python3
+}
+
+# ========== 初始化（建表 + 幂等迁移 + 默认账号） ==========
 do_init() {
     [ -f "$ENV_FILE" ] || error "缺少 $ENV_FILE，worker/数据库配置会缺"
     cd "$BACKEND_DIR"
     set -a; source "$ENV_FILE"; set +a
 
-    python3 <<'PY'
-from app.models import Base, engine, User
+    # 密码策略（T2）：ADMIN_INIT_PASSWORD 环境变量显式传入；
+    # 未设时交互式终端 read -s 输入；非交互 fail-fast（拒绝弱默认密码建库）
+    local admin_user="${ADMIN_INIT_USERNAME:-admin}"
+    if [ -z "${ADMIN_INIT_PASSWORD:-}" ]; then
+        if [ -t 0 ]; then
+            local pw1 pw2
+            read -sp "设置管理员($admin_user)密码: " pw1; echo
+            read -sp "确认密码: " pw2; echo
+            [ ${#pw1} -ge 8 ] || error "密码至少 8 位"
+            [ "$pw1" = "$pw2" ] || error "两次输入不一致"
+            ADMIN_INIT_PASSWORD="$pw1"
+        else
+            error "必须显式传入管理员密码：ADMIN_INIT_PASSWORD='<密码>' bash setup.sh init"
+        fi
+    fi
+    export ADMIN_INIT_PASSWORD ADMIN_INIT_USERNAME
+
+    # T1：走 models.init_db() —— create_all + _safe_add/drop_column 幂等迁移 + 种子，
+    # 与 lifespan(main.py) 同一函数；pg_dump 恢复的旧库也能对齐到最新表结构
+    "$(detect_init_pybin)" <<'PY'
+import os
+from app.models import init_db, engine
 from sqlalchemy import text
 import bcrypt
 
-Base.metadata.create_all(bind=engine)
-print('  ✅ 表创建完成')
+init_db()
+print('  ✅ 建表 + 幂等迁移 + 种子完成（init_db 全链路）')
 
 with engine.connect() as conn:
     r = conn.execute(text("SELECT tablename FROM pg_tables WHERE schemaname='public';"))
@@ -307,14 +340,15 @@ with engine.connect() as conn:
     r = conn.execute(text("SELECT COUNT(*) FROM users;"))
     count = r.scalar()
     if count == 0:
-        password_hash = bcrypt.hashpw(b'admin123', bcrypt.gensalt(rounds=12)).decode()
+        admin = os.environ["ADMIN_INIT_USERNAME"]
+        password_hash = bcrypt.hashpw(os.environ["ADMIN_INIT_PASSWORD"].encode(), bcrypt.gensalt(rounds=12)).decode()
         conn.execute(
             text("INSERT INTO users (username, password_hash, role, is_active) "
                  "VALUES (:u, :p, :r, :a)"),
-            {'u': 'admin', 'p': password_hash, 'r': 'admin', 'a': True}
+            {'u': admin, 'p': password_hash, 'r': 'admin', 'a': True}
         )
         conn.commit()
-        print('  ✅ 默认管理员账号已创建 (admin / admin123)')
+        print(f'  ✅ 默认管理员账号已创建 ({admin})，密码取自环境变量 ADMIN_INIT_PASSWORD')
     else:
         print('  ⏭  管理员账号已存在，跳过')
 PY
@@ -408,8 +442,164 @@ do_start() {
     fi
     info "  前端: http://$main_ip:$FRONTEND_PORT/"
     info "  API:  http://$main_ip:$BACKEND_PORT/docs"
-    info "  默认账号: admin / admin123"
+    info "  默认账号: admin（密码为 init 时 ADMIN_INIT_PASSWORD 传入值，勿用默认弱口令）"
     info "  提示：其他网卡 IP 可手动拼接 http://<ip>:$FRONTEND_PORT/"
+}
+
+# ========== 卸载（数据级重置，清数据留骨架） ==========
+# 语义：跑完 uninstall 再 bash setup.sh install = 全新部署。
+# 分级：
+#   uninstall          默认档：停服务+清平台容器+DROP DB+删 artifacts/logs/cache（备份先行；保留 镜像/skills/配置）
+#   uninstall --purge  追加：自制镜像、skills/、.env.compile、config.yaml、dist、node_modules、PG 账号
+#   uninstall --yes    跳过总确认（--purge 的镜像删除仍单独二次确认）
+# 影子测试：DB_NAME=<库> + ART_DIR/LOG_DIR/CACHE_DIR 覆盖，勿在生产跑
+do_uninstall() {
+    local purge=0 assume_yes=0
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --purge) purge=1 ;;
+            --yes|-y) assume_yes=1 ;;
+            *) warn "忽略未知参数: $a" ;;
+        esac
+    done
+
+    # DB 参数（config.yaml 为权威；影子测试可用 DB_NAME 覆盖）
+    local db_host db_port db_user db_name db_pass
+    db_host=$(awk '/postgresql:/{f=1;next} f&&/host:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_port=$(awk '/postgresql:/{f=1;next} f&&/port:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_user=$(awk '/postgresql:/{f=1;next} f&&/username:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_name=$(awk '/postgresql:/{f=1;next} f&&/database:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_pass=$(awk '/postgresql:/{f=1;next} f&&/password:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_host="${db_host:-localhost}"; db_port="${db_port:-5432}"
+    db_user="${db_user:-compile_user}"; db_name="${DB_NAME:-${db_name:-compile_platform}}"
+    db_pass="${DB_PASS:-${db_pass:-compile123}}"
+    # 统一走 -h（TCP）+ 密码：pg_hba 把 local 也设成了 md5，sudo -u postgres 裸 socket 会 fe_sendauth
+    local PSQLU="psql -h $db_host -p $db_port -U $db_user"
+    export PGPASSWORD="***"
+
+    # 路径（UNINSTALL_* 前缀覆盖，影子测试指向 /tmp 假目录；
+    # 注意不能用 LOG_DIR 裸名——setup.sh 顶部无条件赋值会覆盖外部 env，撞车教训）
+    local skills_dir="${SKILLS_DIR:-$PROJECT_DIR/skills}"
+    local dist_dir="$FRONTEND_DIR/dist"
+    local nm_dir="$FRONTEND_DIR/node_modules"
+    local art_dir="${UNINSTALL_ART_DIR:-$PROJECT_DIR/artifacts}"
+    local log_dir="${UNINSTALL_LOG_DIR:-$PROJECT_DIR/logs}"
+    local cache_dir="${UNINSTALL_CACHE_DIR:-$PROJECT_DIR/cache}"
+
+    info "===== uninstall${purge:+（--purge 全清档）} 目标 ====="
+    echo "  数据库: $db_name@$db_host:$db_port（pg_dump 备份后 DROP）"
+    echo "  容器: 平台 task_id label 容器 + 本项目镜像派生容器（仅 Exited 逐个确认）"
+    echo "  目录: $art_dir、$log_dir、$cache_dir"
+    if [ "$purge" = "1" ]; then
+        echo "  --purge 追加: 自制镜像、skills/、.env.compile、config.yaml、dist、node_modules、PG 账号 $db_user"
+    else
+        echo "  保留: docker 镜像（自制重建代价高）、skills/、.env.compile、config.yaml、源码/git"
+    fi
+    if [ -d "$art_dir" ]; then
+        echo "  磁盘占用: $(du -sh "$art_dir" 2>/dev/null | cut -f1) (artifacts)"
+    fi
+
+    if [ "$assume_yes" != "1" ]; then
+        if [ ! -t 0 ]; then
+            error "非交互终端拒绝执行卸载；确认请加 --yes（如: bash setup.sh uninstall --yes）"
+        fi
+        printf "确认执行以上删除？输入 yes 继续: "
+        local ans; read -r ans
+        [ "$ans" = "yes" ] || { info "已取消"; return 0; }
+    fi
+
+    # 1) 停服务（SKIP_STOP=1 跳过：影子测试用，避免误停生产服务）
+    if [ "${SKIP_STOP:-0}" = "1" ]; then
+        info "[1/6] SKIP_STOP=1，不停服务"
+    else
+        info "[1/6] 停止前后端 + 清理 legacy worker..."
+        do_stop
+    fi
+
+    # 2) 备份（先于一切删除；--purge 同样强制）
+    local backup_dir="$HOME/compile-platform-backup-$(date +%Y%m%d-%H%M%S)"
+    info "[2/6] 备份 → $backup_dir"
+    mkdir -p "$backup_dir"
+    if command -v pg_dump >/dev/null 2>&1; then
+        if pg_dump -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" > "$backup_dir/db.sql" 2>/dev/null && [ -s "$backup_dir/db.sql" ]; then
+            info "  ✅ db 备份 $(du -sh "$backup_dir/db.sql" | cut -f1)"
+        else
+            rm -f "$backup_dir/db.sql"
+            warn "  pg_dump 失败（库可能不存在）——跳过"
+        fi
+    else
+        warn "  无 pg_dump，跳过 DB 备份"
+    fi
+    if [ -d "$skills_dir" ]; then
+        tar czf "$backup_dir/skills.tar.gz" -C "$PROJECT_DIR" skills && info "  ✅ skills/ 已 tar（skills/ 不在 git，唯一副本）"
+    fi
+
+    # 3) docker 容器（镜像默认不动）
+    if command -v docker >/dev/null 2>&1; then
+        info "[3/6] 清理平台容器..."
+        # label 口径（引擎 stage3 建容器统一带）；grep -v 防无匹配时把整仓库容器全清
+        local ids
+        ids=$(docker ps -aq --filter 'label=task_id' --filter 'label=phase=infrastructure' 2>/dev/null | grep -v '^$' || true)
+        ids=$(echo "$ids" $(docker ps -aq --filter 'label=ticket_id' 2>/dev/null || true) | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+        if [ -n "$ids" ]; then
+            echo "$ids" | xargs -r docker rm -f >/dev/null && info "  ✅ 删除 label 容器 $(echo "$ids" | wc -l) 个"
+        else
+            info "  无 label 容器"
+        fi
+        if [ "$purge" = "1" ]; then
+            if [ ! -t 0 ]; then
+                error "--purge 删自制镜像必须交互式二次确认（加 --yes 也不行）"
+            fi
+            warn "即将删除自制镜像（重建需重新构建/重新 save-load）："
+            docker images --format '  {{.Repository}}:{{.Tag}}  {{.Size}}' | grep -E 'loongnix-build|openeuler.*SP4' || true
+            printf "输入 yes 确认删镜像: "; local ans2; read -r ans2
+            if [ "$ans2" = "yes" ]; then
+                docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'loongnix-build|openeuler.*SP4' | xargs -r docker rmi -f >/dev/null && info "  ✅ 镜像已删"
+            else
+                warn "  跳过镜像删除"
+            fi
+        fi
+    else
+        info "[3/6] 无 docker，跳过容器清理"
+    fi
+
+    # 4) 数据库
+    info "[4/6] DROP DATABASE $db_name..."
+    if $PSQLU -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1; then
+        info "  ✅ 已 DROP（重装由 install/init 重建）"
+    else
+        warn "  DROP 失败（PG 未运行/库本不存在）——检查 $backup_dir/db.sql 是否在"
+    fi
+
+    # 5) 运行数据目录（守门：仓库根直属子目录 或 /tmp 影子目录，其余拒绝）
+    info "[5/6] 删运行数据目录..."
+    rm_safe() {
+        local target
+        for target in "$@"; do
+            [ -n "$target" ] || { error "拒绝删除空路径"; }
+            if [[ ( "$target" == "$PROJECT_DIR"/* && "${target#$PROJECT_DIR/}" != */* && -n "${target#$PROJECT_DIR/}" ) || "$target" == /tmp/* ]]; then
+                rm -rf "$target" && info "  ✅ 删除 $target"
+            else
+                error "路径越界，拒绝删除: $target"
+            fi
+        done
+    }
+    rm_safe "$art_dir" "$log_dir" "$cache_dir"
+    # 6) --purge 追加
+    if [ "$purge" = "1" ]; then
+        info "[6/6] --purge 清理..."
+        rm_safe "$skills_dir"
+        rm -f "$ENV_FILE" "$CONFIG_FILE" && info "  ✅ 删 .env.compile / config.yaml"
+        rm -rf "$dist_dir" "$nm_dir" && info "  ✅ 删 dist / node_modules"
+        # 删 PG 账号仍需超管（compile_user 无此权限）；本机 pg_hba local=md5 时需带 postgres 密码
+        sudo -u postgres psql -c "DROP OWNED BY \"$db_user\"; DROP USER IF EXISTS \"$db_user\";" >/dev/null 2>&1 && info "  ✅ 删 PG 账号 $db_user" || warn "  删 PG 账号失败（可 sudo -u postgres psql 手动 DROP USER）"
+    else
+        info "[6/6] 非 --purge，无追加清理"
+    fi
+
+    info "uninstall 完成。备份在 $backup_dir（含 db.sql / skills.tar.gz）"
+    info "从头部署：bash setup.sh install"
 }
 
 # ========== 清理孤儿编译 worker（worker.py 独立进程，已废弃架构） ==========
@@ -492,10 +682,11 @@ case "${1:-start}" in
     stop)    do_stop ;;
     restart) do_restart "$2" ;;  # 透传模式参数；不传 = 保持 COMPILE_MODE
     status)  do_status ;;
+    uninstall) do_uninstall "${@:2}" ;;   # 可选 --purge / --yes
     dev)     do_start dev ;;     # 显式 dev：uvicorn --reload
     prod)    do_start prod ;;    # 显式 prod：无 --reload
     *)
-        echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|dev|prod}"
+        echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|uninstall [--purge] [--yes]|dev|prod}"
         echo
         echo "  start         生产模式启动（默认；无 --reload）"
         echo "  start dev     开发模式启动（uvicorn --reload，改 .py 自动重启）"
@@ -503,6 +694,8 @@ case "${1:-start}" in
         echo "  restart       重启（保持当前模式，可用 restart dev/prod 切换）"
         echo "  restart dev   切到开发模式重启"
         echo "  restart prod  切到生产模式重启"
+        echo "  uninstall     数据级重置（清容器/DB/artifacts，先备份；镜像/skills 保留）"
+        echo "  uninstall --purge  连自制镜像/skills/配置全清；--yes 跳过总确认（镜像仍单独确认）"
         exit 1
         ;;
 esac
