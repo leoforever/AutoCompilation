@@ -34,6 +34,23 @@ ln -sf /usr/local/bin/npx /usr/bin/npx
 - 很多 npm 包含 native binding（如 sqlite3、bcrypt）
 - 用 prebuilt 时认准 loong64 标签；没 prebuilt 需本地 node-gyp 重编
 
+## 原生模块 / PTY·交互类库的验证（必读）
+验证必须**非交互、能自然退出**，否则任务挂死：
+- ❌ 反例（实证事故 2026-10-22 T-20261022110307-65072C，node-pty）：
+  `node -e "pty.spawn('/bin/bash')"` 裸跑——shell 等输入永不退出，整任务挂 2.5 小时被硬闸强退，产物没归档。
+- ✅ 正确姿势（两段式，带 timeout 保险）：
+  ```bash
+  timeout 30 node -e "
+  const pty = require('node-pty');
+  const p = pty.spawn('/bin/bash', ['-c', 'echo pty-ok'], {name:'xterm', cols:80, rows:24});
+  let out=''; p.onData(d=>{out+=d; if(out.includes('pty-ok')){console.log('PTY_OK'); p.kill(); process.exit(0);}});
+  setTimeout(()=>{console.log('PTY_TIMEOUT'); process.exit(1);}, 10000);
+  "
+  ```
+  要点：起进程→onData 断言预期输出→kill；自身带 10s 兜底 + 外层 timeout 30。
+- 一般原生模块验收 = 加载断言即可：`timeout 30 node -e "const m=require('模块'); console.log(Object.keys(m))"`。
+- 前台服务器类（express listen 等）同理：后台起 → curl 断言 → kill。
+
 ## 注意事项
 - Electron / node-gyp 项目需要 C++ 工具链（见 toolchain-paths）
 - yarn / pnpm 同样走 npmmirror

@@ -1,245 +1,98 @@
 # 龙芯 LoongArch 智能编译平台 · 项目契约
 
-> **唯一事实源**：本文件 + 根目录设计文档 `龙芯LoongArch智能编译平台设计文档.docx` + UI原型 `compile-platform-mockup.html`
-> **禁止**：Hermes 不得自行新增业务逻辑、字段、状态值。所有需求以两份文档为准。
+> **本文件性质**：对 AI 助手（Hermes）的工程约束——目录结构、技术栈、编码纪律、状态机、红线。
+> **实现现状以代码 + README + docs/api.md 为准**；历史设计文档（.docx / mockup.html）不在本仓库，不再作为"唯一事实源"引用（2026-10-22 修订：契约与实现对齐，删除已失效的附件依赖）。
+> **禁止**：Hermes 不得自行新增业务逻辑、字段、状态值——要加先提案、用户拍板。
 
 ---
 
 ## 一、项目简介
 
-面向龙芯 LoongArch 架构的软件编译场景，打造**云端公共编译服务 + 本地私有化客户端编译**双模式智能编译平台。
+面向龙芯 LoongArch 架构的软件源码编译平台：**云端容器编译 + DeepAgents 执行 + 工单人工兜底 + 经验闭环**（BUILD_NOTES 现场记录 → 攻略草稿 → 审批 → Skill 库 → 下次编译命中）。
 
-**核心闭环**：用户编译 → 问题反馈 → 人工优化 → 经验沉淀 → 全员复用
+核心闭环：用户编译 → 问题反馈 → 人工/Agent 处理 → 经验沉淀 → 复用加速。
 
-**双模式**：
-- **云端公共编译**：开源软件、无保密需求，源码上传云端，容器隔离执行
-- **本地私有编译**：涉密代码，编译全程离线，仅选择性上报脱敏日志
-
-**Skill 经验体系**：SKILL.md 标准格式，通用 Skill（跨系统）+ 专用 Skill（特定软件×系统），审核入库后被编译 agent 直接读取。
+> 原"本地私有化客户端"双模式为远期规划：`client/` 仅骨架，当前实现为纯云端容器模式。涉密场景暂不支持，安全条款见第九节现状版。
 
 ---
 
-## 二、固定目录结构
+## 二、目录结构（与代码同步，禁止随意增删顶层目录）
 
 ```
 compile-platform/
-├── project-spec.md          # 本文件，每次任务必读
-├── docs/                    # 接口文档、开发笔记
-├── backend/                 # FastAPI 后端（禁止移到其他目录）
+├── project-spec.md          # 本文件，改本项目代码前必读
+├── README.md                # 部署/使用入口
+├── setup.sh                 # install/init/start/stop/restart/status/uninstall
+├── docs/                    # API、教程、变更记录（注：docs/ 不入 git，磁盘为准）
+├── backend/                 # FastAPI 后端（禁止移动）
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py          # FastAPI 入口
-│   │   ├── config.py        # 配置加载
-│   │   ├── models.py        # SQLAlchemy ORM 模型（DDL 仅生成，不自动执行）
-│   │   ├── schemas.py       # Pydantic v2 请求/响应模型
-│   │   ├── dependencies.py  # 依赖注入（auth、权限）
-│   │   ├── routes/          # API 路由（按模块拆分）
-│   │   │   ├── compile.py   # 编译任务接口
-│   │   │   ├── tickets.py   # 工单接口
-│   │   │   ├── experience.py # 经验/ Skill 接口
-│   │   │   ├── admin.py     # 管理员接口
-│   │   │   └── ws.py        # WebSocket 实时日志
-│   │   └── services/        # 业务逻辑层
-│   │       ├── compile_engine.py  # 编译引擎（容器/本地）
-│   │       ├── skill_matcher.py   # AI Skill 匹配
-│   │       ├── ticket_service.py  # 工单服务
-│   │       └── experience_service.py # 经验服务
-│   ├── requirements.txt
-│   └── alembic/             # 数据库迁移（可选）
-├── frontend/                # Vue3 + Vite + ElementPlus（禁止移到其他目录）
-│   ├── index.html
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── src/
-│   │   ├── main.ts
-│   │   ├── App.vue
-│   │   ├── router/          # 路由配置
-│   │   ├── views/           # 页面组件（按角色分目录）
-│   │   │   ├── user/        # 用户前台（5页）
-│   │   │   └── admin/       # 管理员后台（7页）
-│   │   ├── components/      # 公共组件
-│   │   │   ├── LogViewer.vue       # 长日志虚拟滚动 + WebSocket
-│   │   │   ├── SkillPreview.vue    # SKILL.md 预览
-│   │   │   ├── ChatBox.vue         # 工单对话气泡
-│   │   │   └── StatusTag.vue       # 状态标签
-│   │   ├── stores/          # Pinia 状态管理
-│   │   └── utils/           # 工具函数（axios封装等）
-│   └── public/
-├── client/                  # 本地 Python 客户端（LoongArch）
-│   ├── compile_client.py
-│   ├── skill_sync.py
-│   └── requirements.txt
-├── skills/                  # Skill 定义（审批流入库，禁止 AI 直改）
-│   └── README.md            # Skill 库说明
-└── .hermes/
-    └── skills/              # Hermes 自定义技能（本项目专用）
-        ├── vue3-elementplus-dev/
-        ├── fastapi-dev/
-        ├── loongarch-build-openclaw/  # ⚠️ 只读，禁止AI修改
-        └── doc-sync-gen/
+│   │   ├── main.py          # 入口 + lifespan（worker 线程池、心跳、sweep 对账挂点）
+│   │   ├── config.py        # 配置加载（.env.compile > 默认值）
+│   │   ├── models.py        # ORM（PostgreSQL；新列经 init_db 的 _safe_add_column 幂等迁移）
+│   │   ├── schemas.py       # Pydantic v2（Optional 一律 = None；上限对齐列宽）
+│   │   ├── dependencies.py  # JWT 鉴权、DB 会话
+│   │   ├── routes/          # auth / compile / tickets / experience / admin / ws
+│   │   └── services/        # compile_engine（6 阶段引擎）· docker_backend · ticket_agent
+│   │                        #   task_queue · task_writer（唯一终态写入口）· task_reconciler（对账自愈）
+│   │                        #   skill_loader · skill_draft · experience_generator · ws_broadcaster · sample_data
+│   ├── config.yaml          # 数据库连接
+│   ├── .env.compile         # AI key/镜像/超时（不入 git）；.example 模板入 git
+│   └── tests/               # pytest 套件
+├── frontend/                # Vue3 + Vite + Element Plus + Pinia（禁止移动）
+│   └── src/views/           # user 5 页（Workbench/Tasks/Tickets/Contributions/Download）
+│                            # admin 7 页（Dashboard/TicketsAdmin/Review/SkillLib/Users/Systems/ChatAdmin）
+├── client/                  # 本地客户端骨架（远期，勿扩功能）
+└── skills/                  # SKILL.md 经验库：git 跟踪；仅经审批流/API 写入，禁止 AI 直改文件
 ```
 
 **强制约束**：
-- 所有代码必须在此目录结构内，**禁止新建其他目录**存放代码
-- 前端代码不得进入 `backend/`，后端代码不得进入 `frontend/`
-- `skills/` 目录为 Skill 经验库，仅用于存放和读取，**禁止 AI 自动写入**
+- 前后端代码不得互串目录；新模块放对应 services/ 或 routes/ 下
+- `skills/` 的产生路径唯一：Experience 审批流 approve（写表+落盘）或 admin Skill API——绕过审批的直改一律禁止
+- 终态落库唯一入口 `services/task_writer.write_terminal`——禁止新开 `task.status = ...` 直写点
 
----
+## 三、技术栈（当前实际）
 
-## 三、技术栈硬性约束
-
-| 层级 | 技术 | 版本/约束 |
-|------|------|----------|
-| 后端框架 | FastAPI | 最新稳定版 |
-| 数据验证 | Pydantic v2 | `model_config = ConfigDict(...)` 语法 |
-| ORM | SQLAlchemy 2.0 | 异步/同步均可，统一使用 `sessionmaker` |
-| 数据库 | PostgreSQL | 开发阶段可用 SQLite，生产用 PG |
-| 缓存/队列 | Redis | 任务队列、WebSocket 广播、Skill 缓存 |
-| 实时通信 | WebSocket | FastAPI `WebSocket` 类 |
-| 前端框架 | Vue 3 | `<script setup>` 语法，**禁止 Vue2 语法** |
-| UI 组件库 | Element Plus | 最新稳定版 |
-| 构建工具 | Vite | TypeScript |
-| 状态管理 | Pinia | Composition API 风格 |
-| HTTP 客户端 | axios | 全局封装，拦截器处理 token |
-| 客户端 | Python 3.9+ | 标准库 + requests |
-| Skill 格式 | SKILL.md 标准 | 严格遵守 `SKILL.md` 规范（见设计文档 6.2） |
-
----
+FastAPI + SQLAlchemy 2.0 + Pydantic v2 + PostgreSQL（config.yaml，compile_user/compile_platform）；
+Vue 3 `<script setup>` + Vite + Element Plus + Pinia + axios（全局 30s，慢端点调用级放宽/异步 job）；
+DeepAgents/langgraph（checkpointer 显式传参）+ docker SDK；WS = **进程内 BROADCASTER 单例**（原设计 Redis 队列/广播未采用——worker 与 API 同进程，DB 轮询队列够用）；无 alembic（迁移走 init_db 幂等链）。
 
 ## 四、编码约束
 
-### 4.1 后端
-- 所有 API 必须加异常捕获（`try/except`），返回统一错误格式
-- WebSocket 必须组件卸载销毁（`onUnmounted` 等价逻辑）
-- 数据库 DDL **仅生成 SQL 脚本，禁止 Hermes 直接执行**
-- 所有用户输入必须校验（Pydantic schema）
-- 敏感操作记录审计日志
+**后端**：API 统一异常捕获返回 `{code,message,data}`；用户输入必过 Pydantic；敏感操作写 AuditLog；DDL 变更走 models.py + init_db（幂等，自动执行）；**async 端点内禁止直调分钟级同步 IO**（docker/git clone/requests）——必须 `asyncio.to_thread`/executor，否则冻结全站（2026-10-22 接单事故）。
+**前端**：`<script setup>`；WS/定时器 `onUnmounted` 销毁；长日志虚拟滚动；大文本默认折叠懒加载（不点不请求、失败不弹错）；>30s 的外部调用端点按 job+轮询设计，不靠放宽超时硬扛。
+**通用**：优先 diff 不大改；改前 git 干净；后端改动需 `setup.sh restart`（挑编译空窗——重启杀在跑任务）；前端改动 `npx vite build` 同步 dist。
 
-### 4.2 前端
-- 所有组件使用 `<script setup>` 语法
-- WebSocket / 定时器必须在 `onUnmounted` 销毁
-- 长日志列表必须使用虚拟滚动（`el-virtual-list` 或自研）
-- UI 布局、表格字段、弹窗交互**严格对齐 `compile-platform-mockup.html`**
+## 五、状态机（与代码一致）
 
-### 4.3 通用
-- **输出优先 diff，禁止全量重写文件**（除非全新文件）
-- **一次只实现单个模块/单个文件**，禁止一次性写整套系统
-- 每次任务开始前必须 `git commit` 保存当前状态
-
----
-
-## 五、输入源约定
-
-**所有需求、页面、字段、API、状态流转必须以下列两份材料为准**：
-
-1. **设计文档**：`龙芯LoongArch智能编译平台设计文档.docx`（需求、架构、API、流程图）
-2. **UI 原型**：`compile-platform-mockup.html`（页面布局、交互、样式）
-
-**禁止行为**：
-- ❌ 自行新增业务逻辑
-- ❌ 自行新增状态值（编译任务状态、工单状态、Skill 审核状态必须与文档流程图完全一致）
-- ❌ 自行修改 UI 布局或增加 mockup 中不存在的功能
-- ❌ 自行设计数据库表结构（必须基于设计文档第十一节 API 推导）
-
----
-
-## 六、状态机定义（必须严格遵守）
-
-### 6.1 编译任务状态
 ```
-submitted → compiling → success
-                       → failed
+编译任务：submitted → compiling → success / failed / cancelled
+工单：    pending → processing → resolved → closed（closed 触发容器回收 recycle）
+经验审批：submitted →（approve：写 Skill 表+落盘，同名旧版 superseded）/ rejected
 ```
 
-### 6.2 工单状态
-```
-pending → processing → resolved → closed
-           ↓
-         (user) → 可重新打开
-```
+## 六、AI 会话规范
 
-### 6.3 Skill 审核状态
-```
-submitted → under_review → approved → synced
-                      → rejected
-```
+- 开场必读本文件 + README；调试经验/设计档案在 Hermes 技能 `compile-platform-debugging`（~/.hermes/skills/，含部署 TODO、账本设计、BUILD_NOTES 设计）
+- 一次一个模块；"先别改"=零 patch 只出方案；"记着"=写进技能 references；数据删除类操作先影子演练
+- 权限：允许文件读写/语法检查/只读查询；执行 DDL 破坏性语句、rm -rf、装系统包、sudo 必须用户明示
+- 验证：改完必须实跑（pytest 基线 39 passed + 针对性 ad-hoc），空口"已完成"无效
 
----
+## 七、API 面
 
-## 七、Hermes 会话规范
+端点清单与语义以 **docs/api.md**（按代码实测重写版）+ Swagger `/docs` 为准，本文件不再维护副本（原第八节清单系 9 月设计稿，与实现已有出入，废弃）。
 
-### 7.1 每次任务开场白（必须粘贴）
-```
-读取 ./project-spec.md，参考根目录下设计文档【龙芯LoongArch智能编译平台设计文档.docx】和UI原型【compile-platform-mockup.html】，加载skills目录下面的vue3-elementplus-dev、fastapi-dev技能。所有业务逻辑、字段、页面、API严格以两份文档为准，不要自行增加业务。一次只实现单个模块/单个文件，修改优先输出diff，不要全量重写完整文件。
-```
+## 八、安全与隐私（现状版）
 
-### 7.2 会话拆分策略
-| 会话 | 内容 | 输出物 |
-|------|------|--------|
-| 会话1 | 架构 & 数据库设计 | SQL DDL 脚本、OpenAPI 契约 |
-| 会话2 | 后端 FastAPI 开发 | 逐个接口实现 |
-| 会话3 | Vue 前端开发 | 页面组件 |
-| 会话4 | Bug 调试 | 问题排查 |
-| 会话5 | 本地客户端开发 | Python 客户端 |
+1. 当前仅云端模式：用户源码上传后存 `artifacts/<task_id>/`，任务终态后保留（uninstall 清除）
+2. 工单上报可附编译日志；`AI_API_KEY` 等密钥只存 `.env.compile`（不入 git），日志/草稿生成需避免回显 key
+3. Skill 库只存编译经验（命令/坑/攻略），不得包含用户源码片段
+4. 自助注册默认关闭（ALLOW_SELF_REGISTER），账号由管理员创建；JWT + 角色守卫，普通用户不可达 admin 面
 
-### 7.3 权限控制
-- ✅ 允许：文件读写、diff 对比、语法检查
-- ❌ 禁止：执行 DDL、删除文件（`rm -rf`）、安装系统包
-- ⚠️ 高危操作必须人工确认
+## 九、验收口径（平台立场，2026-10-22 定）
 
----
-
-## 八、API 接口清单（基于设计文档第十一节）
-
-### 8.1 用户前台 API
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/compile/submit` | 提交编译任务 |
-| GET | `/api/compile/tasks` | 获取任务列表 |
-| GET | `/api/compile/tasks/{id}` | 获取任务详情 |
-| GET | `/api/compile/tasks/{id}/log` | 获取编译日志 |
-| POST | `/api/tickets/report` | 上报问题工单 |
-| GET | `/api/tickets/my` | 获取我的工单 |
-| POST | `/api/experience/submit` | 提交经验 |
-| GET | `/api/experience/my` | 获取我的经验 |
-| GET | `/api/skills` | 获取可用 Skill 列表 |
-| GET | `/api/systems` | 获取目标系统列表 |
-
-### 8.2 管理员后台 API
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/stats/overview` | 统计看板数据 |
-| GET | `/api/tickets` | 工单列表 |
-| GET | `/api/tickets/{id}` | 工单详情 |
-| POST | `/api/tickets/{id}/messages` | 发送消息 |
-| POST | `/api/tickets/{id}/resolve` | 标记解决 |
-| GET | `/api/experience/pending` | 待审核经验 |
-| POST | `/api/experience/{id}/approve` | 通过审核 |
-| POST | `/api/experience/{id}/reject` | 驳回审核 |
-| GET | `/api/skills` | Skill 列表 |
-| POST | `/api/skills` | 新增 Skill |
-| PUT | `/api/skills/{id}` | 更新 Skill |
-| DELETE | `/api/skills/{id}` | 删除 Skill |
-| GET | `/api/users` | 用户列表 |
-| POST | `/api/audit/logs` | 操作日志 |
-| GET | `/api/systems` | 目标系统列表 |
-| POST | `/api/systems` | 新增目标系统 |
-| PUT | `/api/systems/{id}` | 更新目标系统配置 |
-| DELETE | `/api/systems/{id}` | 删除目标系统 |
-
----
-
-## 九、安全与隐私规则
-
-1. 本地客户端编译全程离线，源码/日志/产物**不上传云端**
-2. 云端编译失败时，工单上报日志**自动脱敏**
-3. Skill 经验库仅同步规则，不同步用户代码数据
-4. 涉密代码场景必须使用本地客户端模式
-
----
+编译验收 = **基本三件套**（干净环境安装 / 导入加载 / 一次最小调用）；上游全量测试套件（pytest/test_ops/gradcheck/benchmark）非必需且禁止默认执行——已制度化注入 task_prompt、两草稿生成器、build-notes 模板四处，改动勿只动其一。
 
 ## 十、版本信息
 
-- 项目版本：v1.0
-- 设计文档日期：2026-09-21
-- 最后更新：2026-09-22
+- 契约版本：v2（2026-10-22 瘦身对齐实际；v1=2026-09-22 设计期，依赖的外部 docx/mockup 不在仓库）
+- 实现事实源：代码 + README + docs/api.md + git log
