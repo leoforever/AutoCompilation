@@ -19,9 +19,12 @@
               <el-tag :type="ticketStatusType(row.status)" size="small">{{ ticketStatusText(row.status) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="100">
+          <el-table-column label="操作" width="110">
             <template #default="{ row }">
-              <el-button size="small" @click="openChat(row)">查看对话</el-button>
+              <!-- T8: 管理员新回复红点（打开对话即清零） -->
+              <el-badge :value="row.admin_unread" :hidden="!row.admin_unread" :offset="[4, -2]">
+                <el-button size="small" @click="openChat(row)">查看对话</el-button>
+              </el-badge>
             </template>
           </el-table-column>
         </el-table>
@@ -36,10 +39,11 @@
             <div class="content">{{ msg.content }}</div>
           </div>
         </div>
-        <div style="margin-top:12px;display:flex;gap:8px">
+        <div v-if="currentTicket.status !== 'closed'" style="margin-top:12px;display:flex;gap:8px">
           <el-input v-model="newMessage" placeholder="输入回复..." style="flex:1" @keyup.enter="sendMessage" />
           <el-button type="primary" size="small" @click="sendMessage">发送</el-button>
         </div>
+        <div v-else class="muted" style="margin-top:12px;font-size:13px">工单已关闭，对话结束</div>
       </div>
       <div class="card" v-else style="display:flex;align-items:center;justify-content:center;min-height:300px">
         <span class="muted">选择左侧工单查看对话</span>
@@ -90,8 +94,12 @@ function formatDate(dateStr: string) {
 
 async function openChat(ticket: any) {
   currentTicket.value = ticket
-  const res = await api.get(`/tickets/${ticket.ticket_id}`)
+  const res: any = await api.get(`/tickets/${ticket.ticket_id}`)
   messages.value = res.data?.messages || []
+  // T8: 打开面板即把管理员回复标已读，红点/角标同步清零
+  if (ticket.admin_unread > 0) {
+    try { await api.post(`/tickets/${ticket.ticket_id}/read`); ticket.admin_unread = 0 } catch { /* 非关键路径 */ }
+  }
   await nextTick()
   scrollToBottom()
 }

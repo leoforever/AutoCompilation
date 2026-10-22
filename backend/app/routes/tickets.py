@@ -62,11 +62,29 @@ def _ticket_to_dict(t: "Ticket", include_messages: bool = False, db: "Session | 
                 "content": m.content,
                 "user_id": m.user_id,
                 "username": m.user.username if m.user else "已注销",
+                # T8: is_read 是"用户已读"语义——用户自己发的消息恒 True，仅 admin 回复会 False
+                "is_read": True if m.role != "admin" else bool(m.is_read),
+                "kind": m.kind or "chat",
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in t.messages
+            if (m.kind or "chat") != "agent_cmd"
         ]
     return result
+
+
+def _unread_map(db: "Session", ticket_ids: list) -> dict:
+    """T8: 批量算每个工单的管理员未读回复数（列表红点用，一次查询防 N+1）"""
+    if not ticket_ids:
+        return {}
+    from sqlalchemy import func as _f
+    rows = (db.query(TicketMessage.ticket_id, _f.count(TicketMessage.id))
+            .filter(TicketMessage.ticket_id.in_(ticket_ids),
+                    TicketMessage.role == "admin",
+                    TicketMessage.kind == "chat",   # T8: 指令线(agent_cmd)不算用户未读
+                    TicketMessage.is_read == False)  # noqa: E712
+            .group_by(TicketMessage.ticket_id).all())
+    return {tid: n for tid, n in rows}
 
 
 # ============== 共享：读 build.log 末尾 ==============
@@ -197,7 +215,13 @@ async def list_my_tickets(
     if status:
         q = q.filter(Ticket.status == TicketStatus(status))
     tickets = q.order_by(Ticket.created_at.desc()).all()
-    return ApiResponse(data=[_ticket_to_dict(t) for t in tickets])
+    unread = _unread_map(db, [t.ticket_id for t in tickets])
+    data = []
+    for t in tickets:
+        d = _ticket_to_dict(t)
+        d["admin_unread"] = unread.get(t.ticket_id, 0)
+        data.append(d)
+    return ApiResponse(data=data)
 
 
 # ============== 4) 工单详情 ==============
@@ -213,7 +237,32 @@ async def get_ticket(
     if ticket.user_id != current_user.user_id and current_user.role != "admin":
         raise HTTPException(status_code=403, detail="无权查看此工单")
 
-    return ApiResponse(data=_ticket_to_dict(ticket, include_messages=True, db=db))
+    return ApiResponse(data={
+        **_ticket_to_dict(ticket, include_messages=True, db=db),
+        "admin_unread": _unread_map(db, [ticket.ticket_id]).get(ticket.ticket_id, 0),
+    })
+
+
+# ============== 4.5) T8: 用户打开对话面板 → admin 回复标已读（红点清零） ==============
+@router.post("/{ticket_id}/read", response_model=ApiResponse)
+async def mark_ticket_read(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="工单不存在")
+    if ticket.user_id != current_user.user_id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权操作此工单")
+    db.query(TicketMessage).filter(
+        TicketMessage.ticket_id == ticket_id,
+        TicketMessage.role == "admin",
+        TicketMessage.kind == "chat",   # 只清对话线
+        TicketMessage.is_read == False,  # noqa: E712
+    ).update({"is_read": True})
+    db.commit()
+    return ApiResponse(message="已读")
 
 
 # ============== 5) 追加消息（用户/admin） ==============
@@ -241,6 +290,7 @@ async def add_ticket_message(
         user_id=current_user.user_id,
         role=role,
         content=content.strip(),
+        is_read=(role != "admin"),  # T8: admin 回复=用户未读；用户自己发的恒已读
     )
     db.add(msg)
     # pending 状态下用户回复 = 重新激活，admin 看得到

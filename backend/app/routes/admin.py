@@ -239,6 +239,7 @@ async def send_ticket_message(
         user_id=current_user.user_id,
         role="admin",
         content=content.strip(),
+        is_read=False,  # T8: 管理员回复→用户侧红点
     )
     db.add(message)
 
@@ -251,7 +252,9 @@ async def send_ticket_message(
         action="ticket_message",
         target_type="ticket",
         target_id=ticket_id,
-        details=f"status={old_status.value}→{ticket.status.value}",
+        # status 列是 Column[str]，ORM 拉回是裸 str 没有 .value（§2e 同款陷阱；
+        # 本端点此前前端零入口从未触发，T8 接通后首爆——str() 兜底两头兼容）
+        details=f"status={str(old_status)}→{str(ticket.status)}",
     ))
     db.commit()
     return ApiResponse(message="消息已发送")
@@ -528,6 +531,7 @@ async def admin_get_ticket(
 
     # agent session 是否活跃
     from app.services.ticket_agent import MANAGER
+    from app.models import TicketAgent
     sess = MANAGER.get(ticket_id)
     agent_active = sess is not None
     container_short = sess.container_id[:12] if sess else None
@@ -548,9 +552,12 @@ async def admin_get_ticket(
         "task": task_info,  # 新：完整任务详情
         "agent_active": agent_active,  # 新
         "container_id_short": container_short,  # 新
+        # T8: 是否曾有 agent 会话（Tab2 可用性：接单建过会话才允许切到工作台看历史指令）
+        "agent_session_exists": db.query(TicketAgent).filter(TicketAgent.ticket_id == ticket_id).first() is not None,
         "messages": [
             {
                 "id": m.id, "role": m.role, "content": m.content,
+                "kind": m.kind or "chat",  # T8: chat=对话线(用户可见) / agent_cmd=工作台指令
                 "user_id": m.user_id,
                 "username": (
                     (m.user.username if m.user and not m.user.deleted_at
@@ -1430,6 +1437,8 @@ async def post_agent_message(
         user_id=current_user.user_id,
         role="admin",
         content=content.strip(),
+        kind="agent_cmd",  # T8: 工作台指令线，用户端不可见
+        is_read=True,
     )
     db.add(admin_msg)
     db.commit()
@@ -1685,6 +1694,8 @@ async def stream_agent_message(
                 user_id=current_user.user_id,
                 role="admin",
                 content=content.strip(),
+                kind="agent_cmd",  # T8: 工作台指令线，用户端不可见
+                is_read=True,
             )
             s.add(admin_msg)
             s.add(AuditLog(

@@ -170,9 +170,13 @@
             show-icon
             style="margin-bottom:10px"
           >
+            <!-- T8-U 2026-10-22：显示后端 phase 细粒度当前阶段（git clone 大仓可能数分钟，
+                 笼统"启动中"无法判断卡在哪）。currentPhaseLabel 由 phase 轮询实时更新；
+                 轮询尚未出首个事件时回落通用文案 -->
             <strong v-if="current.agent_restoring">Agent 现场恢复中…</strong>
-            <strong v-else>Agent 启动中…</strong>
-            （{{ current.agent_restoring ? '自动复用容器 + 接回对话' : '容器创建 + 拉源码 + DeepAgent 初始化' }}，约 5-90 秒，请稍候）
+            <strong v-else-if="currentPhaseLabel">{{ currentPhaseLabel }}</strong>
+            <strong v-else>Agent 启动中（正在创建容器…）</strong>
+            <span style="margin-left:6px">已耗时 {{ agentStartElapsed }}s{{ currentPhaseLabel ? '' : '，大仓源码拉取可能需数分钟' }}</span>
           </el-alert>
           <el-alert
             v-else-if="!current.agent_active && current.status === 'processing' && current.agent_error"
@@ -199,35 +203,66 @@
             <el-button size="small" type="danger" plain style="margin-left:8px" @click="cleanupContainer()">清理容器</el-button>
           </el-alert>
 
-          <!-- 对话流 -->
-          <div class="chat" ref="chatScrollRef">
-            <div v-if="!current.messages || current.messages.length === 0" class="chat-empty">
-              （暂无消息 —— 接单 + Agent 启动后与 agent 多轮对话解决）
-            </div>
-            <div v-for="m in (localChat.length ? localChat : (current.messages || []))" :key="m.id" :class="['msg', m.role]">
-              <div class="msg-who">
-                <el-tag :type="roleTag(m.role)" size="small">{{ roleLabel(m.role) }}</el-tag>
-                · {{ m.username || (m.role === 'agent' ? 'Agent' : m.role) }} · {{ formatDate(m.created_at) }}
+          <!-- T8: 双线分离——用户消息线(TicketMessage) / Agent 工作台线(B3 指令)。
+               病根修复：此前抽屉唯一输入框发 /agent/message，管理员没有"回复用户"入口 -->
+          <el-tabs v-model="chatTab" style="margin-bottom:6px">
+            <el-tab-pane name="user">
+              <template #label>用户消息</template>
+              <div class="chat" style="max-height:340px;overflow:auto">
+                <div v-if="!userMessages.length" class="chat-empty">（暂无用户消息）</div>
+                <div v-for="m in userMessages" :key="'u' + m.id" :class="['msg', m.role]">
+                  <div class="msg-who">
+                    <el-tag :type="m.role === 'admin' ? 'success' : 'info'" size="small">{{ m.role === 'admin' ? '管理员（我）' : '用户' }}</el-tag>
+                    · {{ m.username }} · {{ formatDate(m.created_at) }}
+                  </div>
+                  <div class="msg-content">{{ m.content }}</div>
+                </div>
               </div>
-              <div class="msg-content">{{ m.content }}</div>
-            </div>
-            <div v-if="agentThinking" class="msg agent pending">
-              <div class="msg-who">Agent 思考中…</div>
-              <div class="msg-content">{{ agentThinking }}</div>
-            </div>
-          </div>
+              <div class="reply" v-if="current.status !== 'closed'">
+                <el-input v-model="userReply" type="textarea" :rows="3"
+                          :placeholder="current.status === 'pending' ? '回复用户（发送后工单自动进入处理中）（Ctrl+Enter）' : '回复用户（Ctrl+Enter 发送）'"
+                          @keydown.ctrl.enter="sendUserReply" />
+                <div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">
+                  <el-button type="primary" :loading="sendingReply" :disabled="!userReply.trim()" @click="sendUserReply">
+                    回复用户
+                  </el-button>
+                </div>
+              </div>
+              <div v-else class="muted" style="font-size:13px;padding:8px 0">工单已关闭，双方禁言</div>
+            </el-tab-pane>
 
-          <!-- 输入框（仅 processing+agent_active 时可输入） -->
-          <div class="reply" v-if="current.status === 'processing' && current.agent_active">
-            <el-input v-model="newMessage" type="textarea" :rows="3"
-                      placeholder="告诉 agent 下一步该做什么（Ctrl+Enter 发送）"
-                      @keydown.ctrl.enter="sendAgentMessage" />
-            <div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">
-              <el-button type="primary" :loading="sendingAgent" :disabled="!newMessage.trim()" @click="sendAgentMessage">
-                发送给 Agent
-              </el-button>
-            </div>
-          </div>
+            <el-tab-pane label="Agent 工作台" name="agent" :disabled="!current.agent_session_exists && !current.agent_active">
+              <!-- 对话流 -->
+              <div class="chat" ref="chatScrollRef">
+                <div v-if="!current.messages || current.messages.length === 0" class="chat-empty">
+                  （暂无消息 —— 接单 + Agent 启动后与 agent 多轮对话解决）
+                </div>
+                <div v-for="m in (localChat.length ? localChat : agentFallbackMessages)" :key="m.id" :class="['msg', m.role]">
+                  <div class="msg-who">
+                    <el-tag :type="roleTag(m.role)" size="small">{{ roleLabel(m.role) }}</el-tag>
+                    · {{ m.username || (m.role === 'agent' ? 'Agent' : m.role) }} · {{ formatDate(m.created_at) }}
+                  </div>
+                  <div class="msg-content">{{ m.content }}</div>
+                </div>
+                <div v-if="agentThinking" class="msg agent pending">
+                  <div class="msg-who">Agent 思考中…</div>
+                  <div class="msg-content">{{ agentThinking }}</div>
+                </div>
+              </div>
+
+              <!-- 输入框（仅 processing+agent_active 时可输入） -->
+              <div class="reply" v-if="current.status === 'processing' && current.agent_active">
+                <el-input v-model="newMessage" type="textarea" :rows="3"
+                          placeholder="告诉 agent 下一步该做什么（Ctrl+Enter 发送）"
+                          @keydown.ctrl.enter="sendAgentMessage" />
+                <div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">
+                  <el-button type="primary" :loading="sendingAgent" :disabled="!newMessage.trim()" @click="sendAgentMessage">
+                    发送给 Agent
+                  </el-button>
+                </div>
+              </div>
+            </el-tab-pane>
+          </el-tabs>
         </div>
 
         <!-- 5. 解决/生成 Skill 按钮组 -->
@@ -310,7 +345,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/utils/request'
 
@@ -321,6 +356,32 @@ const loading = ref(false)
 const detailVisible = ref(false)
 const current = ref<any>(null)
 const newMessage = ref('')
+// T8: 双线 tab 状态
+const chatTab = ref<'user' | 'agent'>('user')
+const userReply = ref('')
+const sendingReply = ref(false)
+// tab1 数据源：对话线消息（排除工作台指令 kind=agent_cmd）；历史旧行 kind=chat 自然全含
+const userMessages = computed(() => (current.value?.messages || []).filter((m: any) => (m.kind || 'chat') !== 'agent_cmd'))
+// T8: tab2 兜底视图（B3 历史拉不到时）同样只留工作台线，防 chat/用户行再串入
+const agentFallbackMessages = computed(() => (current.value?.messages || []).filter((m: any) => m.kind === 'agent_cmd'))
+async function sendUserReply() {
+  if (!userReply.value.trim() || !current.value) return
+  const content = userReply.value.trim()
+  sendingReply.value = true
+  try {
+    await api.post(`/admin/tickets/${current.value.ticket_id}/messages`, null, { params: { content } })
+    current.value.messages.push({ id: Date.now(), role: 'admin', content, username: '我', kind: 'chat', created_at: new Date().toISOString() })
+    userReply.value = ''
+    ElMessage.success('已回复用户')
+    // pending 首回自动转 processing 由后端做，这里同步状态显示+列表计数
+    if (current.value.status === 'pending') current.value.status = 'processing'
+    loadCounts()
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '回复失败')
+  } finally {
+    sendingReply.value = false
+  }
+}
 const fullLog = ref('')
 const logLoaded = ref(false)
 const logLoading = ref(false)
@@ -404,10 +465,15 @@ async function openDetail(row: any) {
   logLoaded.value = false
   fullLog.value = ''
   newMessage.value = ''
+  userReply.value = ''
+  // T8: 有工作台会话的工单默认落 tab2（原使用习惯），纯人工单落 tab1
+  chatTab.value = r.data?.agent_session_exists ? 'agent' : 'user'
   agentThinking.value = ''
   // B3 2026-10-19：admin 抽屉打开时拉 agent 历史 + 拼到 localChat
   // （解决"退出再进 agent 消息丢"问题）
-  const adminHistory = (r.data?.messages || []).filter((m: any) => m.role === 'admin')
+  // T8 线分离（2026-10-22 泄漏修复：tab2 混进了 tab1 的"回复用户"行）——
+  // admin 行只取工作台指令线 kind=agent_cmd；chat 回复线只在 tab1 显示
+  const adminHistory = (r.data?.messages || []).filter((m: any) => m.role === 'admin' && m.kind === 'agent_cmd')
   const agentHistoryResp: any = await api.get(`/admin/tickets/${row.ticket_id}/agent/messages-history`).catch(() => ({ data: { messages: [] } }))
   const agentMsgs = (agentHistoryResp.data?.messages || [])
   // 拼装：最后一条 admin msg 在最前（因为刚发），agent/tool msgs 按时间序
@@ -496,6 +562,16 @@ let _phaseLastSeqMap: Map<number, number> = new Map()  // ticketId → 已读最
 let _lastPhaseTicketId: number = 0  // 当前轮询的 ticketId（迁移用，可保留）
 // 2026-10-19：当前阶段（顶部状态条，**不**进 localChat 历史气泡）
 const currentPhaseLabel = ref<string>('')  // 空 = 不显示
+// T8-U: 启动/恢复已耗时（秒），进入 processing-未active 轮询时重置
+const agentStartElapsed = ref(0)
+let _startTimer: ReturnType<typeof setInterval> | null = null
+function startElapsedTimer() {
+  stopElapsedTimer()
+  agentStartElapsed.value = 0
+  _startTimer = setInterval(() => { agentStartElapsed.value += 1 }, 1000)
+}
+function stopElapsedTimer() { if (_startTimer) { clearInterval(_startTimer); _startTimer = null } }
+
 const currentPhaseClass = ref<string>('phase-progress')  // phase-progress/running/done/failed
 const PHASE_LABEL: Record<string, { emoji: string; label: string }> = {
   reuse_container: { emoji: '♻️', label: '复用容器' },
@@ -556,11 +632,15 @@ function stopPhasePolling() {
     clearInterval(_phasePollTimer)
     _phasePollTimer = null
   }
+  stopElapsedTimer()  // T8-U: 关抽屉/切工单时启动计时一并停（pollAgentStart 后台循环自会随三出口收敛）
 }
 
 async function pollAgentStart(ticketId: number) {
+  startElapsedTimer()  // T8-U: 启动/恢复计时（alert 里显示已耗时）
   // restoring（重启后自动恢复现场：docker start + agent 重建）可能要 30-90s，窗口放宽
-  for (let i = 0; i < 45; i++) {
+  // 2026-10-22：窗口 45×2s=90s → 300×2s=10min。教训：pytorch 级大仓 clone 数分钟，
+  // 旧窗口内 clone 还在正常推进就被判"未启动请接单"（误诊）；就绪/失败出口仍即时跳出
+  for (let i = 0; i < 300; i++) {
     await new Promise(r => setTimeout(r, 2000))
     const r: any = await api.get(`/admin/tickets/${ticketId}/agent/status`)
     const d = r.data || {}
@@ -570,18 +650,21 @@ async function pollAgentStart(ticketId: number) {
       current.value.agent_error = null
       current.value.agent_restoring = false
       ElMessage.success('Agent session 已就绪')
+      stopElapsedTimer()
       return
     }
     if (d.phase === 'failed' && d.error) {
       // 启动失败 — 显示错误 + 停止轮询
       current.value.agent_error = d.error
       ElMessage.error(`Agent 启动失败：${d.error}`)
+      stopElapsedTimer()
       return
     }
     if (d.phase === 'session_lost') {
       // 兼容老后端：仍提示手动重新启动
       current.value.agent_error = d.error
       ElMessage.warning(`Session 已丢失，请点「重新启动」按钮`)
+      stopElapsedTimer()
       return
     }
     // starting / restoring → 顶部给个状态提示继续等
@@ -590,25 +673,31 @@ async function pollAgentStart(ticketId: number) {
       current.value.agent_restoring = true
     }
   }
-  // 超时但没明确错误 — 多查一次 /agent/phase 拿真因
+  // 超时但没明确错误 — 读 /agent/phase 定位卡在哪个阶段（中文），按阶段给可判断的原因
   current.value.agent_restoring = false
   try {
     const r2: any = await api.get(`/admin/tickets/${ticketId}/agent/phase`, { params: { since_seq: 0 } })
     const data = r2.data || {}
     const events = data.events || []
     if (events.length === 0) {
-      // 完全没事件 — 说明后端没收到 accept 或 _create_session 没跑（用户没点接单）
-      current.value.agent_error = 'Agent session 未启动。请点「接单」按钮（如果还没接），或「重新启动」按钮（已接单但 session 丢失）'
+      // 完全没事件 — 后端确实没开始建 session（没点到接单/启动请求丢了）
+      current.value.agent_error = '后端未收到启动请求（没有任何阶段记录）。请点「接单」；若已接单请点「重新启动」'
       ElMessage.warning('Agent 未启动：请接单 / 重新启动')
     } else {
-      // 有 phase 事件但 30s 内没完成 — 显示已进行的阶段 + phase 端点的 error
       const lastEv = events[events.length - 1]
-      const errMsg = data.error || `已运行到「${lastEv.phase}」阶段但 30s 未完成。请检查容器 / git clone / 拉镜像进度`
-      current.value.agent_error = errMsg
-      ElMessage.error(`Agent 启动卡在「${lastEv.phase}」阶段`)
+      const cn = (PHASE_LABEL[lastEv.phase] || { label: lastEv.phase }).label
+      const hint: Record<string, string> = {
+        create_container: 'docker 创建容器异常慢——可能镜像首次拉取或 docker daemon 卡住',
+        fetch_source: 'git clone 大仓进行中——pytorch 这类仓库需数分钟，稍后重开抽屉即可看到进展',
+        create_deep_agent: 'DeepAgent 初始化慢——LLM 连接/技能加载阶段，可稍等或重新启动',
+      }
+      current.value.agent_error = `已进行到「${cn}」阶段，等待 ${agentStartElapsed.value}s 未就绪。`
+        + (data.error ? `后端报错：${data.error}` : (hint[lastEv.phase] || '该阶段耗时异常，可点「重新启动」'))
+        + '（阶段未回退=大概率仍在推进，不一定是失败）'
+      ElMessage.error(`Agent 启动卡在「${cn}」阶段`)
     }
   } catch (e) {
-    current.value.agent_error = '启动超时（30s），可能 docker daemon 卡住 / git clone 慢 / 拉镜像慢'
+    current.value.agent_error = `启动等待 ${agentStartElapsed.value}s 超时，且阶段记录读取失败——检查后端日志`
   }
 }
 
@@ -719,6 +808,7 @@ async function sendAgentMessage() {
     username: '我',
     created_at: new Date().toISOString(),
   }
+  adminMsg.kind = 'agent_cmd'  // T8: 线别标记，不串进 tab1
   localChat.value.push(adminMsg)
   console.log('[FE] pushed adminMsg', { id: adminMsg.id, localChat_len: localChat.value.length })
   agentThinking.value = '（Agent 思考中…）'

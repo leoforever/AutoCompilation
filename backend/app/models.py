@@ -197,7 +197,11 @@ class TicketMessage(Base):
     ticket_id = Column(Integer, ForeignKey("tickets.ticket_id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
     role = Column(String(20), nullable=False)
+    # T8: 消息线别——chat=用户可见对话 / agent_cmd=admin→Agent 工作台指令（用户端不返回）
+    kind = Column(String(12), default="chat", nullable=False)
     content = Column(Text, nullable=False)
+    # T8: 用户侧已读标记（admin 回复→用户红点；打开对话面板清零）。历史行由 init 迁移全标 True
+    is_read = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     ticket = relationship("Ticket", back_populates="messages")
@@ -343,6 +347,12 @@ def init_db():
     _safe_add_column("users", "original_username", "VARCHAR(50) NULL")
     # 2026-10-20: 工单经验统一走 experience 审批流（ticket_id 标识来源工单）
     _safe_add_column("experiences", "ticket_id", "INTEGER NULL")
+    # T8 工单对话线：ticket_messages.is_read（2026-10-22）。存量历史消息一律标已读，
+    # 防功能上线瞬间满屏红点（用户拍板）；新 admin 回复默认未读由写入侧显式置 False
+    # 回填由 DDL 的 DEFAULT TRUE 天然完成（ADD COLUMN 存量行自动填默认值，无需 UPDATE；
+    # 别在这写 db.execute——init_db 作用域没有 session，2026-10-22 启动炸 NameError 教训）
+    _safe_add_column("ticket_messages", "is_read", "BOOLEAN NOT NULL DEFAULT TRUE")
+    _safe_add_column("ticket_messages", "kind", "VARCHAR(12) NOT NULL DEFAULT 'chat'")
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
     _seed_default_target_systems()
     logger.info("Database initialized")
