@@ -41,7 +41,7 @@
           <template #default="{ row }">
             <span v-if="!row.artifact_path" class="muted">—</span>
             <span v-else :title="row.artifact_path" style="cursor:help">
-              {{ artifactSummary(row.artifact_path) }}
+              {{ artifactSummary(row.artifact_path, row.bundle_size) }}
             </span>
           </template>
         </el-table-column>
@@ -213,16 +213,16 @@ function formatDate(dateStr: string) {
          `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-// artifact_path 是 JSON 字符串：[{"name":"hello","path":"...","size":69696}]
-// 摘要：第一个文件名 + 文件数 + 总大小
-function artifactSummary(artifactPath: string): string {
+// artifact_path 是 JSON 字符串：文件 {name,size}；目录 {name:'x/', type:'dir', files}（不记磁盘和）
+// 摘要：首条目名 + 其余计数 + 真实下载体积（bundle_size=artifacts.tar.gz 字节，无包回退清单和标≈）
+function artifactSummary(artifactPath: string, bundleSize?: number): string {
   try {
     const arr = JSON.parse(artifactPath)
     if (!Array.isArray(arr) || arr.length === 0) return '—'
     const first = arr[0]
     const name = first.name || '?'
-    const totalBytes = arr.reduce((s: number, a: any) => s + (a.size || 0), 0)
-    const sizeStr = formatSize(totalBytes)
+    const totalBytes = bundleSize ?? arr.reduce((s: number, a: any) => s + (a.size || 0), 0)
+    const sizeStr = formatSize(totalBytes) + (bundleSize ? '' : '≈')
     if (arr.length === 1) return `${name} (${sizeStr})`
     return `${name} +${arr.length - 1}个 (${sizeStr})`
   } catch {

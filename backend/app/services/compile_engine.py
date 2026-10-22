@@ -621,6 +621,10 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 【禁止】跑上游全量测试套件（pytest 全量 / test_ops / gradcheck / JIT+compile 全家桶 / benchmark）——
 那是 CI 的开发动作，动辄数小时且非验收所需。若攻略里出现"跑完整测试"，只挑上面三件套执行、
 其余跳过并在 BUILD_NOTES 注明"全量测试非验收必需，已按轻量口径"。产物验证通过后立即归档收尾。
+【验证方式铁律】所有验证命令必须非交互、能自然退出：
+- 禁止前台直接运行等待输入的程序（交互式 shell / REPL / TUI / 前台服务器）
+- 验证 PTY / 子进程 / 常驻服务类库：用 `timeout 30` 包裹，或"后台起进程 → 断言 → kill"两段式
+- 单条验证命令预期 ≤5 分钟；超了就换非交互写法重试，不要干等（教训：node-pty 任务 pty.spawn bash 裸跑，永不退出挂 2.5h 拖到硬闸）
 
 【强制】现场记录 BUILD_NOTES.md：
 - 源码就绪后第一件事：read_file 读 /skills/generic/build-notes-standard/SKILL.md，按其模板 write_file 创建 /work/output/BUILD_NOTES.md 骨架（含环境探测结果）
@@ -842,6 +846,11 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
                      f"[阶段6] 产物打包: {bundle_path} ({bundle_size // 1024} KB)", on_log)
             except Exception as e:
                 _log(state, "warn", f"[阶段6] 产物打包失败（下载时将实时打包）: {e}", on_log)
+            # 清单以宿主机归档树为准（与 tar 同源可对账；容器 find 仅前中期过程视图）
+            _mf = _manifest_from_host(state.get("work_dir", ""))
+            if _mf is not None:
+                state["artifacts"] = _mf
+                _log(state, "info", f"[阶段6] 产物清单(宿主机对账): {len(_mf)} 项（目录折叠）", on_log)
             # BUILD_NOTES 落定固定路径（从归档树拷）
             _rescue_build_notes(state, None, on_log)
         except Exception as e:
@@ -1038,6 +1047,41 @@ def _find_files_smart(container, search_dir: str) -> list:
             continue
         files.append(p)
     return files[:50]  # 上限 50 个
+
+
+def bundle_size_bytes(work_dir: str) -> "int | None":
+    """任务产物整包（artifacts.tar.gz）真实字节数=用户下载的实际传输量；无包/未归档返 None"""
+    if not work_dir:
+        return None
+    b = Path(work_dir) / "artifacts.tar.gz"
+    try:
+        return b.stat().st_size if b.is_file() else None
+    except OSError:
+        return None
+
+
+def _manifest_from_host(work_dir: str) -> "list[dict] | None":
+    """stage6 归档完成后，以宿主机 artifacts/output/ 为事实源生成产物清单——
+    与 tar 打包同树（货/tar/账三方可对账）。2026-10-22 教训（B9ED7E）：旧容器内
+    find -type f -maxdepth 2 漏掉 libtorch 整棵目录树（清单 3 项 80M vs 实际 4 项 400M）。
+    目录折叠为一个条目（type=dir，只记文件数——目录大小对下载无意义，
+    真实传输量以 bundle_size=tar.gz 字节为准）；返回 None=目录不存在，调用方沿用旧兜底。"""
+    out_dir = Path(work_dir) / "artifacts" / "output"
+    if not out_dir.is_dir():
+        return None
+    items = []
+    for p in sorted(out_dir.iterdir()):
+        if p.name in (".", ".."):
+            continue
+        if p.is_file():
+            items.append({"name": p.name, "path": f"/work/output/{p.name}", "size": p.stat().st_size})
+        elif p.is_dir():
+            n_files = sum(len(fns) for _dp, _dirs, fns in os.walk(p))
+            items.append({"name": p.name + "/", "path": f"/work/output/{p.name}",
+                          "type": "dir", "files": n_files})  # 不记磁盘和：下载走整包 tar，目录大小无传输意义
+    # 排序：文件按大小降序、目录殿后——产物列"首文件名"=主产品（whl/tgz），不被 notes 抢头条
+    items.sort(key=lambda a: (a.get("type") == "dir", -a.get("size", 0)))
+    return items or None
 
 
 def _collect_artifacts(container, output_dir: str, source_dir: str = "") -> list:

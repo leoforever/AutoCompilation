@@ -267,6 +267,16 @@ async def list_skill_options(
     ])
 
 
+def _bundle_size_for(task_id: str) -> int | None:
+    """下载真实传输量=artifacts.tar.gz 字节（与产物清单口径配套，2026-10-22）"""
+    from app.services.compile_engine import _artifacts_dir
+    b = _artifacts_dir() / task_id / "artifacts.tar.gz"
+    try:
+        return b.stat().st_size if b.is_file() else None
+    except OSError:
+        return None
+
+
 @router.get("/tasks", response_model=CompileTaskListResponse)
 async def list_compile_tasks(
     status: Optional[str] = Query(default=None),
@@ -310,7 +320,8 @@ async def list_compile_tasks(
         tasks=[
             CompileTaskResponse(
                 system_name=sys_names.get(t.system_id),
-                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name"}),
+                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name", "bundle_size"}),
+                bundle_size=_bundle_size_for(t.task_id),
             )
             for t in tasks
         ],
@@ -334,7 +345,8 @@ async def get_compile_task(
     sys_names = _system_names_for_tasks(db, [task.system_id])
     return ApiResponse(data=CompileTaskResponse(
         system_name=sys_names.get(task.system_id),
-        **CompileTaskResponse.model_validate(task).model_dump(exclude={"system_name"}),
+        **CompileTaskResponse.model_validate(task).model_dump(exclude={"system_name", "bundle_size"}),
+        bundle_size=_bundle_size_for(task.task_id),
     ).model_dump())
 
 
@@ -420,19 +432,22 @@ async def download_artifacts_bundle(
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
     artifacts_root = _artifacts_dir()
-    bundle_path = artifacts_root / f"{task_id}.tar.gz"
+    # 与 stage6 预打包同路径（教训 2026-10-22：旧代码找 artifacts/<tid>.tar.gz 少一层目录，
+    # 永远 miss → 每次下载都走兜底，且兜底打的是整任务目录=包中包+build.log，体积与 bundle_size 对不上）
+    task_dir = artifacts_root / task_id
+    bundle_path = task_dir / "artifacts.tar.gz"
 
     if not bundle_path.exists():
-        # 兜底：实时打包（stage6 失败时也支持下载）
-        artifacts_dir = artifacts_root / task_id
-        if not artifacts_dir.exists() or not any(artifacts_dir.iterdir()):
+        # 兜底：实时打包产物树（arcname 与预包对齐；打完留在正式路径，下次秒回）
+        tree = task_dir / "artifacts"
+        if not tree.is_dir() or not any(tree.iterdir()):
             raise HTTPException(
                 status_code=404,
                 detail=f"产物不存在（任务 {task_id} 未成功或产物已被清理）",
             )
         import tarfile
         with tarfile.open(bundle_path, "w:gz") as tar:
-            tar.add(artifacts_dir, arcname=artifacts_dir.name)
+            tar.add(tree, arcname=tree.name)
 
     return FileResponse(
         path=str(bundle_path),
