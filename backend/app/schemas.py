@@ -207,18 +207,22 @@ class SkillCreate(BaseModel):
     type: str = Field(..., pattern="^(generic|specific)$")
     description: Optional[str]
     system_ids: List[int]
-    version: Optional[str]
+    # version 列 String(20)：schema 先拦超长，防 DB 层"值太长"500（同 SkillUpdate，2026-10-21）
+    version: Optional[str] = Field(None, max_length=20)
     skill_content: str
     script_content: Optional[str] = None
 
 
 class SkillUpdate(BaseModel):
+    # 全部 = None：Pydantic v2 里 Optional[X] 无默认值=必填字段，
+    # 前端编辑表单不带 is_active/部分字段 → 422 Field required → 用户端显示"网络错误"（2026-10-21 事故）
     name: Optional[str] = Field(None, min_length=1, max_length=100)
-    description: Optional[str]
-    system_ids: Optional[List[int]]
-    version: Optional[str]
-    is_active: Optional[bool]
-    skill_content: Optional[str]
+    description: Optional[str] = None
+    system_ids: Optional[List[int]] = None
+    # version 列 String(20)：超长会在 DB 层炸 500"值太长了(20)"（2026-10-21 实测），schema 先拦成 422 可读错误
+    version: Optional[str] = Field(None, max_length=20)
+    is_active: Optional[bool] = None
+    skill_content: Optional[str] = None
 
 
 class SkillResponse(BaseModel):

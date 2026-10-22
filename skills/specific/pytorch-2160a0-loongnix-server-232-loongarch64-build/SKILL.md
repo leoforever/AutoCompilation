@@ -283,14 +283,31 @@ description: |
     python -c "import torch; ..."
     ```
 
-    并结合 `test_ops` 与 C++ 程序验证。
+    并结合冒烟脚本与 C++ 程序验证。
 
-## 验证方法
+## 验证方法（轻量冒烟即可）
 
-- 检查 wheel 内容。
-- 在干净 venv 中安装 wheel。
-- 验证数值、算子、compile、JIT、`test_ops`。
-- 验证 libtorch C++ 链接运行。
+本平台是编译平台：验收只证明"装得上、import 得动、算子调得通"。**不要**跑 `test_ops`/gradcheck/compile/JIT/pytest 全量——test_ops 有 3 万+ 参数化 item（gradcheck 是数值微分，单条几秒~几十秒），龙芯走标量路径更慢，全套要数小时，那是 PyTorch CI 的开发动作，不是编译验收。
+- 检查 wheel 包文件内容
+- 在干净 venv 环境安装 wheel
+- 基础验证：可正常 import、基础算子可调用（不跑完整 test_ops /compile/ JIT 全套用例）
+- 基础验证 libtorch C++：可链接、能正常启动运行（简单调用即可，不做复杂算子核验）
+- 核对产物版本字符串可正常读取展示
+
+  ```bash
+  /tmp/vcheck/bin/python - <<'EOF'
+  import torch
+  a = torch.randn(64, 64, dtype=torch.float64)
+  print("version:", torch.__version__)
+  print("matmul:", (a @ a).sum().item() is not None)
+  x = torch.ones(3, requires_grad=True); (x * 2).sum().backward()
+  print("grad:", x.grad.tolist())
+  print("sleef exp:", torch.exp(torch.tensor(2.0, dtype=torch.float64)).item())
+  print("SMOKE_OK")
+  EOF
+  ```
+
+  五项全出数（版本串/matmul/backward 梯度/exp/SMOKE_OK）即判成功。
 - 确认产物版本串：
 
   ```text

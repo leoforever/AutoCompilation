@@ -52,7 +52,12 @@ api.interceptors.response.use(
     } else if (!error.response) {
       ElMessage.error('网络错误：无法连接服务器')
     } else {
-      ElMessage.error(messages[status] || '网络错误')
+      // 优先透传后端业务错误 detail（422 校验/400 冲突等），别让它们都长成"网络错误"
+      const detail = error.response.data?.detail
+      const msg = typeof detail === 'string' ? detail
+        : Array.isArray(detail) ? (detail[0]?.msg || JSON.stringify(detail[0] ?? {}))
+        : null
+      ElMessage.error(msg || messages[status] || '网络错误')
     }
     return Promise.reject(error)
   }
