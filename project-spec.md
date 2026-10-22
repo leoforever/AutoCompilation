@@ -15,7 +15,7 @@
 - **云端公共编译**：开源软件、无保密需求，源码上传云端，容器隔离执行
 - **本地私有编译**：涉密代码，编译全程离线，仅选择性上报脱敏日志
 
-**Skill 经验体系**：OpenClaw 标准格式，通用 Skill（跨系统）+ 专用 Skill（特定软件×系统），审核入库后同步至所有客户端。
+**Skill 经验体系**：SKILL.md 标准格式，通用 Skill（跨系统）+ 专用 Skill（特定软件×系统），审核入库后被编译 agent 直接读取。
 
 ---
 
@@ -69,7 +69,7 @@ compile-platform/
 │   ├── compile_client.py
 │   ├── skill_sync.py
 │   └── requirements.txt
-├── skills/                  # OpenClaw Skill 定义（只读，禁止AI改写）
+├── skills/                  # Skill 定义（审批流入库，禁止 AI 直改）
 │   └── README.md            # Skill 库说明
 └── .hermes/
     └── skills/              # Hermes 自定义技能（本项目专用）
@@ -102,7 +102,7 @@ compile-platform/
 | 状态管理 | Pinia | Composition API 风格 |
 | HTTP 客户端 | axios | 全局封装，拦截器处理 token |
 | 客户端 | Python 3.9+ | 标准库 + requests |
-| Skill 格式 | OpenClaw | 严格遵守 `SKILL.md` 标准（见设计文档 6.2） |
+| Skill 格式 | SKILL.md 标准 | 严格遵守 `SKILL.md` 规范（见设计文档 6.2） |
 
 ---
 

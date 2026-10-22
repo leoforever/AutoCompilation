@@ -101,7 +101,7 @@ function resolveTicket() {
 }
 
 function convertToSkill() {
-  ElMessage.info('📝 已将本次对话内容整理为标准 OpenClaw Skill，进入审核队列')
+  ElMessage.info('📝 已将本次对话内容整理为标准 Skill，进入审核队列')
 }
 
 onMounted(loadMessages)

@@ -1,86 +1,79 @@
 # 龙芯 LoongArch 智能编译平台
 
-面向龙芯 LoongArch 架构的软件编译场景，打造云端公共编译服务 + 本地私有化客户端编译双模式智能编译平台。
+面向龙芯 LoongArch 架构的软件源码编译场景：云端容器编译 + AI Agent（DeepAgents）执行 + 工单人工兜底 + 经验闭环沉淀（编译现场记录 BUILD_NOTES → 攻略草稿 → 审批 → Skill 库）。
 
 ## 项目结构
 
 ```
 compile-platform/
-├── backend/           # FastAPI 后端
-├── frontend/          # Vue3 + ElementPlus 前端
+├── backend/           # FastAPI 后端（worker 线程池在进程内跑编译）
+├── frontend/          # Vue3 + Element Plus 前端
 ├── client/            # 本地 Python 客户端（私有化部署用）
-├── skills/            # OpenClaw Skill 经验库（agent 编译时直接读）
-├── docs/              # 接口文档、设计笔记
+├── skills/            # Skill 经验库（agent 编译时直接读磁盘；git 跟踪，DB 为备份）
+├── artifacts/         # 编译产物与日志（按 task_id/ 归档，运行数据不入 git）
+├── docs/              # API 文档、教程、变更记录
 └── project-spec.md    # 项目契约文件
 ```
 
-## 快速开始（生产部署 / 新机器）
+## 快速开始（新环境部署）
 
-非容器化部署，使用 `setup.sh` 一键安装启动。
+非容器化部署，`setup.sh` 一条命令装好。**唯一必填**：AI key（agent 编译靠它）。
 
 ```bash
 # 1. 克隆
-git clone <repo-url> compile-platform
-cd compile-platform
+git clone <repo-url> compile-platform && cd compile-platform
 
-# 2. 一键安装（首次：装 PG、建库表、装 Python/前端依赖、初始化 admin 账号）
-bash setup.sh install
-# 期间会提示编辑 backend/.env.compile，填 AI_API_KEY / AI_BASE_URL / AI_MODEL
-# （AI key 必填，否则 agent 编译时调用 LLM 会失败）
+# 2. 一键安装：装 PG → 建库建用户 → 复制 .env → 建表+种子数据 → 装前后端依赖 → 启动
+#    管理员密码必须在初始化时显式给出（不再默认 admin123）：
+ADMIN_INIT_PASSWORD='***' bash setup.sh install
+#    （不带该变量且在交互终端下运行会提示输入两次；非交互环境直接 fail-fast）
 
-# 3. 启动
-bash setup.sh start
+# 3. 编辑 backend/.env.compile 填 AI key（install 过程中会提示）
+#    AI_API_KEY / AI_BASE_URL / AI_MODEL —— 模板见 .env.compile.example
 
 # 4. 访问
-#   前端：http://<host>:3000/
-#   API:  http://<host>:8000/docs
-#   默认账号：admin / admin123
+#    前端 http://<host>:3000/    API http://<host>:8000/docs
 ```
 
-`setup.sh` 子命令：
+**编译沙箱前置**：stage3 需要龙芯构建镜像。`loongnix-build:23.2` 为自制镜像（无公共源，需 `docker load` 迁移包或按镜像文档重建）；openEuler 系镜像走 lcr.loongnix.cn 公共 pull。新环境先 `docker images` 确认，缺镜像时任务会失败在阶段 3。
+
+## setup.sh 子命令
 
 | 命令 | 作用 |
 |---|---|
-| `install` | 一次性环境准备：装 PG / 建库 / 装依赖 / 建表 / 默认 admin 账号 |
-| `init` | 仅"建表 + 默认 admin 账号"，便于重置 |
-| `start` | 启动后端 + 前端（不初始化） |
-| `stop` | 按端口探活后停掉 |
-| `restart` | stop + start |
-| `status` | 探活报告实际运行情况 |
+| `install` | 一次性环境准备：装 PG / 建库 / 依赖 / 建表 / admin 账号 / 启动 |
+| `init` | 建表+幂等迁移+种子数据+admin（走完整 `init_db()` 迁移链；需 `ADMIN_INIT_PASSWORD`） |
+| `start` / `stop` / `restart` / `status` | 服务管理（restart 支持 dev/prod 模式参数） |
+| `uninstall` | 数据级重置：停服务、清平台容器、DROP 库（先 pg_dump 备份）、删 artifacts/logs/cache；镜像/skills/配置保留 |
+| `uninstall --purge` | 全清档：另删自制镜像（单独二次确认）、skills/、.env、dist、node_modules、PG 账号 |
+| `--yes` / `RECONCILE_AUTO=0` | uninstall 免交互 / 对账只报告不自动改库 |
 
 ## 技术栈
 
-- **后端**：FastAPI + SQLAlchemy 2.0 + Pydantic v2
-- **前端**：Vue 3 + Vite + Element Plus + Pinia
-- **数据库**：PostgreSQL（默认）/ SQLite（兜底）
-- **AI**：DeepAgents + langchain（通过 SKILLS_PATHS 路径注入 skill）
-- **编译沙箱**：Docker（`loongnix-build:23.2` 镜像，龙芯专用）
+- **后端**：FastAPI + SQLAlchemy 2.0 + Pydantic v2 + PostgreSQL（`backend/config.yaml`）
+- **前端**：Vue 3 + Vite + Element Plus + Pinia（开发 `vite`，生产 nginx/静态）
+- **AI 引擎**：DeepAgents（langchain），system_prompt 只给元信息、具体知识从 skills 读
+- **编译沙箱**：Docker 容器（loongnix-build:23.2 / openEuler 镜像），worker 线程池进程内执行
+- **思考型模型适配**：reasoning 计入 max_completion_tokens（草稿生成 65536、工单总结 2048、2048 会 content 空）
 
-## 关键路径
+## 核心机制（速览）
 
-- `backend/.env.compile`：**不入 git**，含 AI key / Docker 镜像 / DB 配置。首次安装由 setup.sh 从 `.env.compile.example` 复制
-- `backend/.env.compile.example`：模板文件，**入 git**
-- `skills/`：OpenClaw 经验库，agent 编译时直接读磁盘
-- `artifacts/`：编译产物，按 `task_id/` 归档
-- `logs/`：后端 + 前端运行日志 + PID 文件
-
-## Skill 经验库管理
-
-`skills/` 目录是 agent 编译时**唯一**读取的来源。管理员通过 `SkillLib` 页面（`/admin/SkillLib`）管理：
-
-- **新增 / 编辑 / 删除** Skill：写盘 + 同步 DB
-- **磁盘 → DB 自动同步**：每次进入 SkillLib 页面自动触发 reconcile
-- **误删容错**：删除的 skill 进 DB 回收站，可恢复或永久删除
-- 详细设计见 `skills/README.md`
+- **编译流水线**：阶段1 初始化 → 2 环境 → 3 建容器 → 4a 拉源码 → 4 就绪 → 5 DeepAgents 执行（硬闸：时长 STAGE5_MAX_SECONDS=3h / chunk 500 / 连续快速失败）→ 6 归档清理
+- **心跳与看门狗**：每任务 60s 心跳线程刷 updated_at；worker 真死（心跳停 >30min）才由看门狗回收——长静默命令（pip 源码编译、submodule）不再被误杀
+- **BUILD_NOTES 制度**：agent 强制维护编译现场记录（开工建骨架/分段更新/成败收尾），stage6 落定 `artifacts/<task_id>/BUILD_NOTES.md`；成功喂经验流、失败喂工单流
+- **统一终态写入器**（task_writer）：核心状态与日志分块提交、NUL/非法字符净化、失败落 `.persist_error` 哨兵 + WS 告警 + stats 计数
+- **对账自愈**（task_reconciler）：每小时扫冻结任务，有成功现场证据自动恢复并留审计；无证据不动
+- **经验闭环**：工单 resolve → 攻略草稿（preview-job 异步轮询）→ 审批页预览可编辑 → 通过写 Skill 表 + 落盘 `skills/`（stage5 读磁盘生效）
+- **Skill 命中收口**：agent 读过的 SKILL.md 记入 `matched_skills` 列 + WS 事件 + build.log 收口行
+- **自助注册默认关闭**：账号由管理员在用户管理页创建（`ALLOW_SELF_REGISTER=1` 可开）
 
 ## 文档
 
 - [API 接口文档](docs/api.md)
-- [数据库 DDL](docs/sql/schema.sql)
-- [项目契约](project-spec.md)
-- [变更记录](docs/changelog.md)
-- [开发排期](docs/roadmap.md)
+- [入门教程](docs/TUTORIAL.md) ｜ [测试指南](docs/test-guide.md)
+- [变更记录](docs/changelog.md) ｜ [项目契约](project-spec.md)
+- Skill 库说明：`skills/README.md`
 
 ## 开发规范
 
-详细开发规范请参考 `project-spec.md` 和 `.hermes/skills/` 目录下的技能文件。
+详细规范见 `project-spec.md`；调试经验与踩坑记录在 Hermes 技能 `compile-platform-debugging`（部署 TODO、BUILD_NOTES 设计、账本设计等 references）。

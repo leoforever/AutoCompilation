@@ -1,7 +1,7 @@
 <template>
   <div class="page">
     <div class="page-title">经验库管理</div>
-    <div class="page-sub">在线编辑、新增、禁用 OpenClaw 通用/专用 Skill；支持从磁盘导入与重新同步</div>
+    <div class="page-sub">在线编辑、新增、禁用 通用/专用 Skill；支持从磁盘导入与重新同步</div>
 
     <!-- 统计卡片 -->
     <div class="stats">
