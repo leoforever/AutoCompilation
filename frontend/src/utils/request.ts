@@ -48,7 +48,7 @@ api.interceptors.response.use(
       authStore.logout()
       window.location.href = '/login'
     } else if (!error.response && /ECONNABORTED|ETIMEDOUT|timeout/i.test(error.code || error.message || '')) {
-      ElMessage.error('请求超时：AI 生成较慢，请稍候重试')
+      ElMessage.error('请求超时：服务器可能正忙，请稍后重试')
     } else if (!error.response) {
       ElMessage.error('网络错误：无法连接服务器')
     } else {

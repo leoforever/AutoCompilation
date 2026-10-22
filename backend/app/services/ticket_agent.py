@@ -376,8 +376,12 @@ class TicketAgentManager:
             phase_cb("reuse_container", f"复用容器 {existing_container_id[:12]}")
 
         # 2) 阶段 3：建容器 / 复用
+        # ⚠ 同步重活必须 to_thread：直接 await 调用会在事件循环线程跑 docker/clone，
+        #   冻结全站（2026-10-22 事故：接单 pytorch clone 期间 /api/health 35s 无响应，
+        #   管理页"接单卡住/查看超时"）。编译引擎同款问题当年靠 executor 线程修的，这里对齐。
         phase_cb("create_container", f"启动镜像 {docker_image}...")
-        state = stage3_create_container(state, on_log=log_cb, existing_container_id=existing_container_id)
+        state = await asyncio.to_thread(  # type: ignore[assignment]  # TaskState 运行时=普通 dict（total=False），未声明键透传无碍
+            stage3_create_container, state, on_log=log_cb, existing_container_id=existing_container_id)
         if state.get("status") == "failed":
             raise RuntimeError(f"容器创建失败: {state.get('last_error')}")
         phase_cb("container_ready", f"容器 {state['container_id'][:12]} 已就绪")
@@ -389,7 +393,7 @@ class TicketAgentManager:
         else:
             phase_cb("fetch_source", f"拉取源码 {state.get('git_url') or state.get('source_path')}")
         try:
-            state = stage4a_fetch_source_on_host(state, on_log=log_cb)
+            state = await asyncio.to_thread(stage4a_fetch_source_on_host, state, on_log=log_cb)  # type: ignore[assignment]
         except Exception as e:
             await self._kill_container(state.get("container_id"))
             raise RuntimeError(f"拉源码失败: {e}")
