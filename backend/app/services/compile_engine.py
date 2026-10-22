@@ -614,6 +614,14 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 请执行完整的编译流程：先用 read_file 读 Skills 清单中匹配的 SKILL.md，再按攻略执行。
 完成后输出编译结果摘要（中文，包含"编译成功"或"编译失败"）。
 
+【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
+① 干净环境安装产物（pip install whl / npm i tgz / 二进制 ldd+file 检查，按产物类型）
+② 导入/加载（python -c "import x" / node require / ./bin --version）
+③ 一次最小真实调用出结果（一个 matmul / 一个函数 / 一次请求）
+【禁止】跑上游全量测试套件（pytest 全量 / test_ops / gradcheck / JIT+compile 全家桶 / benchmark）——
+那是 CI 的开发动作，动辄数小时且非验收所需。若攻略里出现"跑完整测试"，只挑上面三件套执行、
+其余跳过并在 BUILD_NOTES 注明"全量测试非验收必需，已按轻量口径"。产物验证通过后立即归档收尾。
+
 【强制】现场记录 BUILD_NOTES.md：
 - 源码就绪后第一件事：read_file 读 /skills/generic/build-notes-standard/SKILL.md，按其模板 write_file 创建 /work/output/BUILD_NOTES.md 骨架（含环境探测结果）
 - 每过一个里程碑（依赖/configure/编译/install/打包/验证）重写补全对应节；每次踩坑换路实时记入"踩坑与修复"
