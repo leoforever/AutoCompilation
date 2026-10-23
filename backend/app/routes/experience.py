@@ -14,8 +14,8 @@ from app.schemas import (
     ExperienceSubmit, ExperienceResponse, SkillCreate, SkillUpdate, SkillResponse,
     ApiResponse
 )
-from app.services.skill_loader import write_skill_to_disk
-from app.dependencies import get_current_user
+from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
+from app.dependencies import get_current_user, require_admin
 import logging
 
 router = APIRouter()
@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 async def submit_experience(
     exp_data: ExperienceSubmit,
     db: Session = Depends(get_db),
-    current_user_id: int = 1  # TODO: 从 session 获取
+    # T9批1: 原 `current_user_id: int = 1` 默认参数——token 被无视，全员经验记在 admin 名下
+    current_user: User = Depends(get_current_user)
 ):
     """提交编译经验"""
     # 验证任务存在
@@ -64,7 +65,7 @@ async def submit_experience(
     # 创建经验记录
     experience = Experience(
         task_id=exp_data.task_id,
-        user_id=current_user_id,
+        user_id=current_user.user_id,
         skill_name=exp_data.skill_name,
         skill_type=exp_data.skill_type,
         system_id=exp_data.system_id,
@@ -85,11 +86,11 @@ async def submit_experience(
 @router.get("/my", response_model=ApiResponse)
 async def list_my_experiences(
     db: Session = Depends(get_db),
-    current_user_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(get_current_user)
 ):
     """获取我的经验提交记录"""
     experiences = db.query(Experience).filter(
-        Experience.user_id == current_user_id
+        Experience.user_id == current_user.user_id
     ).order_by(Experience.submitted_at.desc()).all()
     
     return ApiResponse(data=[
@@ -100,7 +101,8 @@ async def list_my_experiences(
 
 @router.get("/pending", response_model=ApiResponse)
 async def list_pending_experiences(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
 ):
     """获取待审核经验列表（管理员）"""
     experiences = db.query(Experience).filter(
@@ -117,14 +119,14 @@ async def list_pending_experiences(
 async def approve_experience(
     experience_id: int,
     db: Session = Depends(get_db),
-    reviewer_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(require_admin)
 ):
     """通过经验审核
 
-    流程：
-    1. 写 DB（Skill 表）+ 计算 version
-    2. 同步写盘到 skills/<type>/<name>/SKILL.md（SKILLS_DIR_HOST 宿主机目录）
-    3. 写盘失败 → 整个 approve 回滚（DB 也回滚），返回 500
+    T9批1 时序（原"先 commit 再写盘，写盘失败 rollback 是 no-op"= 假回滚，DB/磁盘永久分叉）：
+    1. 快照磁盘旧内容
+    2. 写盘（失败 → DB 尚未 commit，rollback 丢弃全部改动，天然回滚）
+    3. commit DB（失败 → 把磁盘恢复快照/删除新建，防反向不一致）
     """
     experience = db.query(Experience).filter(Experience.experience_id == experience_id).first()
     if not experience:
@@ -146,8 +148,9 @@ async def approve_experience(
 
     experience.status = ExperienceStatus.APPROVED
     experience.reviewed_at = datetime.utcnow()
+    experience.reviewer_id = current_user.user_id
 
-    # 创建或更新 Skill（DB）
+    # 创建或更新 Skill（DB）——全部改动保持未 commit，写盘成功才提交
     skill = db.query(Skill).filter(Skill.name == experience.skill_name).first()
     version = f"v{datetime.now().strftime('%Y%m%d')}"
     if skill:
@@ -165,26 +168,29 @@ async def approve_experience(
         )
         db.add(skill)
 
+    disk_type, disk_name = str(experience.skill_type), str(experience.skill_name)
+    old_disk = read_skill_from_disk(disk_type, disk_name)  # None=磁盘此前无该 skill
+
+    try:
+        write_skill_to_disk(skill_type=disk_type, skill_name=disk_name,
+                            content=str(experience.skill_content or ""), version=version)
+    except (ValueError, RuntimeError) as e:
+        db.rollback()  # 此刻事务尚未 commit——真回滚（supersede/APPROVED/Skill 行全部丢弃）
+        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（DB 已回滚）: {e}")
+
     try:
         db.commit()
     except Exception as e:
         db.rollback()
+        # commit 炸了盘已写——尽力恢复快照（失败只告警，磁盘新内容无害于 stage5）
+        try:
+            if old_disk is None:
+                remove_skill_from_disk(disk_type, disk_name)
+            else:
+                write_skill_to_disk(disk_type, disk_name, old_disk)
+        except Exception as de:
+            logger.error("[approve] commit 失败后磁盘恢复也失败: %s", de)
         raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
-
-    # 同步写盘（这步失败要回滚 DB，避免 DB 与磁盘不一致）
-    try:
-        write_skill_to_disk(
-            skill_type=str(experience.skill_type),
-            skill_name=str(experience.skill_name),
-            content=str(experience.skill_content or ""),
-            version=version,
-        )
-    except (ValueError, RuntimeError) as e:
-        # 写盘失败 → 把 DB 改回原状
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（已回滚 DB）: {e}")
-
-    db.commit()
 
     return ApiResponse(message="经验已通过审核，SKILL.md 已同步到磁盘")
 
@@ -194,7 +200,7 @@ async def reject_experience(
     experience_id: int,
     reason: Optional[str] = None,
     db: Session = Depends(get_db),
-    reviewer_id: int = 1  # TODO: 从 session 获取
+    current_user: User = Depends(require_admin)
 ):
     """驳回经验审核"""
     experience = db.query(Experience).filter(Experience.experience_id == experience_id).first()
@@ -204,6 +210,7 @@ async def reject_experience(
     experience.status = ExperienceStatus.REJECTED
     experience.rejection_reason = reason
     experience.reviewed_at = datetime.utcnow()
+    experience.reviewer_id = current_user.user_id
 
     db.commit()
 

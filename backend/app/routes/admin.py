@@ -19,7 +19,7 @@ from app.schemas import (
     StatsOverview, ApiResponse
 )
 from app.dependencies import get_current_user
-from app.services.skill_loader import write_skill_to_disk, remove_skill_from_disk
+from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
 import logging
 
 router = APIRouter()
@@ -633,13 +633,8 @@ async def create_skill(
         source="admin",  # 管理页面创建
     )
     db.add(skill)
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
-
-    # 同步写盘
+    # T9批1: 先写盘后 commit（原时序"commit→写盘失败 rollback=no-op"是假回滚）。
+    # 新建场景磁盘原无此 skill（name 唯一约束+前面 400 挡过），写盘失败 DB 回滚即全净
     try:
         write_skill_to_disk(
             skill_type=str(skill_data.type),
@@ -649,9 +644,16 @@ async def create_skill(
         )
     except (ValueError, RuntimeError) as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（已回滚 DB）: {e}")
-
-    db.commit()
+        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（DB 已回滚）: {e}")
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        try:
+            remove_skill_from_disk(str(skill_data.type), str(skill_data.name))  # 反向：盘已写 DB 未落
+        except Exception as de:
+            import logging as _lg; _lg.getLogger(__name__).error("[create_skill] 盘回滚失败: %s", de)
+        raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
     db.refresh(skill)
 
     return ApiResponse(data=SkillResponse.model_validate(skill).model_dump())
@@ -692,23 +694,10 @@ async def update_skill(
     if skill_data.skill_content:
         skill.skill_content = skill_data.skill_content
 
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB 更新失败: {e}")
-
-    # 如果改名 → 先清旧目录
     new_name = str(skill.name)
-    if old_name != new_name:
-        try:
-            remove_skill_from_disk(old_type, old_name)
-        except RuntimeError as e:
-            # 旧目录清不掉不致命，记录即可
-            import logging
-            logging.warning("改名时清旧目录失败: %s", e)
-
-    # 同步写盘（disk 上的 type 始终是当前 DB 的 type — SkillUpdate 不允许改 type）
+    # T9批1: 时序=快照旧盘→写新盘→commit→成功后才删旧目录。
+    # 原时序两处坑：commit 后写盘失败"回滚"是 no-op；改名先删旧目录、新盘再写失败=旧盘已毁 DB 未提交
+    old_disk = read_skill_from_disk(old_type, old_name) if old_name == new_name else None
     try:
         write_skill_to_disk(
             skill_type=old_type,
@@ -718,9 +707,28 @@ async def update_skill(
         )
     except (ValueError, RuntimeError) as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（已回滚 DB）: {e}")
+        raise HTTPException(status_code=500, detail=f"SKILL.md 写盘失败（DB 已回滚）: {e}")
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        try:
+            if old_name != new_name:
+                remove_skill_from_disk(old_type, new_name)   # 新建的撤掉，旧目录本就未动
+            elif old_disk is not None:
+                write_skill_to_disk(old_type, old_name, old_disk)  # 恢复快照
+        except Exception as de:
+            import logging as _lg; _lg.getLogger(__name__).error("[update_skill] 盘回滚失败: %s", de)
+        raise HTTPException(status_code=500, detail=f"DB 更新失败: {e}")
 
-    db.commit()
+    # commit 成功后才清旧目录（改名场景；失败不致命——残留旧目录由 sweep/人工清）
+    if old_name != new_name:
+        try:
+            remove_skill_from_disk(old_type, old_name)
+        except RuntimeError as e:
+            import logging
+            logging.warning("改名时清旧目录失败: %s", e)
+
     db.refresh(skill)
 
     return ApiResponse(data=SkillResponse.model_validate(skill).model_dump())

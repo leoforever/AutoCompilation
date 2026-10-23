@@ -116,8 +116,6 @@ def write_skill_to_disk(skill_type: str, skill_name: str, content: str,
     - 失败时抛 RuntimeError（含原始错误）
     """
     skill_dir = _resolve_skill_dir(skill_type, skill_name)
-    skill_dir.mkdir(parents=True, exist_ok=True)
-
     target = skill_dir / "SKILL.md"
     tmp = skill_dir / "SKILL.md.tmp"
 
@@ -128,6 +126,8 @@ def write_skill_to_disk(skill_type: str, skill_name: str, content: str,
     # version 信息从 DB skills.version 字段查；如要写到文件，append 到 frontmatter 内
 
     try:
+        # mkdir 纳入 try：目标路径被普通文件占据时 FileExistsError(OSError) 也走统一 RuntimeError
+        skill_dir.mkdir(parents=True, exist_ok=True)
         tmp.write_text(body, encoding="utf-8")
         os.replace(tmp, target)
     except Exception as e:
@@ -139,6 +139,15 @@ def write_skill_to_disk(skill_type: str, skill_name: str, content: str,
             pass
         raise RuntimeError(f"写 SKILL.md 失败 ({skill_dir}): {type(e).__name__}: {e}") from e
     return target
+
+
+def read_skill_from_disk(skill_type: str, skill_name: str) -> "str | None":
+    """T9批1: 写盘前快照旧内容，供 commit 失败时恢复（None=此前不存在）。"""
+    try:
+        p = _resolve_skill_dir(skill_type, skill_name) / "SKILL.md"
+        return p.read_text(encoding="utf-8") if p.exists() else None
+    except Exception:
+        return None
 
 
 def remove_skill_from_disk(skill_type: str, skill_name: str) -> bool:

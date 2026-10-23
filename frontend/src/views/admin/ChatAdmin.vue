@@ -20,7 +20,7 @@
             <div class="who">
               {{ msg.role === 'admin' ? '我（管理员）' : '用户' }} {{ formatDate(msg.created_at) }}
             </div>
-            <div class="content" v-html="msg.content"></div>
+            <div class="content">{{ msg.content }}</div><!-- T9批1: v-html 渲染用户上报内容=存储型XSS，消息本就是纯文本 -->
           </div>
         </div>
 
@@ -122,7 +122,8 @@ onMounted(loadMessages)
 .msg.admin { align-self: flex-end; background: var(--primary); color: #fff; border-bottom-right-radius: 4px }
 .msg.user { align-self: flex-start; background: #f1f5f9; color: var(--text); border-bottom-left-radius: 4px }
 .who { font-size: 11px; opacity: 0.7; margin-bottom: 3px }
-.content { line-height: 1.6 }
+.content {
+  white-space: pre-wrap; word-break: break-word; line-height: 1.6 }
 .content code { background: rgba(0,0,0,0.1); padding: 2px 6px; border-radius: 4px; font-size: 12px }
 .ticket-detail { font-size: 13px; line-height: 2 }
 .ticket-detail code { background: #f0f1f3; padding: 1px 6px; border-radius: 4px; font-size: 12px; font-family: monospace; color: #c7254e }
