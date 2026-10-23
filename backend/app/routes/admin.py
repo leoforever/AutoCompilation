@@ -1332,6 +1332,24 @@ async def get_agent_last_response(
 
 
 # ============== 工单 Agent 多轮对话（admin 跟 agent 聊）=============
+def _b3_stamp_ts(new_msgs: list, old_json: str | None) -> None:
+    """T9-U 2026-10-23: B3 每条消息补 ts（ISO）。B3 每轮全量重建 state 消息，
+    老消息必须继承上一版里同位置的 ts（首见时刻才可信）；新出现的打当前时刻。"""
+    from datetime import datetime as _dt
+    old_list = []
+    try:
+        import json as _j
+        old_list = _j.loads(old_json) if old_json else []
+    except Exception:
+        old_list = []
+    now_iso = _dt.now().isoformat()
+    for i, m in enumerate(new_msgs):
+        if i < len(old_list) and old_list[i].get("type") == m.get("type") and old_list[i].get("ts"):
+            m["ts"] = old_list[i]["ts"]        # 同位置同类型=同一条消息，继承首见时刻
+        else:
+            m["ts"] = now_iso                  # 新消息（或历史无 ts 的旧行）打当前时刻
+
+
 @router.get("/tickets/{ticket_id}/agent/messages-history")
 async def get_agent_messages_history(
     ticket_id: int,
@@ -1344,14 +1362,36 @@ async def get_agent_messages_history(
     - messages: list[dict]（type/content/tool_calls/tool_call_id）—— agent/tool 消息
     - source: "db" | "empty"（db 没存历史返空）
     """
-    from app.models import TicketAgent as _TAgent
+    from app.models import TicketAgent as _TAgent, TicketMessage
     import json as _json
     rec = db.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
+
+    # T9-U 存量 ts 回填：整批同 ts（继承机制上线前存的老数据）时，
+    # 给 human 消息补真实时刻（TicketMessage 指令行按内容配对，created_at 权威）。
+    # 数组序本即 langgraph 时序，前端渲染靠序不靠 ts——回填只为时间显示可信。
+    msgs_raw = _json.loads(str(rec.last_messages_json)) if rec and rec.last_messages_json else []
+    if msgs_raw:
+        _tss = [m.get("ts") for m in msgs_raw if m.get("ts")]
+        if _tss and len(set(_tss)) == 1 and len(_tss) == len(msgs_raw):
+            _adm = db.query(TicketMessage).filter(
+                TicketMessage.ticket_id == ticket_id, TicketMessage.role == "admin",
+                TicketMessage.kind == "agent_cmd").order_by(TicketMessage.id).all()
+            _used = set()
+            for _m in msgs_raw:
+                if _m.get("type") != "human":
+                    continue
+                _c = (_m.get("content") or "").strip()[:60]
+                for _a in _adm:
+                    if _a.id in _used:
+                        continue
+                    if (_a.content or "").strip()[:60] == _c:
+                        _m["ts"] = _a.created_at.isoformat() if _a.created_at else _m["ts"]
+                        _used.add(_a.id)
+                        break
     if not rec or not rec.last_messages_json:
         return ApiResponse(data={"messages": [], "source": "empty"})
     try:
-        msgs = _json.loads(str(rec.last_messages_json))
-        return ApiResponse(data={"messages": msgs, "source": "db"})
+        return ApiResponse(data={"messages": msgs_raw, "source": "db"})
     except Exception as e:
         return ApiResponse(data={"messages": [], "source": "parse_error", "error": str(e)})
 
@@ -1575,7 +1615,12 @@ async def post_agent_message(
             if tool_call_id:
                 entry["tool_call_id"] = tool_call_id
             msgs_for_db.append(entry)
-        agent_rec = db.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
+        _oldj = None
+        _rec0 = db.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
+        if _rec0 and _rec0.last_messages_json:
+            _oldj = str(_rec0.last_messages_json)
+        _b3_stamp_ts(msgs_for_db, _oldj)  # T9-U: 交错时间线需要每条带 ts
+        agent_rec = _rec0
         if agent_rec:
             agent_rec.last_messages_json = _json.dumps(msgs_for_db, ensure_ascii=False)
             db.commit()
@@ -1641,6 +1686,7 @@ def _persist_round(ticket_id: int, content: str, full_response: str,
                     msgs_for_db.append(entry)
                 rec = s.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
                 if rec:
+                    _b3_stamp_ts(msgs_for_db, str(rec.last_messages_json) if rec.last_messages_json else None)
                     rec.last_messages_json = json.dumps(msgs_for_db, ensure_ascii=False)
                     _log.info(f"[ticket={ticket_id}] B3: saved {len(msgs_for_db)} msgs to last_messages_json")
         s.add(_AL(

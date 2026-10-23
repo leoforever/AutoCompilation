@@ -232,18 +232,34 @@
             </el-tab-pane>
 
             <el-tab-pane label="Agent 工作台" name="agent" :disabled="!current.agent_session_exists && !current.agent_active">
-              <!-- 对话流 -->
+              <!-- 对话流（T9-U 回合分组：文本=章节头，工具=折叠明细） -->
               <div class="chat" ref="chatScrollRef">
-                <div v-if="!current.messages || current.messages.length === 0" class="chat-empty">
+                <div v-if="chatTurns.length === 0" class="chat-empty">
                   （暂无消息 —— 接单 + Agent 启动后与 agent 多轮对话解决）
                 </div>
-                <div v-for="m in (localChat.length ? localChat : agentFallbackMessages)" :key="m.id" :class="['msg', m.role]">
-                  <div class="msg-who">
-                    <el-tag :type="roleTag(m.role)" size="small">{{ roleLabel(m.role) }}</el-tag>
-                    · {{ m.username || (m.role === 'agent' ? 'Agent' : m.role) }} · {{ formatDate(m.created_at) }}
+                <template v-for="(t, ti) in chatTurns" :key="'turn-' + ti">
+                  <div v-for="m in t.lead" :key="m.id" :class="['msg', m.role]">
+                    <div class="msg-who">
+                      <el-tag :type="roleTag(m.role)" size="small">{{ roleLabel(m.role) }}</el-tag>
+                      · {{ m.username || (m.role === 'agent' ? 'Agent' : m.role) }} · {{ formatDate(m.created_at) }}
+                    </div>
+                    <div class="msg-content">{{ m.content }}</div>
                   </div>
-                  <div class="msg-content">{{ m.content }}</div>
-                </div>
+                  <div v-if="t.tools.length" class="turn-tools">
+                    <div class="turn-tools-head" @click="toggleTurn(ti)">
+                      {{ isOpenTurn(ti) ? '▾' : '▸' }} 🔧 {{ t.tools.length }} 个工具调用{{ isOpenTurn(ti) ? '（点击收起）' : '（点击展开命令与输出）' }}
+                    </div>
+                    <template v-if="isOpenTurn(ti)">
+                      <div v-for="m in t.tools" :key="m.id" :class="['msg', m.role]">
+                        <div class="msg-who">
+                          <el-tag :type="roleTag(m.role)" size="small">{{ roleLabel(m.role) }}</el-tag>
+                          · {{ m.username || 'Agent' }} · {{ formatDate(m.created_at) }}
+                        </div>
+                        <div class="msg-content">{{ m.content }}</div>
+                      </div>
+                    </template>
+                  </div>
+                </template>
                 <div v-if="agentThinking" class="msg agent pending">
                   <div class="msg-who">Agent 思考中…</div>
                   <div class="msg-content">{{ agentThinking }}</div>
@@ -476,61 +492,52 @@ async function openDetail(row: any) {
   const adminHistory = (r.data?.messages || []).filter((m: any) => m.role === 'admin' && m.kind === 'agent_cmd')
   const agentHistoryResp: any = await api.get(`/admin/tickets/${row.ticket_id}/agent/messages-history`).catch(() => ({ data: { messages: [] } }))
   const agentMsgs = (agentHistoryResp.data?.messages || [])
-  // 拼装：最后一条 admin msg 在最前（因为刚发），agent/tool msgs 按时间序
+  // T9-U 2026-10-23 交错时间线：B3 数组本身就是 langgraph state 的自然时序
+  // （human/ai/tool 交错），此前按"来源分块堆"（admin 全顶+agent 全底）失真。
+  // 现在顺序遍历 B3：human→管理员气泡（与 TicketMessage 按内容配对拿权威 created_at），
+  // ai→Agent 气泡，tool_calls→工具气泡（输出按 tcId 合并回调用气泡），ts 缺的旧行继承不上也不乱序。
   const combined: any[] = []
-  // 先把当前 admin 消息列表里已经收到的（from server detail）拼上
-  for (const m of adminHistory) {
-    combined.push({
-      id: `hist-admin-${m.id}`,
-      role: 'admin',
-      content: m.content,
-      username: m.username || '我',
-      created_at: m.created_at,
-    })
-  }
-  // 然后拼 agent/tool 历史
+  const b3HumanKeys = new Set(agentMsgs.filter(m => m.type === 'human').map(m => (m.content || '').slice(0, 80)))
   for (const m of agentMsgs) {
-    if (m.type === 'ai') {
+    if (m.type === 'human') {
+      const adm = adminHistory.find(a => (a.content || '').slice(0, 80) === (m.content || '').slice(0, 80))
+      combined.push({
+        id: `hist-admin-${adm?.id ?? combined.length}`,
+        role: 'admin',
+        content: m.content,
+        username: adm?.username || '我',
+        created_at: adm?.created_at || m.ts || null,  // TicketMessage 时间优先，退回 B3 ts
+      })
+    } else if (m.type === 'ai') {
       if (m.content) {
-        combined.push({
-          id: `hist-agent-${m.tool_call_id || combined.length}`,
-          role: 'agent',
-          content: m.content,
-          username: 'Agent',
-          created_at: new Date().toISOString(),
-        })
+        combined.push({ id: `hist-agent-${m.tool_call_id || combined.length}`, role: 'agent', content: m.content, username: 'Agent', created_at: m.ts || null })
       }
       if (m.tool_calls) {
         for (const tc of m.tool_calls) {
-          // 2026-10-19：tool 气泡用 friendly content（优先 tc.content，否则 [name] args）
           const _tc_content = tc.content || `[${tc.name || '?'}] ${tc.args && Object.keys(tc.args).length ? JSON.stringify(tc.args) : '(无参数)'}`
-          combined.push({
-            id: `hist-tool-${m.tool_call_id || combined.length}-${tc.name}`,
-            tcId: tc.id,  // 2026-10-19：供下面 [result] 关联合并
-            role: 'tool',
-            content: _tc_content,
-            username: 'Agent',
-            created_at: new Date().toISOString(),
-          })
+          combined.push({ id: `hist-tool-${m.tool_call_id || combined.length}-${tc.name}`, tcId: tc.id, role: 'tool', content: _tc_content, username: 'Agent', created_at: m.ts || null })
         }
       }
     } else if (m.type === 'tool') {
-      // 2026-10-19：工具输出能关联到调用气泡就合并（穿插，不独立一条）
       const hit = m.tool_call_id ? combined.find(x => x.tcId === m.tool_call_id) : null
       if (hit) {
         hit.content = `${hit.content}\n↳ ${(m.content || '').slice(0, 1200)}`
       } else {
-        combined.push({
-          id: `hist-toolresult-${m.tool_call_id || combined.length}`,
-          role: 'tool',
-          content: `↳ [${m.name || 'result'}] ${(m.content || '').slice(0, 1200)}`,
-          username: 'Agent',
-          created_at: new Date().toISOString(),
-        })
+        combined.push({ id: `hist-toolresult-${m.tool_call_id || combined.length}`, role: 'tool', content: `↳ [${m.name || 'result'}] ${(m.content || '').slice(0, 1200)}`, username: 'Agent', created_at: m.ts || null })
       }
     }
   }
+  // B3 里没有的指令行（历史裁剪/旧 session）按 created_at 插入正确位置，不整块沉底
+  const strays = adminHistory.filter(a => !b3HumanKeys.has((a.content || '').slice(0, 80)))
+  if (strays.length) {
+    for (const m of strays) {
+      const idx = combined.findIndex(x => x.created_at && new Date(x.created_at) > new Date(m.created_at))
+      const item = { id: `hist-admin-${m.id}`, role: 'admin', content: m.content, username: m.username || '我', created_at: m.created_at }
+      idx === -1 ? combined.push(item) : combined.splice(idx, 0, item)
+    }
+  }
   localChat.value = combined
+  openTurns.value = new Set([Math.max(0, chatTurns.value.length - 1)])  // 最新回合默认展开
   console.log('[B3] openDetail loaded history: admin=', adminHistory.length, 'agent/tool msgs=', agentMsgs.length, 'combined=', combined.length)
   detailVisible.value = true
   // 2026-10-19：滚到聊天最底
@@ -793,6 +800,32 @@ const localChat = ref<any[]>([])
 watch(() => localChat.value.length, () => {
   scrollChatToBottom()
 })
+
+// T9-U 2026-10-23 回合分组渲染：admin/agent 文本 = 章节头（lead），其间的 tool 调用收进
+// 可折叠明细——治"计划长文孤零零压在一堆工具上面"的观感（时序本身是对的，ReAct 就是
+// agent 只在回合首尾说话；缺的是把"这段工具属于哪句话"表达出来）
+const chatTurns = computed(() => {
+  const list = localChat.value.length ? localChat.value : (agentFallbackMessages.value || [])
+  const turns: { lead: any[]; tools: any[] }[] = []
+  let cur: { lead: any[]; tools: any[] } | null = null
+  for (const m of list) {
+    if (m.role === 'admin' || m.role === 'agent') {
+      cur = { lead: [m], tools: [] }
+      turns.push(cur)
+    } else {
+      if (!cur) { cur = { lead: [], tools: [] }; turns.push(cur) }
+      cur.tools.push(m)
+    }
+  }
+  return turns
+})
+const openTurns = ref<Set<number>>(new Set())
+function isOpenTurn(i: number) { return openTurns.value.has(i) }
+function toggleTurn(i: number) {
+  const st = new Set(openTurns.value)
+  st.has(i) ? st.delete(i) : st.add(i)
+  openTurns.value = st
+}
 
 async function sendAgentMessage() {
   if (!newMessage.value.trim() || !current.value) return
@@ -1097,6 +1130,12 @@ onMounted(loadTickets)
 .msg.tool { background: #f4f4f5; align-self: stretch; max-width: 100%; font-size: 12px; color: var(--text3) }
 .msg.system { background: #ecf5ff; align-self: center; max-width: 100%; font-size: 12px; color: var(--primary, #409eff); text-align: center; font-style: italic }
 .msg.pending { opacity: 0.7; font-style: italic }
+.turn-tools-head {
+  font-size: 12px; color: #8a8f98; cursor: pointer; user-select: none;
+  padding: 3px 8px; margin: 4px 0; border-radius: 4px;
+  background: rgba(128, 135, 148, 0.10);
+}
+.turn-tools-head:hover { background: rgba(128, 135, 148, 0.20); }
 .msg-who { font-size: 11px; color: var(--text3); margin-bottom: 4px; display: flex; gap: 6px; align-items: center }
 .msg-content { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.6 }
 .reply { margin-top: 10px }
