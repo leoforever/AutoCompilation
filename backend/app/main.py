@@ -63,7 +63,8 @@ async def lifespan(app: FastAPI):
     import uuid as _uuid
     import os as _os
     # 默认 8：服务器 32 物理核，8 worker × 4 核/worker 正好打满
-    max_workers = int(_os.environ.get("MAX_WORKERS", "8"))
+    from app.config import get_cfg as _get_cfg
+    max_workers = int(_get_cfg("worker.max_workers", 8, env_alias="MAX_WORKERS"))
     if max_workers < 1:
         max_workers = 1
     if max_workers > 32:
@@ -82,6 +83,7 @@ async def lifespan(app: FastAPI):
         return cb
 
     def worker_loop(worker_id: str):
+        _poll_iv = int(_get_cfg("worker.poll_interval", 5))
         """后台线程主循环：dequeue → run_task → publish status"""
         from app.services.ws_broadcaster import BROADCASTER
         from app.services.compile_engine import run_task
@@ -102,13 +104,14 @@ async def lifespan(app: FastAPI):
                     # （T-20261020183119-20EF38 实证：stage5 明明活着，1867s 时被看门狗处死）。
                     # 线程活着 = 任务活着；线程死（进程崩/线程炸）→ 心跳停 → 30min 后看门狗回收，语义回归正确
                     _hb_stop = threading.Event()
-                    def _hb_loop(_tid=task_id, _stop=_hb_stop):
-                        while not _stop.wait(60):
+                    _hb_iv = int(_get_cfg("worker.heartbeat_interval", 60))
+                    def _hb_loop(_tid=task_id, _stop=_hb_stop, _iv=None):
+                        while not _stop.wait(_iv):
                             try:
                                 task_queue.heartbeat(_tid)
                             except Exception:
                                 pass  # 单次心跳失败不影响（下次再来）
-                    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+                    _hb_thread = threading.Thread(target=_hb_loop, kwargs={"_iv": _hb_iv}, daemon=True)
                     _hb_thread.start()
                     try:
                         result = run_task(task_id, on_log=on_log)
@@ -121,10 +124,10 @@ async def lifespan(app: FastAPI):
                     })
                     logger.info(f"[lifespan] worker {worker_id} 任务 {task_id} 完成: {result.get('status')}")
 
-                stop_event.wait(timeout=5)
+                stop_event.wait(timeout=_poll_iv)
             except Exception as e:
                 logger.exception(f"[lifespan] worker {worker_id} 异常: {e}")
-                stop_event.wait(timeout=5)
+                stop_event.wait(timeout=_poll_iv)
         logger.info(f"[lifespan] worker {worker_id} 退出")
 
     # 启动 worker 线程池
@@ -172,7 +175,7 @@ async def lifespan(app: FastAPI):
                     _PREVIEW_JOBS.pop(k, None)
             except Exception:
                 pass
-            await asyncio.sleep(3600)
+            await asyncio.sleep(int(_get_cfg("worker.sweep_interval", 3600)))
 
     _sweep_task = asyncio.create_task(_sweep_loop())
 

@@ -1,41 +1,47 @@
-# 编译平台配置文件
-# 数据库配置
+# 编译平台配置（权威层；.env.compile 同名 env > 本文件 > 代码默认）
+
 database:
-  type: postgresql  # postgresql | sqlite
-  # PostgreSQL 配置
+  type: postgresql            # postgresql | sqlite
   postgresql:
     host: localhost
     port: 5432
     username: compile_user
     password: compile123
     database: compile_platform
-  # SQLite 配置（仅当 type: sqlite 时生效）
   sqlite:
-    path: ./cache/compile_platform.db
+    path: ./cache/compile_platform.db   # 仅 type=sqlite 时生效
 
-# JWT 配置
 jwt:
-  secret_key: "loongarch-compile-platform-secret-2026"
+  secret_key: "loongarch-compile-platform-secret-2026"  # JWT 签名密钥（生产须换强随机串）
   algorithm: HS256
-  expire_minutes: 1440  # 24小时
+  expire_minutes: 1440        # 令牌有效期（24 小时）
 
-# 编译引擎配置
 compile:
-  timeout: 3600        # 编译超时（秒）
-  max_concurrent: 10   # 最大并发任务数
-  artifact_dir: ./artifacts
+  max_retries: 4              # 编译失败重试上限
+  artifact_dir: ./artifacts   # 产物根目录，相对仓库根解析
 
-# 阶段5 / 单条 docker exec 超时（可被 .env.compile 里的同名 env 覆盖）
-# STAGE5_MAX_SECONDS: 整个 stage5 阶段硬上限（默认 1800 = 30 分钟）
-# DOCKER_EXEC_TIMEOUT: 单条 execute 命令 timeout（默认 3600 = 1 小时）
-stage5:
-  max_seconds: 3600    # 整个 stage5 阶段硬上限（秒）
-  loop_threshold: 5    # 死循环检测：连续快速失败次数
-  loop_window: 5       # 死循环检测：单次失败间隔窗口（秒）
+worker:                       # 生产主路径 = main.py lifespan worker
+  max_workers: 8              # 任务并发数（每 worker 限 32/max_workers 核）
+  poll_interval: 5            # 领任务轮询间隔（秒）
+  heartbeat_interval: 60      # 任务心跳写库间隔（秒）
+  heartbeat_timeout: 1800     # 无心跳看门狗：compiling 停更超此值判 worker 死并回收（秒）
+  stale_threshold: 600        # 冻结任务对账阈值（秒）
+  sweep_interval: 3600        # 孤儿容器/任务对账周期（秒）
+
+auth:
+  allow_self_register: false  # 自助注册开关（env ALLOW_SELF_REGISTER=1 可开）
+  reconcile_auto: true        # 对账自愈开关（env RECONCILE_AUTO=0 可关）
+
+stage5:                       # agent 编译阶段闸门
+  max_seconds: 10800          # 阶段总墙钟（秒），勿低于 3600：torch 实测 3064s
+  max_chunks: 500             # 死循环保险：工具调用 chunk 总量上限
+  loop_threshold: 5           # 连续快速失败 N 次判死循环
+  loop_window: 5              # "快速失败"判定窗口（秒）
+  heartbeat_seconds: 30       # 长静默补"仍在跑"日志的间隔（秒）
+
 docker_exec:
-  timeout: 3600        # 单条 docker exec 命令 timeout（秒）
+  timeout: 3600               # 单条容器内命令硬超时（秒），到点 SIGTERM→60s 后 SIGKILL
 
-# 文件上传配置
 upload:
-  max_size: 2147483648  # 2GB
-  upload_dir: ./uploads
+  max_size: 2147483648        # 上传大小上限（2GB）
+  upload_dir: ./uploads       # 上传暂存目录

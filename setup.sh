@@ -162,12 +162,11 @@ do_install() {
             error "缺少 ${ENV_FILE}.example 模板（git 应入库），无法初始化 .env.compile"
         fi
         cp "${ENV_FILE}.example" "$ENV_FILE"
-        info "已从模板创建 $ENV_FILE（AI key / Docker 镜像 / DB 配置都在里面）"
+        info "已从模板创建 $ENV_FILE（AI 三件套必填；运维参数在 config.yaml）"
         warn "请立刻编辑 $ENV_FILE，至少填好以下 3 项："
         warn "  1) AI_API_KEY  —— LLM API 密钥（AI 调用必需）"
         warn "  2) AI_BASE_URL —— LLM API base URL"
         warn "  3) AI_MODEL   —— 模型名"
-        warn "其它项（MAX_WORKERS、STAGE5_MAX_SECONDS 等）有合理默认值，可暂不改"
         if [ -t 0 ]; then
             read -p "编辑好 .env.compile 后按回车继续（Ctrl+C 中止安装）: " _ || true
         else
@@ -175,14 +174,9 @@ do_install() {
         fi
     fi
 
-    # config.yaml 同理：缺则从 .example 复制
+    # config.yaml 随 git 入库（参数无保密性，不再维护 .example 模板）
     if [ ! -f "$CONFIG_FILE" ]; then
-        if [ ! -f "${CONFIG_FILE}.example" ]; then
-            error "缺少 ${CONFIG_FILE}.example 模板（git 应入库），无法初始化 config.yaml"
-        fi
-        cp "${CONFIG_FILE}.example" "$CONFIG_FILE"
-        info "已从模板创建 $CONFIG_FILE（默认配置：PostgreSQL + dev/test 账号）"
-        info "生产部署请手动编辑 $CONFIG_FILE（改 secret_key 等）"
+        error "缺少 $CONFIG_FILE（本应随 git 入库；若被 --purge 删过可 git checkout 恢复）"
     fi
 
     info "检查 PostgreSQL..."

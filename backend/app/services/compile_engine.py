@@ -32,7 +32,7 @@ from typing_extensions import TypedDict
 
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.config import get_cfg, get_settings
 from app.models import CompileTask, TaskStatus, SessionLocal
 from app.services.docker_backend import DockerBackend, get_docker_client
 from app.services.skill_loader import get_skills_paths, SKILLS_DIR_HOST, SKILLS_DIR_CONTAINER
@@ -49,11 +49,10 @@ def _ai_base_url() -> str:
     return os.environ.get("AI_BASE_URL", "")
 
 def _max_retries() -> int:
-    return int(os.environ.get("MAX_RETRIES", "4"))
+    return int(get_cfg("compile.max_retries", 4, env_alias="MAX_RETRIES"))
 
 def _artifacts_dir() -> Path:
-    cfg = get_settings()
-    base = Path(os.environ.get("ARTIFACTS_DIR") or cfg.artifact_dir)
+    base = Path(get_cfg("compile.artifact_dir", get_settings().artifact_dir, env_alias="ARTIFACTS_DIR"))
     if not base.is_absolute():
         # 从本文件位置推断仓库根（services/compile_engine.py → 往上一层到 backend/app/services → 上 2 层到 backend → 上 3 层到仓库根）
         project_root = Path(__file__).resolve().parents[3]
@@ -536,7 +535,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
     # CPU 限速：服务器 32 物理核 → MAX_WORKERS 个 worker 每个限 32/MAX_WORKERS 核
     # 避免 N 个 worker 同时 make -j32 互相抢
     try:
-        _max_workers = int(os.environ.get("MAX_WORKERS", "8"))
+        _max_workers = int(get_cfg("worker.max_workers", 8, env_alias="MAX_WORKERS"))
     except ValueError:
         _max_workers = 8
     _jobs_per_worker = max(2, 32 // max(1, _max_workers))
@@ -643,22 +642,22 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         # 默认 200 chunk / 30 分钟（ollama cmake --build 要 15+ 分钟，10 分钟不够）
         # 死循环启发式：连续 5 次快速 execute 失败 → 强退（区别真编译 vs 死循环）
         try:
-            _max_chunks = int(os.environ.get("STAGE5_MAX_CHUNKS", "500"))
+            _max_chunks = int(get_cfg("stage5.max_chunks", 500))
         except ValueError:
             _max_chunks = 500
         try:
-            _max_seconds = int(os.environ.get("STAGE5_MAX_SECONDS", "10800"))  # 3 小时
+            _max_seconds = int(get_cfg("stage5.max_seconds", 10800))  # 3 小时
             # 2026-10-20：1800→10800。教训：torch 源码编译 ninja 一步就 ~30min+，
             # 任务 233 被 1800s 一刀切打死（"超时 2292s"非编译失败）；
             # 死循环仍由 chunk 上限 + 连续快速失败启发式兜底
         except ValueError:
             _max_seconds = 10800
         try:
-            _loop_threshold = int(os.environ.get("STAGE5_LOOP_THRESHOLD", "5"))  # 连续快速失败次数
+            _loop_threshold = int(get_cfg("stage5.loop_threshold", 5))  # 连续快速失败次数
         except ValueError:
             _loop_threshold = 5
         try:
-            _loop_window = float(os.environ.get("STAGE5_LOOP_WINDOW", "5"))  # 快速判定窗口（秒）
+            _loop_window = float(get_cfg("stage5.loop_window", 5))  # 快速判定窗口（秒）
         except ValueError:
             _loop_window = 5.0
 
@@ -668,7 +667,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         chunk_count = 0
         # 长命令心跳：chunk 间隔 > gap 秒时补一行"仍在跑"（现在 pip install 300s 期间日志静默像卡死）
         try:
-            _hb_gap = float(os.environ.get("STAGE5_HEARTBEAT_SECONDS", "30"))
+            _hb_gap = float(get_cfg("stage5.heartbeat_seconds", 30))
         except ValueError:
             _hb_gap = 30.0
         _last_chunk_ts = start_ts

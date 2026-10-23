@@ -2,7 +2,6 @@
 Database models for LoongArch Compile Platform
 """
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -54,7 +53,9 @@ def load_db_config():
         raise ValueError(f"不支持的数据库类型: {db_type}")
 
 db_cfg = load_db_config()
-engine = create_engine(db_cfg['url'], **(db_cfg.get('extra', {})))
+# 审查 #15 修复（2026-10-23 配置链落地顺带）：旧版只展开 db_cfg.get('extra')（恒不存在）
+# → pool_pre_ping/pool_recycle/check_same_thread 静默蒸发，PG 重启后死连接打 500
+engine = create_engine(db_cfg['url'], **{k: v for k, v in db_cfg.items() if k != 'url'})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

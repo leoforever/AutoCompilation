@@ -22,7 +22,9 @@ settings = get_settings()
 @router.post("/register", response_model=ApiResponse)
 async def register(user_data: UserCreate, db: Session = Depends(get_db)):
     """用户注册 — 默认关闭（ALLOW_SELF_REGISTER=1 才开放），账号由管理员在用户管理页创建"""
-    if os.environ.get("ALLOW_SELF_REGISTER", "0") != "1":
+    from app.config import get_cfg as _gcfg
+    _allow = _gcfg("auth.allow_self_register", False, env_alias="ALLOW_SELF_REGISTER")
+    if not _allow:  # env=1/true 或 yaml true 才开放
         raise HTTPException(status_code=403, detail="暂不开放自助注册，请联系管理员创建账号")
     existing = db.query(User).filter(User.username == user_data.username).first()
     if existing:

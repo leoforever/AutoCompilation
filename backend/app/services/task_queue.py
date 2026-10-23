@@ -22,7 +22,9 @@ from app.models import CompileTask, TaskStatus, SessionLocal
 # 任务心跳超时（秒）
 # 多 worker 并发下，单 worker 跑大编译时不会主动发心跳，所以放宽到 30 分钟。
 # 真正死掉的 worker 留下的任务，由"超时未心跳的 compiling 也可抢"分支回收。
-HEARTBEAT_TIMEOUT = 1800
+from app.config import get_cfg as _get_cfg
+# 2026-10-23 配置链修通：env WORKER_HEARTBEAT_TIMEOUT / WORKER_HEARTBEAT_SECONDS > yaml worker.heartbeat_timeout > 1800
+HEARTBEAT_TIMEOUT = _get_cfg("worker.heartbeat_timeout", 1800, env_alias=["WORKER_HEARTBEAT_TIMEOUT", "WORKER_HEARTBEAT_SECONDS"])
 
 
 def enqueue(task_id: str) -> bool:

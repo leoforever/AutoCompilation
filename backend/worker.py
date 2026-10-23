@@ -42,12 +42,6 @@ POLL_INTERVAL = 5  # 秒
 HEARTBEAT_INTERVAL = 60  # 秒
 
 
-# ========== 配置 ==========
-WORKER_ID = f"worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
-POLL_INTERVAL = 5  # 秒
-HEARTBEAT_INTERVAL = 60  # 秒
-
-
 # ========== 日志回调 ==========
 def make_log_callback(task_id: str):
     """worker 内部用的 on_log(level, msg)

@@ -145,7 +145,8 @@ async def upload_and_submit(
 
     # 4. 生成 task_id + 写文件到 artifacts/sources/
     settings = get_settings()
-    artifact_dir = Path(os.environ.get("ARTIFACTS_DIR") or settings.artifact_dir)
+    from app.config import get_cfg as _gcfg2
+    artifact_dir = Path(_gcfg2("compile.artifact_dir", settings.artifact_dir, env_alias="ARTIFACTS_DIR"))
     if not artifact_dir.is_absolute():
         # 相对路径按仓库根解析（routes/compile.py → parents[2]=backend → parents[3]=仓库根），
         # 与 compile_engine._artifacts_dir() 同款，换部署目录不失效（教训：旧版写死绝对路径）
@@ -168,7 +169,8 @@ async def upload_and_submit(
     stored_path = sources_dir / stored_name
 
     # 写文件（限制大小）
-    max_size = int(os.environ.get("UPLOAD_MAX_SIZE", settings.max_upload_size))
+    from app.config import get_cfg
+    max_size = int(get_cfg("upload.max_size", settings.max_upload_size, env_alias="UPLOAD_MAX_SIZE"))
     bytes_written = 0
     try:
         with open(stored_path, "wb") as f:

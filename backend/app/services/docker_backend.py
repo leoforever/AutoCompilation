@@ -54,7 +54,8 @@ class DockerBackend(SandboxBackendProtocol):
         """
         if timeout is None:
             try:
-                timeout = int(os.environ.get("DOCKER_EXEC_TIMEOUT", "3600"))
+                from app.config import get_cfg
+                timeout = int(get_cfg("docker_exec.timeout", 3600))
             except (ValueError, TypeError):
                 timeout = 3600
         # 容器内 coreutils timeout 包裹（timeout -k 60 N cmd：N 秒 SIGTERM、再 60 秒 SIGKILL）。
@@ -102,7 +103,8 @@ class DockerBackend(SandboxBackendProtocol):
     def execute(self, command: str, *, timeout: int | None = None, **kwargs) -> ExecuteResponse:
         # 默认 timeout 由 _exec 内部从环境变量读取（默认 3600s）
         # 调用方传 timeout=None 时直接传 None 给 _exec，让它自己读 env
-        _eff = timeout or int(os.environ.get("DOCKER_EXEC_TIMEOUT", "3600"))
+        from app.config import get_cfg as _gcfg
+        _eff = timeout or int(_gcfg("docker_exec.timeout", 3600))
         output, exit_code = self._exec(command, timeout=timeout)
         # 超时语义统一注释（124/137=容器内 coreutils timeout 杀；-1=socket 兜底）——
         # 归口在 execute()（工具结果构造点）：_exec 两条路径（主/降级）出口都经过这里，

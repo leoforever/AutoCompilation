@@ -17,14 +17,18 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
-STALE_S = 600  # updated_at 冻结阈值（心跳 60s，10 倍余量仍冻=写链断了）
+from app.config import get_cfg as _get_cfg
+STALE_S = _get_cfg("worker.stale_threshold", 600, env_alias="WORKER_STALE_THRESHOLD")  # updated_at 冻结阈值
 SUCCESS_LOG_RE = re.compile(r"结果: success")
 
 last_result: dict = {"checked": 0, "restored": 0, "reported": 0, "at": None}
 
 
 def _auto_enabled() -> bool:
-    return os.environ.get("RECONCILE_AUTO", "1") != "0"
+    v = os.environ.get("RECONCILE_AUTO")
+    if v is not None:
+        return v != "0"
+    return bool(_get_cfg("auth.reconcile_auto", True))
 
 
 def _ws_notify(task_id: str, msg: str) -> None:
