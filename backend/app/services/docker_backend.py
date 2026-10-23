@@ -57,7 +57,11 @@ class DockerBackend(SandboxBackendProtocol):
                 timeout = int(os.environ.get("DOCKER_EXEC_TIMEOUT", "3600"))
             except (ValueError, TypeError):
                 timeout = 3600
-        full_cmd = f"(cd {self.work_dir} 2>/dev/null || true); {command}"
+        # 容器内 coreutils timeout 包裹（timeout -k 60 N cmd：N 秒 SIGTERM、再 60 秒 SIGKILL）。
+        # 教训 59CEF3（2026-10-22/23）：sock.settimeout 只能让"等待"结束，容器内进程照跑——
+        # agent 自写坏 gcc 垫片死循环，两个进程烧 13.6h CPU，socket 超时分支也没触发。
+        # 命令本体必须死在容器内，recv 流才会自然 EOF；外层 socket timeout 降为第二保险。
+        full_cmd = f"(cd {self.work_dir} 2>/dev/null || true); timeout -k 60 {timeout} bash -c {shlex.quote(command)}"
         try:
             exec_id = self.container.client.api.exec_create(
                 self.container.id, ["bash", "-c", full_cmd]
@@ -86,7 +90,7 @@ class DockerBackend(SandboxBackendProtocol):
             inspect = self.container.client.api.exec_inspect(exec_id)
             return output, inspect.get("ExitCode", 0)
         except Exception as e:
-            # 降级路径
+            # 降级路径（full_cmd 已含容器内 timeout，即便走 exec_run 也有硬超时保护）
             try:
                 result = self.container.exec_run(["bash", "-c", full_cmd])
                 raw = result.output
@@ -98,7 +102,15 @@ class DockerBackend(SandboxBackendProtocol):
     def execute(self, command: str, *, timeout: int | None = None, **kwargs) -> ExecuteResponse:
         # 默认 timeout 由 _exec 内部从环境变量读取（默认 3600s）
         # 调用方传 timeout=None 时直接传 None 给 _exec，让它自己读 env
+        _eff = timeout or int(os.environ.get("DOCKER_EXEC_TIMEOUT", "3600"))
         output, exit_code = self._exec(command, timeout=timeout)
+        # 超时语义统一注释（124/137=容器内 coreutils timeout 杀；-1=socket 兜底）——
+        # 归口在 execute()（工具结果构造点）：_exec 两条路径（主/降级）出口都经过这里，
+        # 2026-10-23 验证发现只注主路径会漏（sock 超时抛的异常类型走降级分支）
+        if exit_code in (124, 137, -1):
+            output += (f"\n[硬性超时] 命令运行超过 {_eff}s 已被强制终止(SIGTERM→SIGKILL)。"
+                       "若这是正常长任务：用 nohup 后台化+轮询 marker/日志（勿前台干等）；"
+                       "否则检查命令是否在等输入/死循环——交互式验证必须非交互化。")
         return ExecuteResponse(
             output=output,
             exit_code=exit_code,

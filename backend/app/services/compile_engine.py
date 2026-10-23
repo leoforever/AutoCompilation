@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -625,6 +626,11 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 - 禁止前台直接运行等待输入的程序（交互式 shell / REPL / TUI / 前台服务器）
 - 验证 PTY / 子进程 / 常驻服务类库：用 `timeout 30` 包裹，或"后台起进程 → 断言 → kill"两段式
 - 单条验证命令预期 ≤5 分钟；超了就换非交互写法重试，不要干等（教训：node-pty 任务 pty.spawn bash 裸跑，永不退出挂 2.5h 拖到硬闸）
+【长命令纪律】预期 >5 分钟的命令（源码编译/大下载/工具链自举等）一律后台化执行：
+`nohup bash -c '命令 > /work/build/xxx.log 2>&1; echo $? > /work/build/xxx.rc' &`，
+之后轮询 marker/rc 文件取结果；前台 execute 只跑短命令。
+绝对禁止直接替换或伪造系统工具链（/usr/bin/gcc 等）——工具链问题走攻略/工单，勿自造垫片
+（教训：59CEF3 自写 gcc 垫片死循环，configure 探测永不返回，烧 13.6h CPU 后仍无产物）
 
 【强制】现场记录 BUILD_NOTES.md：
 - 源码就绪后第一件事：read_file 读 /skills/generic/build-notes-standard/SKILL.md，按其模板 write_file 创建 /work/output/BUILD_NOTES.md 骨架（含环境探测结果）
@@ -670,6 +676,29 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         # "快速失败" = 上一条 tool result 距今 < _loop_window 秒 + tool result 内容是 error/traceback
         _recent_fast_fail_count = 0
         _last_tool_ts = start_ts  # 上一条 tool result 的 wall-clock 时间
+        # 墙钟看门狗线程（2026-10-23，审查 #12/#14 家族根治）：原超时检查在 chunk 到达时
+        # 才执行——agent 卡在一条永不返回的命令里就没有 chunk，10800s 硬闸形同虚设
+        # （59CEF3 实锤：卡 make_toolchain 假 gcc 死循环，超时检查饿死 13.6h）。
+        # 到点直接 docker stop：exec socket 断流 → execute 返回错误 → 下一 chunk 命中
+        # _external_terminal 检查强退；顺带消灭失控进程烧 CPU 的资源泄漏。
+        # 宽限 120s：让容器内 timeout（execute 硬超时 A 层）先动作，本线程只兜底。
+        _guard_stop = threading.Event()
+        def _wall_guard(_st=state, _start=start_ts, _limit=_max_seconds + 120, _stop=_guard_stop):
+            while not _stop.wait(60):
+                if _st.get("_stage5_done"):  # 流正常收尾/各 return 前置位，看门狗随之退出
+                    break
+                if time.time() - _start > _limit:
+                    _st["_external_terminal"] = TaskStatus.FAILED.value
+                    _st["_external_error"] = f"stage5 墙钟硬闸（看门狗线程）：超 {_limit}s 且 chunk 流停滞，已强停容器"
+                    _log(_st, "error", f"[阶段5] 墙钟硬闸触发：{int(_limit)}s，docker stop 容器强断（防检查点饿死）", on_log)
+                    try:
+                        _cli = get_docker_client()
+                        if _cli and _st.get("container_id"):
+                            _cli.containers.get(_st["container_id"]).stop(timeout=10)
+                    except Exception as e:
+                        _log(_st, "warn", f"[阶段5] 墙钟硬闸停容器失败: {e}", on_log)
+                    break
+        threading.Thread(target=_wall_guard, daemon=True).start()
         _warned_at_80 = False
         for chunk in agent.stream(
             {"messages": [{"role": "user", "content": task_prompt}]},
@@ -692,6 +721,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                      on_log)
                 state["status"] = TaskStatus.FAILED.value
                 state["last_error"] = f"stage5 超时：chunk 计数 {chunk_count} > {_max_chunks}"
+                state["_stage5_done"] = True
                 return state
             if elapsed > _max_seconds:
                 _log(state, "error",
@@ -699,6 +729,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                      on_log)
                 state["status"] = TaskStatus.FAILED.value
                 state["last_error"] = f"stage5 超时：耗时 {elapsed:.1f}s > {_max_seconds}s"
+                state["_stage5_done"] = True
                 return state
             # 软警告：超过 80% 时限发一条提示（用户能看到"在跑"）
             if not _warned_at_80 and elapsed > _max_seconds * 0.8:
@@ -728,6 +759,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                         state["last_error"] = (
                             f"stage5 死循环：连续 {_loop_threshold} 次快速失败"
                         )
+                        state["_stage5_done"] = True
                         return state
                 else:
                     _recent_fast_fail_count = 0
@@ -739,12 +771,14 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                      on_log)
                 state["status"] = state["_external_terminal"]
                 state["last_error"] = state.get("_external_error") or state["last_error"]
+                state["_stage5_done"] = True
                 return state
 
             for msg in messages[prev_msg_count:]:
                 _render_agent_message(msg, state, start_ts, on_log)
             prev_msg_count = len(messages)
             result = chunk
+        state["_stage5_done"] = True
         if result is None:
             result = {"messages": []}
         final = result["messages"][-1].content if result["messages"] else ""
