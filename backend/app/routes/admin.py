@@ -1512,6 +1512,10 @@ async def post_agent_message(
             raise HTTPException(status_code=400, detail="agent 现场恢复中（后端重启过，自动重建约 30-90 秒），请稍候再发消息")
         raise HTTPException(status_code=400, detail="agent session 未启动，请先接单")
 
+    # T9-U 停止功能·缺口 B 防御：上一轮仍标记 running（含"停止中"未收敛窗口）→ 拒绝并发开新轮
+    if sess.agent_state.get("_stream_running"):
+        raise HTTPException(status_code=409, detail="上一轮仍在进行或停止收敛中，请稍候再发（或点『停止』）")
+    sess.stop_event.clear()  # 清上一轮停止旗标，防污染本轮
     # 存 admin 消息（用户/管理员互相对话需要持久化；agent 内部消息不存）
     from app.models import TicketMessage
     admin_msg = TicketMessage(
@@ -1541,6 +1545,7 @@ async def post_agent_message(
         sess.agent_state["_stream_running"] = True
         last_msgs = []
         _chunk_n = 0
+        _stopped = [False]
         # A3 2026-10-19：把同步 stream 扔到默认 ThreadPoolExecutor，不阻塞 uvicorn event loop
         # 参考 stage5 在 lifespan 线程池里跑的方式，但工单路径直接用 default executor（独立于 stage5 的 8 worker）
         import asyncio as _asyncio
@@ -1555,6 +1560,9 @@ async def post_agent_message(
                     config=sess.config,  # 用 session 的 thread_id config（多轮累积）
                     stream_mode="values",
                 ):
+                    if sess.stop_event.is_set():
+                        _stopped[0] = True
+                        break
                     _chunk_n += 1
                     msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
                     if msgs:
@@ -1570,9 +1578,15 @@ async def post_agent_message(
             raise  # 让外层 except AssertionError 抓
         except Exception:
             raise
-        print(f"{_marker} <<< agent.stream END chunks={_chunk_n} last_msgs_count={len(last_msgs)} (elapsed={_time.time()-_t0:.2f}s)", flush=True)
+        print(f"{_marker} <<< agent.stream END chunks={_chunk_n} last_msgs_count={len(last_msgs)} (elapsed={_time.time()-_t0:.2f}s) stopped={_stopped[0]}", flush=True)
         # 标记 stream 跑完（_last_response 等取完 last_msgs 再写）
         sess.agent_state["_stream_running"] = False
+        if _stopped[0]:
+            # 缺口 A 收口：停止轮直接转正（纯 list，dict-partial 灰条不会假"进行中"）
+            try:
+                _persist_round(ticket_id, content, "（本轮已被管理员停止；现场与已完成步骤保留）", [], current_user.user_id, stopped=True)
+            except Exception as _pe:
+                print(f"{_marker} persist-after-stop fail: {_pe}", flush=True)
         # 取最后一条 AIMessage 当 agent 响应（不要取 HumanMessage / ToolMessage）
         for m in last_msgs:
             # AIMessage 在 langchain 是 langchain_core.messages.AIMessage
@@ -1728,7 +1742,7 @@ def _b3_partial_snapshot(ticket_id: int, snapshot: dict) -> None:
 
 
 def _persist_round(ticket_id: int, content: str, full_response: str,
-                   tool_calls_log: list, user_id: int) -> None:
+                   tool_calls_log: list, user_id: int, stopped: bool = False) -> None:
     """SSE stream 收尾持久化：checkpoint + agent 历史 + 审计（在 worker 线程调用，
     与 HTTP 连接生死无关 —— 客户端断开也不丢本轮）。失败仅记日志不抛。"""
     from app.models import SessionLocal, TicketAgent as _TAgent, AuditLog as _AL
@@ -1758,7 +1772,7 @@ def _persist_round(ticket_id: int, content: str, full_response: str,
             action="ticket_agent_message_stream",
             target_type="ticket",
             target_id=ticket_id,
-            details=f"stream: {content.strip()[:100]} | tools={len(tool_calls_log)} | len={len(full_response)}",
+            details=f"stream: {content.strip()[:100]} | tools={len(tool_calls_log)} | len={len(full_response)}" + (" | STOPPED-by-admin" if stopped else ""),
         ))
         s.commit()
         _log.info(f"[ticket={ticket_id}] [persist] round saved (checkpoint+B3)")
@@ -1801,6 +1815,10 @@ async def stream_agent_message(
 
     # 2026-10-19：结构化 log（"记录每次发了什么，收了什么"）
     _log.info(f"[ticket={ticket_id}] [admin→agent] user_msg: {content.strip()[:200]!r}")
+    # T9-U 停止功能·缺口 B 防御（SSE 入口同构）
+    if sess.agent_state.get("_stream_running"):
+        raise HTTPException(status_code=409, detail="上一轮仍在进行或停止收敛中，请稍候再发（或点『停止』）")
+    sess.stop_event.clear()
 
     async def event_gen():
         # 1) 存 admin 消息
@@ -1853,6 +1871,9 @@ async def stream_agent_message(
             finish_reason 时兜底 flush（id 缺失/JSON 不完整的也不丢）。
             """
             nonlocal full_response, tool_calls_log, agent_unavailable, _n_llm_chunks
+            # T9-U：SSE 路径此前从不置 _stream_running —— 409 并发防御/停止收敛/abort 轮询
+            # 都以此字段为唯一"在跑"判据，补齐与 /agent/message 路径同构
+            sess.agent_state["_stream_running"] = True
             _tool_count: dict[str, int] = {}  # 限速统计（现在按"真实调用次数"计）
             _n_dropped = 0  # 修 QueueFull：丢的 chunk 数（debug 用）
             _tc_acc: dict = {}        # index → {id, name, args_str}（分块累积）
@@ -1909,12 +1930,17 @@ async def stream_agent_message(
                     "content": f"[{_name or '?'}] {_cmd[:120]}" if _cmd else f"[{_name or '?'}] (无参数)",
                 })
                 _maybe_snapshot()
+            _stopped = [False]  # T9-U 停止功能：admin 点停 → chunk 边界 break
             try:
                 for chunk in sess.agent.stream(
                     {"messages": [{"role": "user", "content": content.strip()}]},
                     config=sess.config,
                     stream_mode="messages",
                 ):
+                    if sess.stop_event.is_set():
+                        _stopped[0] = True
+                        _log.info(f"[ticket={ticket_id}] [STOP] 收到停止信号，break on chunk 边界 (chunks={_n_llm_chunks})")
+                        break
                     _n_llm_chunks += 1
                     if isinstance(chunk, tuple) and len(chunk) >= 1:
                         msg = chunk[0]
@@ -1996,13 +2022,19 @@ async def stream_agent_message(
                 # sentinel：标记流结束
                 # tool 调用统计（哪些调了 N 次）—— 现在是真实次数（之前是碎片次数）
                 _tool_summary = ", ".join(f"{k}×{v}" for k, v in sorted(_tool_count.items(), key=lambda x: -x[1])[:5])
+                sess.agent_state["_stream_running"] = False
+                if _stopped[0]:
+                    _safe_put({"type": "stopped", "message": "已停止（本轮部分内容已保留）"})
+                    if not full_response:
+                        full_response = "（本轮已被管理员停止；已完成的步骤保留在会话现场，收到新指令后从上一完整状态继续）"
                 _safe_put(None)
                 _log.info(f"[ticket={ticket_id}] [stream done] elapsed={time.time()-_t0:.2f}s chunks={_n_llm_chunks} tools={len(tool_calls_log)} [{_tool_summary}] resp_len={len(full_response)} agent_unavailable={agent_unavailable} dropped={_n_dropped}")
                 # 2026-10-20：持久化挪进 worker 线程收尾（原先在 event_gen 协程里，
                 # 客户端断连 → 协程被 cancel → checkpoint/历史不落库，"agent 跑完了但
                 # 回来看不见这轮回复"）。sentinel 先发不卡 UI，DB 写慢无所谓。
                 try:
-                    _persist_round(ticket_id, content, full_response, tool_calls_log, current_user.user_id)
+                    _persist_round(ticket_id, content, full_response, tool_calls_log,
+                                   current_user.user_id, stopped=_stopped[0])
                 except Exception as pe:
                     _log.error(f"[ticket={ticket_id}] persist-round 失败: {type(pe).__name__}: {pe}")
 
@@ -2062,6 +2094,49 @@ async def cleanup_ticket_container(
     ))
     db.commit()
     return ApiResponse(message="容器已清理，磁盘产物保留")
+
+
+@router.post("/tickets/{ticket_id}/agent/stop", response_model=ApiResponse)
+async def stop_agent_round(ticket_id: int, db: Session = Depends(get_db),
+                           current_user: User = Depends(get_current_user)):
+    """T9-U 工单 Agent「停止当前轮」（docs/ticket-agent-stop-design.md 修订版）
+
+    语义：停本轮执行（杀活跃命令+chunk 边界 break），容器/现场/上下文全保留，
+    下条指令从上一完整状态续跑。与 cleanup-container/force-cleanup 三级语义不混。
+    异步收敛：stopping=true 表示信号已发；轮在下一命令返回/下一 chunk 边界停。
+    击杀实现（本日实验两次纠偏）：exec_inspect().Pid 恒 0 宿主击杀不可信 →
+    _exec 注入 HBEXEC_TAG 环境标记，容器内按标记杀进程组（docker_backend.kill_active_execs）。
+    """
+    import threading as _th
+    from app.services.ticket_agent import MANAGER
+    sess = MANAGER.get(ticket_id)
+    if not sess:
+        raise HTTPException(status_code=400, detail="agent session 未启动")
+    if not sess.agent_state.get("_stream_running"):
+        return ApiResponse(message="当前无进行中的轮次", data={"stopping": False})
+    sess.stop_event.set()
+    # 评审精确化2：全量击杀活跃 exec（含"同一命令并发跑两次"的所有分身）
+    try:
+        killed = sess.backend.kill_active_execs(15)  # SIGTERM 进程组
+    except Exception:
+        killed = 0
+    # 60s 升级 SIGKILL：只打仍挂在登记簿上的（已自然返回的 finally 已清账=不碰）
+    def _escalate():
+        try:
+            if getattr(sess.backend, "exec_registry", None):
+                n2 = sess.backend.kill_active_execs(9)
+                if n2:
+                    import logging
+                    logging.getLogger("ticket_agent_stream").info(
+                        f"[ticket={ticket_id}] [STOP] SIGKILL 升级击杀 {n2} 组")
+        except Exception:
+            pass
+    _th.Timer(60, _escalate).start()
+    db.add(AuditLog(user_id=current_user.user_id, action="ticket_agent_stop",
+                    target_type="ticket", target_id=ticket_id,
+                    details=f"stop round; groups_sigterm={killed}"))
+    db.commit()
+    return ApiResponse(data={"stopping": True, "groups_sigterm": killed})
 
 
 @router.post("/tickets/{ticket_id}/agent/force-cleanup", response_model=ApiResponse)

@@ -8,6 +8,8 @@
 - a* async 方法全部 NotImplementedError（同步后端）
 """
 import os
+import uuid
+import time
 import shlex
 import socket as _socket
 
@@ -38,9 +40,12 @@ def get_docker_client():
 class DockerBackend(SandboxBackendProtocol):
     """让 DeepAgent 在 Docker 容器内执行命令和操作文件"""
 
-    def __init__(self, container_id: str, work_dir: str):
+    def __init__(self, container_id: str, work_dir: str, exec_registry: "dict | None" = None):
         self.container_id = container_id
         self.work_dir = work_dir
+        # T9-U 工单停止功能：活跃 exec 登记簿 {exec_id: {"pid","cmd","started"}}（session 注入，
+        # 命令起止进出登记；stop 端点遍历击杀。None=不登记，编译引擎等路径零影响）
+        self.exec_registry = exec_registry
         cli = get_docker_client()
         if cli is None:
             raise RuntimeError("Docker 客户端未连接")
@@ -63,31 +68,35 @@ class DockerBackend(SandboxBackendProtocol):
         # agent 自写坏 gcc 垫片死循环，两个进程烧 13.6h CPU，socket 超时分支也没触发。
         # 命令本体必须死在容器内，recv 流才会自然 EOF；外层 socket timeout 降为第二保险。
         full_cmd = f"(cd {self.work_dir} 2>/dev/null || true); timeout -k 60 {timeout} bash -c {shlex.quote(command)}"
+        _reg = self.exec_registry is not None
+        _tag = uuid.uuid4().hex[:12] if _reg else None
         try:
             exec_id = self.container.client.api.exec_create(
-                self.container.id, ["bash", "-c", full_cmd]
+                self.container.id, ["bash", "-c", full_cmd],
+                environment=[f"HBEXEC_TAG={_tag}"] if _reg else None,
             )["Id"]
-            sock = self.container.client.api.exec_start(exec_id, socket=True)
-            sock.settimeout(timeout)
-            chunks = []
+            # 🔴 2026-10-23 根因修复（90 号工单"同一命令并发跑两次"悬案定罪于此）：
+            # docker-py 7.x 的 exec_start(socket=True) 返回 SocketIO 包装（无 settimeout/recv），
+            # 旧主路径每次于 sock.settimeout 抛 AttributeError → 落降级 exec_run 重跑同一条命令，
+            # 弃用 exec 仍在容器跑完 = 双执行/双倍 CPU/交错写坏文件（sysdeps 事故真凶）。
+            # 改用官方流式 API（stream+demux 生成器）；命令寿命由容器内 timeout 包裹保证，
+            # 客户端不再持 socket 计时。
+            if _reg:
+                self.exec_registry[exec_id] = {"tag": _tag, "cmd": command[:120], "started": time.time()}
             try:
-                while True:
-                    chunk = sock.recv(8192)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            except _socket.timeout:
-                return (
-                    b"".join(chunks).decode("utf-8", errors="replace")
-                    + f"\n[TimeoutError] exec exceeded {timeout}s",
-                    -1,
-                )
+                parts = []
+                for chunk in self.container.client.api.exec_start(
+                    exec_id, stream=True, demux=True
+                ):
+                    out_c, err_c = chunk if isinstance(chunk, tuple) else (chunk, b"")
+                    if out_c:
+                        parts.append(out_c)
+                    if err_c:
+                        parts.append(err_c)
+                output = b"".join(parts).decode("utf-8", errors="replace")
             finally:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            output = b"".join(chunks).decode("utf-8", errors="replace")
+                if _reg:
+                    self.exec_registry.pop(exec_id, None)
             inspect = self.container.client.api.exec_inspect(exec_id)
             return output, inspect.get("ExitCode", 0)
         except Exception as e:
@@ -99,6 +108,33 @@ class DockerBackend(SandboxBackendProtocol):
                 return output, result.exit_code
             except Exception as e2:
                 return f"Error: {type(e).__name__}: {e}; fallback: {type(e2).__name__}: {e2}", -1
+
+    def kill_active_execs(self, sig: int = 15) -> int:
+        """T9-U 停止功能：击杀登记簿内全部活跃命令（容器内进程组级）。
+
+        实现依据（本日实验）：exec_inspect().Pid 在本环境恒 0，宿主侧击杀不可信；
+        改为 _exec 注入 environment=HBEXEC_TAG=<唯一tag>，容器内遍历 /proc/*/environ
+        匹配后 kill -SIG -<pgid>（进程组，timeout/bash/子命令一网打尽，59CEF3 孤儿形态
+        即防）。pgid=1（容器 init）绝对排除。返回击杀的进程组数。"""
+        if not self.exec_registry:
+            return 0
+        tags = [v.get("tag") for v in list(self.exec_registry.values()) if v.get("tag")]
+        if not tags:
+            return 0
+        script = (
+            'mypid=$$; mypg=$(awk \'{print $5}\' /proc/$mypid/stat 2>/dev/null); '
+            'for t in ' + " ".join(tags) + '; do '
+            'for d in /proc/[0-9]*/environ; do '
+            'p=${d#/proc/}; p=${p%/environ}; [ "$p" = "$mypid" ] && continue; '
+            'if tr "\\0" "\\n" < "$d" 2>/dev/null | grep -qx "HBEXEC_TAG=$t"; then '
+            'g=$(awk \'{print $5}\' /proc/$p/stat 2>/dev/null); '
+            '[ -n "$g" ] && [ "$g" != "$mypg" ] && [ "$g" != "1" ] && kill -' + str(sig) + ' -"$g" 2>/dev/null && echo "K $g"; fi; done; done'
+        )
+        try:
+            out = self.container.exec_run(["sh", "-c", script])[1].decode(errors="replace")
+            return out.count("K ")
+        except Exception:
+            return 0
 
     def execute(self, command: str, *, timeout: int | None = None, **kwargs) -> ExecuteResponse:
         # 默认 timeout 由 _exec 内部从环境变量读取（默认 3600s）

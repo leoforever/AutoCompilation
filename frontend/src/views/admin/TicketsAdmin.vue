@@ -277,7 +277,10 @@
                           @keydown.ctrl.enter="sendAgentMessage" />
                 <div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">
                   <el-button type="primary" :loading="sendingAgent" :disabled="!newMessage.trim()" @click="sendAgentMessage">
-                    发送给 Agent
+                    {{ stoppingAgent ? '停止中…' : '发送给 Agent' }}
+                  </el-button>
+                  <el-button v-if="sendingAgent" type="danger" plain :loading="stoppingAgent" @click="stopAgentRound">
+                    ■ 停止
                   </el-button>
                 </div>
               </div>
@@ -410,6 +413,9 @@ const logLoading = ref(false)
 const logExpanded = ref(false)  // 懒加载：默认折叠，点"展开"才发请求
 const agentThinking = ref('')
 const sendingAgent = ref(false)
+// T9-U 停止当前轮：abort 本地 SSE 读流 + "停止中…"态（收敛前禁误发新指令）
+const agentAbort: { ref: AbortController | null } = { ref: null }
+const stoppingAgent = ref(false)
 const counts = reactive({ all: 0, pending: 0, processing: 0, resolved: 0, closed: 0 })
 
 // 解决弹窗
@@ -809,6 +815,34 @@ const localChat = ref<any[]>([])
 
 // 2026-10-19：监听 localChat 长度变化：消息增加自动滚到底
 // 必须在 localChat 声明之后注册 watch（TDZ 错误：Cannot access before initialization）
+function _stopSafetyReset() {
+  // 停止信号是异步收敛（长命令击杀秒级；纯 LLM 调用等本次返回）。
+  // 90s 未等到 stopped/done 事件（如旧后端/事件丢失）→ 复位按钮态，输入框解禁，
+  // 此时若真在跑，后端 409 防御仍在，误发会被拒——安全。
+  window.setTimeout(() => {
+    if (stoppingAgent.value) {
+      stoppingAgent.value = false
+      ElMessage.warning('停止信号已发出，仍在等待本轮收敛（可在时间线观察是否已停）')
+    }
+  }, 90000)
+}
+
+async function stopAgentRound() {
+  // T9-U 停止当前轮：后端置旗标+杀活跃 exec（进程树）→ 轮在下一 chunk/命令返回边界停
+  if (!current.value || stoppingAgent.value) return
+  stoppingAgent.value = true
+  try {
+    await api.post(`/admin/tickets/${current.value.ticket_id}/agent/stop`)
+    _stopSafetyReset()
+  } catch (e: any) {
+    stoppingAgent.value = false
+    ElMessage.error('停止请求失败: ' + (e?.message || ''))
+    return
+  }
+  // "停止中…"保持到 worker 在命令/chunk 边界收敛（SSE 会收到 stopped；长命令击杀后
+  // 秒级返回；纯 LLM 调用中则等本次返回——UI 明示异步语义，不假装瞬时）
+}
+
 watch(() => localChat.value.length, () => {
   scrollChatToBottom()
 })
@@ -900,6 +934,8 @@ async function sendAgentMessage() {
   console.log('[FE] pushed adminMsg', { id: adminMsg.id, localChat_len: localChat.value.length })
   agentThinking.value = '（Agent 思考中…）'
   sendingAgent.value = true
+  const controller = new AbortController()
+  agentAbort.ref = controller
 
   // 2) 2026-10-19：改用 SSE 流式（POST /agent/stream）—— 边想边打字
   // 参考 stage5 编译任务的实时进度推送（§46 + §30 BROADCASTER），但工单走 SSE 不走 WS
@@ -917,12 +953,19 @@ async function sendAgentMessage() {
     const token = localStorage.getItem('token') || ''
     const resp = await fetch(streamURL, {
       method: 'POST',
+      signal: controller.signal,  // T9-U 停止：点"停止"后掐本地读流
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       // body 用 JSON 形式（FastAPI params 也支持 query，这里用 query 更简单）
     })
+    if (resp.status === 409) {
+      // T9-U 缺口 B 防御命中：上一轮停止未收敛
+      const detail = await resp.text().catch(() => '')
+      ElMessage.warning(detail.includes('上一轮') ? '上一轮还在停止收敛中，请稍候再发' : '上一轮仍在进行，请先停止或等待')
+      return
+    }
     if (!resp.ok || !resp.body) {
       throw new Error(`stream HTTP ${resp.status}: ${await resp.text().catch(() => '')}`)
     }
@@ -996,6 +1039,19 @@ async function sendAgentMessage() {
               created_at: new Date().toISOString(),
             })
           }
+        } else if (payload.type === 'stopped') {
+          // T9-U 后端停止收尾事件（转正已由其 finally 完成）——"停止中"至此收敛
+          stoppingAgent.value = false
+          controller.abort()          // 流尾还有 done 事件，本地无需再读
+          sendingAgent.value = false
+          agentThinking.value = ''
+          localChat.value.push({
+            id: Date.now() + Math.random(),
+            role: 'system',
+            content: `⏹ ${payload.message}`,
+            username: 'System',
+            created_at: new Date().toISOString(),
+          })
         } else if (payload.type === 'error') {
           // 错
           localChat.value.push({
@@ -1021,6 +1077,7 @@ async function sendAgentMessage() {
           if (payload.agent_unavailable) {
             ElMessage.warning('agent 工具调用暂时不可用')
           }
+          stoppingAgent.value = false  // 任何 done 均代表轮已终止
         }
         // 滚到底
         scrollChatToBottom()
@@ -1031,9 +1088,13 @@ async function sendAgentMessage() {
   } catch (e: any) {
     console.error('[FE] sendAgentMessage SSE CATCH', e?.message)
     agentThinking.value = ''
-    ElMessage.error(e?.message || '发送失败（流式连接错误）')
+    if (e?.name !== 'AbortError') {  // T9-U：主动停止掐流不当报错
+      ElMessage.error(e?.message || '发送失败（流式连接错误）')
+    }
   } finally {
     sendingAgent.value = false
+    stoppingAgent.value = false
+    agentAbort.ref = null
     // 刷新工单元信息
     try {
       const det: any = await api.get(`/admin/tickets/${ticketId}`)

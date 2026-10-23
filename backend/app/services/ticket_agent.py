@@ -9,6 +9,7 @@ import os
 import asyncio
 import json
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,8 @@ class _Session:
         self.ticket = ticket
         self.created_at = created_at
         self.lock = asyncio.Lock()  # 多轮串行
+        # T9-U 工单停止功能（docs/ticket-agent-stop-design.md）：当前轮停止信号
+        self.stop_event = threading.Event()
         self.config = config or {}  # langgraph thread_id config（多轮累积 key）
         # 2026-10-19 方案 2：工单调试实时阶段提示（轮询用，不靠 callback）
         self.phase_events: list = []  # [{"phase":..., "detail":..., "ts":...}, ...]
@@ -405,6 +408,7 @@ class TicketAgentManager:
         backend = DockerBackend(
             container_id=state["container_id"],
             work_dir=state["container_work_dir"],
+            exec_registry=state.setdefault("_exec_registry", {}),  # T9-U 停止功能：活跃命令登记簿
         )
 
         # 5) 启动 DeepAgent（接单时一次 Skills 注入）
