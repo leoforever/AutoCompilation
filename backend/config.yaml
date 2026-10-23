@@ -38,6 +38,10 @@ stage5:                       # agent 编译阶段闸门
   loop_threshold: 5           # 连续快速失败 N 次判死循环
   loop_window: 5              # "快速失败"判定窗口（秒）
   heartbeat_seconds: 30       # 长静默补"仍在跑"日志的间隔（秒）
+  wrapup_enabled: true           # 收尾闸门开关（false=完全关闭）
+  wrapup_enforce: false          # false=观测模式（只记不拦）；true=超预算拒答 execute
+  post_green_max_seconds: 900    # 全绿后收尾预算（秒）
+  post_green_max_execs: 15       # 全绿后 execute 预算（801346 校准：合法 NOTES 期 14 次）
 
 docker_exec:
   timeout: 3600               # 单条容器内命令硬超时（秒），到点 SIGTERM→60s 后 SIGKILL

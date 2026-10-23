@@ -597,11 +597,28 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
     # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
     _skills_paths = get_skills_paths()
     from deepagents import create_deep_agent
+    # T9-V 收尾闸门（docs/stage5-verify-discipline-v2.md §七 801346 校准）：检测首次验证
+    # 全绿（RESULT pass=N fail=0）后计收尾预算，超限 execute 拒答引导收尾
+    # （wrapup_enforce=false 观测模式只记不拦）。write_file/read 永不拦，NOTES 永远写得动。
+    _gate_on      = bool(get_cfg("stage5.wrapup_enabled", True))
+    _gate_enforce = bool(get_cfg("stage5.wrapup_enforce", False))
+    _gate_seconds = int(get_cfg("stage5.post_green_max_seconds", 900))
+    _gate_execs   = int(get_cfg("stage5.post_green_max_execs", 15))
+    _green_gate = None
+    if _gate_on:
+        try:
+            from app.services.green_gate import GreenGateMiddleware
+            _green_gate = GreenGateMiddleware(state, enforce=_gate_enforce,
+                                              max_seconds=_gate_seconds, max_execs=_gate_execs,
+                                              on_log=on_log)
+        except Exception as _ge:
+            _log(state, "warn", f"[阶段5] GreenGate 初始化失败（闸门关闭，主流程不受影响）: {_ge}", on_log)
     agent = create_deep_agent(
         model=llm,
         system_prompt=system_prompt,
         backend=backend,
         skills=_skills_paths,
+        **({"middleware": [_green_gate]} if _green_gate else {}),
     )
 
     _log(state, "info", f"[阶段5] DeepAgent 启动, skills={len(_skills_paths)}", on_log)
@@ -625,6 +642,23 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 - 禁止前台直接运行等待输入的程序（交互式 shell / REPL / TUI / 前台服务器）
 - 验证 PTY / 子进程 / 常驻服务类库：用 `timeout 30` 包裹，或"后台起进程 → 断言 → kill"两段式
 - 单条验证命令预期 ≤5 分钟；超了就换非交互写法重试，不要干等（教训：node-pty 任务 pty.spawn bash 裸跑，永不退出挂 2.5h 拖到硬闸）
+【验证要"薄"（规则⓪）】每项检查 = 一条自包含命令（timeout 包裹、预期 ≤10 秒），直接跑产物二进制。
+凡需"搭环境才能测"的检查（chroot rootfs、服务树/监督生命周期、网络服务、特殊 pid1/权限路径）——
+默认降级为 NOTES"建议深挖项"，不为其编写测试夹具。例外：服务管理器类产物允许在两三条命令内
+起 svscan+svstat 冒烟监督链，禁止为此新建 chroot/设备节点/PATH 框架。
+（教训 801346：三件套被做成 22 项检查+百行 chroot 夹具，光调夹具就烧 30 分钟。）
+
+【PASS 即终局（硬约束）】
+① 验证脚本必须输出一行机读结果：`RESULT pass=<N> fail=<M>`。首次 fail=0 = 验证通过，
+   立即归档 + 写 BUILD_NOTES 收尾；之后禁止以任何理由重写验证脚本或重跑（包括怀疑测试
+   "不够真"）——有疑义写进 NOTES"已知限制"节。（教训：两次全绿后推翻考卷重做，白烧 6-15min）
+② 出现 FAIL 才允许修复重跑，且 ≤1 轮；第二轮仍 FAIL → 失败项如实记 NOTES，收尾不无限追。
+③ 验证脚本自身报错（夹具/PATH/chroot/envdir 语义类）≠产品缺陷：同一夹具问题最多修 1 次，
+   修不好把该检查项降级为"已知限制"，继续下一项。
+④ 三件套之外的深度测试冲动：写进 NOTES"建议深挖项"（一行一条，带命令示例），本轮不执行。
+⑤ 验证脚本幂等自隔离：临时目录带 $$ 后缀（run-$$），禁止 rm -rf 共享路径。
+⑥ NOTES 验证节 = 三件套逐项结果 + 失败项原文 + 建议深挖项。写全≠测全：没测的写"未验证"即可。
+
 【长命令纪律】预期 >5 分钟的命令（源码编译/大下载/工具链自举等）一律后台化执行：
 `nohup bash -c '命令 > /work/build/xxx.log 2>&1; echo $? > /work/build/xxx.rc' &`，
 之后轮询 marker/rc 文件取结果；前台 execute 只跑短命令。
@@ -745,6 +779,9 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
                 if nm_type != "tool":
                     continue
                 content = nm.content if isinstance(nm.content, str) else str(nm.content or "")
+                # T9-V：同一批 ToolMessage 喂收尾闸门做全绿检测（RESULT 机读行）
+                if _green_gate is not None:
+                    _green_gate.scan_tool_text(content)
                 is_fail = "error:" in content.lower() or "traceback" in content.lower()
                 # 间隔 = 当前 wall-clock - 上一条 tool result 时间
                 gap = now - _last_tool_ts
