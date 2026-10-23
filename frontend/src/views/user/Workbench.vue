@@ -180,6 +180,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 
@@ -366,7 +367,7 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
       return false
     }
     // 未终态：判断是否 stale
-    const updated = t.updated_at ? new Date(t.updated_at).getTime() : 0
+    const updated = t.updated_at ? (parseServerDate(t.updated_at)?.getTime() ?? 0) : 0  // 10-23: naive UTC 补 Z（否则 age 少算 8h → stale 检测失效）
     const ageMs = Date.now() - updated
     const STALE_MS = 10 * 60 * 1000
     if (ageMs > STALE_MS) {

@@ -247,7 +247,7 @@
                   </div>
                   <div v-if="t.tools.length" class="turn-tools">
                     <div class="turn-tools-head" @click="toggleTurn(ti)">
-                      {{ isOpenTurn(ti) ? '▾' : '▸' }} 🔧 {{ t.tools.length }} 个工具调用{{ isOpenTurn(ti) ? '（点击收起）' : '（点击展开命令与输出）' }}
+                      {{ isOpenTurn(ti) ? '▾' : '▸' }} 🔧 {{ t.tools.length }} 个工具调用{{ isOpenTurn(ti) ? '（点击收起）' : '（已收起，点击展开）' }}
                     </div>
                     <template v-if="isOpenTurn(ti)">
                       <div v-for="m in t.tools" :key="m.id" :class="['msg', m.role]">
@@ -263,6 +263,10 @@
                 <div v-if="agentThinking" class="msg agent pending">
                   <div class="msg-who">Agent 思考中…</div>
                   <div class="msg-content">{{ agentThinking }}</div>
+                </div>
+                <div v-if="agentPartial && !agentThinking && current.status === 'processing'" class="msg agent pending">
+                  <div class="msg-who">⏳ 本回合仍在进行中</div>
+                  <div class="msg-content">以下进度为快照（约 20 秒一存，非实时），跑完自动转为完整记录{{ agentPartial.admin_content ? '；本回合指令：「' + agentPartial.admin_content.slice(0, 60) + '」' : '' }}</div>
                 </div>
               </div>
 
@@ -364,6 +368,7 @@
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 
 const tickets = ref<any[]>([])
 const filterStatus = ref<string>('')
@@ -375,6 +380,7 @@ const newMessage = ref('')
 // T8: 双线 tab 状态
 const chatTab = ref<'user' | 'agent'>('user')
 const userReply = ref('')
+const agentPartial = ref<any>(null)  // T9-U 进行中回合快照标记
 const sendingReply = ref(false)
 // tab1 数据源：对话线消息（排除工作台指令 kind=agent_cmd）；历史旧行 kind=chat 自然全含
 const userMessages = computed(() => (current.value?.messages || []).filter((m: any) => (m.kind || 'chat') !== 'agent_cmd'))
@@ -416,7 +422,7 @@ function statusType(status: string) { return { pending: 'warning', processing: '
 function statusText(status: string) { return { pending: '待处理', processing: '处理中', resolved: '已解决', closed: '已关闭' }[status] || status }
 function roleTag(role: string) { return { user: '', admin: 'success', agent: 'warning', tool: 'info', system: '' }[role] || '' }
 function roleLabel(role: string) { return { user: '用户', admin: '管理员', agent: 'Agent', tool: '工具', system: '系统' }[role] || role }
-function formatDate(s: string) { if (!s) return ''; return new Date(s).toLocaleString('zh-CN') }
+function formatDate(s: string) { return fmtDateTime(s) }  // 10-23: naive UTC 补 Z 解析（时区三踩收口）
 
 // 2026-10-19：关闭工单详情抽屉（不删任何数据，只隐藏）
 // 重要：保留 localChat + _phaseLastSeq（Map 持久化跨 stop/start）
@@ -482,8 +488,8 @@ async function openDetail(row: any) {
   fullLog.value = ''
   newMessage.value = ''
   userReply.value = ''
-  // T8: 有工作台会话的工单默认落 tab2（原使用习惯），纯人工单落 tab1
-  chatTab.value = r.data?.agent_session_exists ? 'agent' : 'user'
+  // T9-U 10-23 用户拍板：工单抽屉一律默认落 Agent 工作台（tab1 用户消息一键可达）
+  chatTab.value = 'agent'
   agentThinking.value = ''
   // B3 2026-10-19：admin 抽屉打开时拉 agent 历史 + 拼到 localChat
   // （解决"退出再进 agent 消息丢"问题）
@@ -492,6 +498,8 @@ async function openDetail(row: any) {
   const adminHistory = (r.data?.messages || []).filter((m: any) => m.role === 'admin' && m.kind === 'agent_cmd')
   const agentHistoryResp: any = await api.get(`/admin/tickets/${row.ticket_id}/agent/messages-history`).catch(() => ({ data: { messages: [] } }))
   const agentMsgs = (agentHistoryResp.data?.messages || [])
+  // T9-U 轮中快照：partial 存在=这轮还在跑（DB 里是 ≥20s 节流的进度快照，非最终账）
+  agentPartial.value = agentHistoryResp.data?.partial || null
   // T9-U 2026-10-23 交错时间线：B3 数组本身就是 langgraph state 的自然时序
   // （human/ai/tool 交错），此前按"来源分块堆"（admin 全顶+agent 全底）失真。
   // 现在顺序遍历 B3：human→管理员气泡（与 TicketMessage 按内容配对拿权威 created_at），
@@ -537,7 +545,7 @@ async function openDetail(row: any) {
     }
   }
   localChat.value = combined
-  openTurns.value = new Set([Math.max(0, chatTurns.value.length - 1)])  // 最新回合默认展开
+  collapsedTurns.value = new Set()  // 重开抽屉恢复全展开
   console.log('[B3] openDetail loaded history: admin=', adminHistory.length, 'agent/tool msgs=', agentMsgs.length, 'combined=', combined.length)
   detailVisible.value = true
   // 2026-10-19：滚到聊天最底
@@ -548,6 +556,9 @@ async function openDetail(row: any) {
   // 2026-10-19 方案 2：起 phase 轮询（拉工单调试实时阶段提示）
   // 2026-10-20 修复：仅 processing 工单轮询——pending/resolved/closed 无启动过程，
   // 后端 done=False 永等导致 1.5s/次无限刷屏
+  if (r.data.status === 'processing' && agentPartial.value) {
+    startPartialPolling(row.ticket_id)  // T9-U：这轮在跑，定期重拉 B3 让进度可见
+  }
   if (r.data.status === 'processing') {
     startPhasePolling(row.ticket_id)
   }
@@ -639,6 +650,7 @@ function stopPhasePolling() {
     clearInterval(_phasePollTimer)
     _phasePollTimer = null
   }
+  stopPartialPolling()  // T9-U: partial 刷新随抽屉生命周期
   stopElapsedTimer()  // T8-U: 关抽屉/切工单时启动计时一并停（pollAgentStart 后台循环自会随三出口收敛）
 }
 
@@ -801,6 +813,47 @@ watch(() => localChat.value.length, () => {
   scrollChatToBottom()
 })
 
+let _partialTimer: number | null = null
+function startPartialPolling(ticketId: number) {
+  stopPartialPolling()
+  _partialTimer = window.setInterval(async () => {
+    try {
+      const r: any = await api.get(`/admin/tickets/${ticketId}/agent/messages-history`)
+      const msgs = r.data?.messages || []
+      const part = r.data?.partial || null
+      // 轮询期间用户可能在手动编辑 localChat？——只在内容有增量时整体替换
+      const cur = localChat.value
+      if (msgs.length && (part || cur.length === 0)) {
+        localChat.value = rebuildFromB3(msgs, part)
+      }
+      agentPartial.value = part
+      if (!part) stopPartialPolling()  // 轮末转正，停止刷新
+    } catch { /* 网络抖动下轮再来 */ }
+  }, 15000)
+}
+function stopPartialPolling() {
+  if (_partialTimer) { clearInterval(_partialTimer); _partialTimer = null }
+}
+// 从 B3 消息重建 localChat（与 openDetail 拼装同规则的精简版，供轮询刷新用）
+function rebuildFromB3(agentMsgs: any[], _part: any): any[] {
+  const combined: any[] = []
+  for (const m of agentMsgs) {
+    if (m.type === 'human') {
+      combined.push({ id: `p-admin-${combined.length}`, role: 'admin', content: m.content, username: '我', created_at: m.ts || null })
+    } else if (m.type === 'ai') {
+      if (m.content) combined.push({ id: `p-agent-${combined.length}`, role: 'agent', content: m.content, username: 'Agent', created_at: m.ts || null })
+      for (const tc of (m.tool_calls || [])) {
+        combined.push({ id: `p-tool-${combined.length}-${tc.name}`, tcId: tc.id, role: 'tool', content: `[${tc.name || '?'}]`, username: 'Agent', created_at: m.ts || null })
+      }
+    } else if (m.type === 'tool') {
+      const hit = m.tool_call_id ? combined.find(x => x.tcId === m.tool_call_id) : null
+      if (hit) hit.content = `${hit.content}\n↳ ${(m.content || '').slice(0, 1200)}`
+      else combined.push({ id: `p-tout-${combined.length}`, role: 'tool', content: `↳ [${m.name || 'result'}] ${(m.content || '').slice(0, 1200)}`, username: 'Agent', created_at: m.ts || null })
+    }
+  }
+  return combined
+}
+
 // T9-U 2026-10-23 回合分组渲染：admin/agent 文本 = 章节头（lead），其间的 tool 调用收进
 // 可折叠明细——治"计划长文孤零零压在一堆工具上面"的观感（时序本身是对的，ReAct 就是
 // agent 只在回合首尾说话；缺的是把"这段工具属于哪句话"表达出来）
@@ -819,12 +872,13 @@ const chatTurns = computed(() => {
   }
   return turns
 })
-const openTurns = ref<Set<number>>(new Set())
-function isOpenTurn(i: number) { return openTurns.value.has(i) }
+// T9-U: 默认全展开（读流水不需要逐组点击）；collapsedTurns 记"手动收起"的组，点击切换
+const collapsedTurns = ref<Set<number>>(new Set())
+function isOpenTurn(i: number) { return !collapsedTurns.value.has(i) }
 function toggleTurn(i: number) {
-  const st = new Set(openTurns.value)
+  const st = new Set(collapsedTurns.value)
   st.has(i) ? st.delete(i) : st.add(i)
-  openTurns.value = st
+  collapsedTurns.value = st
 }
 
 async function sendAgentMessage() {

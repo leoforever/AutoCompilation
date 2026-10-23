@@ -194,8 +194,46 @@ def _collect_ticket_evidence(db: Session, ticket: Ticket, task: CompileTask) -> 
     except Exception:
         pass
 
+    # 5) 工单处理现场资产（ticket_agent 容器 bind 挂载 = 宿主机 container_work/，close 也不删）：
+    #    处理期写的验证脚本全文 / .done rc 清单（哪些步骤真过了）/ 工单版 BUILD_NOTES——
+    #    2026-10-23 补口：此前生成器只见对话节选，脚本与验证结论这类"可复跑资产"全部丢失
+    site_bits: list[str] = []
+    try:
+        cw = _artifacts_dir() / f"{task.task_id}-TKT{ticket.ticket_id}" / "container_work"
+        if cw.is_dir():
+            nt = cw / "output" / "BUILD_NOTES.md"
+            if nt.is_file():
+                site_bits.append("### 工单处理记录 BUILD_NOTES（排查实录）\n```\n"
+                                 + nt.read_text(encoding="utf-8", errors="replace")[:6000] + "\n```")
+            _scripts = sorted((list(cw.glob("*.sh")) + list((cw / "output").glob("*.sh")) + list((cw / "build").glob("*.sh"))),
+                              key=lambda f: f.stat().st_mtime, reverse=True)[:2]
+            for f_ in _scripts:
+                try:
+                    txt = f_.read_text(encoding="utf-8", errors="replace")
+                    if len(txt) > 4000:
+                        txt = txt[:4000] + "\n# (截断)"
+                    site_bits.append(f"### 处理期脚本 {f_.name}（可直接复用/改造的验证与构建逻辑）\n```bash\n{txt}\n```")
+                except Exception:
+                    continue
+            done_dir = None
+            for cand in (cw / ".done", cw / "build" / ".done"):  # run.sh 惯例放 build/.done（90 实证）
+                if cand.is_dir():
+                    done_dir = cand
+                    break
+            if done_dir:
+                items = []
+                for d_ in sorted(done_dir.iterdir())[:20]:
+                    try:
+                        items.append(f"{d_.name}=rc{d_.read_text().strip()[:4]}")
+                    except Exception:
+                        items.append(d_.name)
+                if items:
+                    site_bits.append("### 已执行步骤标记（.done tag=rc，rc0=该步验证通过）: " + ", ".join(items))
+    except Exception:
+        pass
+
     return {"trajectory": trajectory, "patches": patches, "error_lines": "\n".join(err_lines),
-            "build_notes": build_notes}
+            "build_notes": build_notes, "site": "\n\n".join(site_bits)}
 
 
 def _extract_resolution_trajectory(db: Session, ticket_id: int) -> str:
@@ -269,6 +307,9 @@ _TICKET_USER_PROMPT = """你是龙芯 LoongArch 编译平台的攻略整理助�
 ## 容器内文件修改记录
 {patches}
 
+## 工单处理现场资产（脚本/验证标记全文——可直接进攻略的可复跑步骤，比对话节选更完整）
+{site}
+
 ## 管理员确认的结论
 {resolution}
 
@@ -329,6 +370,7 @@ def _llm_generate_ticket_draft(db: Session, ticket: Ticket, task: CompileTask, s
         build_notes=(ev.get("build_notes") or "(无现场记录)")[:8000],
         trajectory=trajectory,
         patches=patches_txt,
+        site=ev["site"] or "(处理现场无脚本/notes 资产)",
         resolution=ticket.resolution or "(无)",
     )
 

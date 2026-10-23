@@ -1339,10 +1339,16 @@ def _b3_stamp_ts(new_msgs: list, old_json: str | None) -> None:
     old_list = []
     try:
         import json as _j
-        old_list = _j.loads(old_json) if old_json else []
+        _parsed = _j.loads(old_json) if old_json else []
+        # T9-U: 轮中 partial 快照形状 {"messages":[..], "_partial":..} → 解内层列表再继承
+        if isinstance(_parsed, dict):
+            _parsed = _parsed.get("messages") or []
+        old_list = _parsed if isinstance(_parsed, list) else []
     except Exception:
         old_list = []
-    now_iso = _dt.now().isoformat()
+    # naive UTC 全链纪律（10-23 时区三踩教训）：曾用 _dt.now()（本地+08）打戳，
+    # 与 TicketMessage.created_at(utcnow) 同屏差 8h——工单 87 时间线错乱实锤
+    now_iso = _dt.utcnow().isoformat()
     for i, m in enumerate(new_msgs):
         if i < len(old_list) and old_list[i].get("type") == m.get("type") and old_list[i].get("ts"):
             m["ts"] = old_list[i]["ts"]        # 同位置同类型=同一条消息，继承首见时刻
@@ -1366,32 +1372,60 @@ async def get_agent_messages_history(
     import json as _json
     rec = db.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
 
-    # T9-U 存量 ts 回填：整批同 ts（继承机制上线前存的老数据）时，
-    # 给 human 消息补真实时刻（TicketMessage 指令行按内容配对，created_at 权威）。
-    # 数组序本即 langgraph 时序，前端渲染靠序不靠 ts——回填只为时间显示可信。
+    # T9-U 读时归一（10-23 时区修复）：存量 B3 ts 是 _b3_stamp_ts 用 datetime.now()
+    # （本地 +08）打的，与 created_at(naive UTC) 混源显示差 8h。用 human↔TicketMessage
+    # 配对偏移做系统性探测（6h<off<10h 判为本地戳）：命中则整批平移回 UTC，
+    # human 本身以 created_at 为权威覆盖。不写回 DB——读时纯函数，幂等。
+    # （比"整批同 ts"探测更通用：覆盖每轮增量保存的混合 ts，如工单 87）
+    _partial_info = None
     msgs_raw = _json.loads(str(rec.last_messages_json)) if rec and rec.last_messages_json else []
+    # T9-U 轮中快照形状 {"messages":[...], "_partial":{...}}：拆出进度标记，按列表走归一逻辑
+    if isinstance(msgs_raw, dict):
+        _partial_info = msgs_raw.get("_partial")
+        msgs_raw = msgs_raw.get("messages") or []
+    if not isinstance(msgs_raw, list):
+        msgs_raw = []
     if msgs_raw:
-        _tss = [m.get("ts") for m in msgs_raw if m.get("ts")]
-        if _tss and len(set(_tss)) == 1 and len(_tss) == len(msgs_raw):
-            _adm = db.query(TicketMessage).filter(
-                TicketMessage.ticket_id == ticket_id, TicketMessage.role == "admin",
-                TicketMessage.kind == "agent_cmd").order_by(TicketMessage.id).all()
-            _used = set()
-            for _m in msgs_raw:
-                if _m.get("type") != "human":
+        _adm = db.query(TicketMessage).filter(
+            TicketMessage.ticket_id == ticket_id, TicketMessage.role == "admin",
+            TicketMessage.kind == "agent_cmd").order_by(TicketMessage.id).all()
+        _used, _pair = set(), []
+        for _m in msgs_raw:
+            if _m.get("type") != "human":
+                continue
+            _c = (_m.get("content") or "").strip()[:60]
+            for _a in _adm:
+                if _a.id in _used:
                     continue
-                _c = (_m.get("content") or "").strip()[:60]
-                for _a in _adm:
-                    if _a.id in _used:
-                        continue
-                    if (_a.content or "").strip()[:60] == _c:
-                        _m["ts"] = _a.created_at.isoformat() if _a.created_at else _m["ts"]
-                        _used.add(_a.id)
-                        break
+                if (_a.content or "").strip()[:60] == _c:
+                    _used.add(_a.id)
+                    _pair.append((_m, _a))
+                    break
+        if _pair:
+            from datetime import datetime as _dt2, timedelta as _td
+            _offs = []
+            for _m, _a in _pair:
+                if _m.get("ts") and _a.created_at:
+                    try:
+                        _offs.append(_dt2.fromisoformat(_m["ts"]) - _a.created_at)
+                    except ValueError:
+                        pass
+            _local = [o for o in _offs if _td(hours=6) < o < _td(hours=10)]
+            if _local:
+                _fix = sum(_local, _td()) / len(_local)
+                for _m in msgs_raw:
+                    if _m.get("ts"):
+                        try:
+                            _m["ts"] = (_dt2.fromisoformat(_m["ts"]) - _fix).isoformat()
+                        except ValueError:
+                            pass
+            for _m, _a in _pair:
+                if _a.created_at:
+                    _m["ts"] = _a.created_at.isoformat()  # human 权威时刻
     if not rec or not rec.last_messages_json:
         return ApiResponse(data={"messages": [], "source": "empty"})
     try:
-        return ApiResponse(data={"messages": msgs_raw, "source": "db"})
+        return ApiResponse(data={"messages": msgs_raw, "source": "db", "partial": _partial_info})
     except Exception as e:
         return ApiResponse(data={"messages": [], "source": "parse_error", "error": str(e)})
 
@@ -1644,6 +1678,55 @@ async def post_agent_message(
     )
 
 
+def _b3_serialize_msgs(state_msgs: list) -> list:
+    """langgraph 消息对象 → B3 存储条目（轮末与轮中 partial 快照共用，序列化形状单一权威）"""
+    out = []
+    for m in state_msgs:
+        entry = {"type": getattr(m, "type", None) or "unknown"}
+        c = getattr(m, "content", None)
+        entry["content"] = (c if isinstance(c, str) else str(c or ""))[:4000]
+        tcs = getattr(m, "tool_calls", None)
+        if tcs:
+            entry["tool_calls"] = [
+                {"name": tc.get("name", "?"),
+                 "id": tc.get("id"),
+                 "args": {k: str(v)[:600] for k, v in (tc.get("args") or {}).items()}}
+                for tc in tcs
+            ]
+        tcid = getattr(m, "tool_call_id", None)
+        if tcid:
+            entry["tool_call_id"] = tcid
+        mname = getattr(m, "name", None)
+        if mname:
+            entry["name"] = mname
+        out.append(entry)
+    return out
+
+
+def _b3_partial_snapshot(ticket_id: int, snapshot: dict) -> None:
+    """T9-U 2026-10-23 轮中增量快照：一轮 agent 对话跑到一半时（工具调用/结果每有新增，
+    且距上次 ≥20s）把进度写 last_messages_json——形状 {"messages":[...], "_partial":{...}}，
+    前端识别 _partial 渲染"⏳ 本回合进行中"。轮末 _persist_round 用纯 list 全量覆盖=转正，
+    单字段单权威账。旧读取方遇 dict 形状按空史处理（fail-soft，绝不崩）。
+    动机（用户报）：中途退出重进，这轮在 DB 里完全隐身——B3 只有轮末两个写点，
+    轮中历史只在内存；后端重启则这轮彻底蒸发。"""
+    from app.models import SessionLocal as _SL, TicketAgent as _TA
+    s = _SL()
+    try:
+        rec = s.query(_TA).filter(_TA.ticket_id == ticket_id).first()
+        if rec:
+            rec.last_messages_json = json.dumps(snapshot, ensure_ascii=False)
+            s.commit()
+    except Exception as se:
+        try:
+            s.rollback()
+        except Exception:
+            pass
+        _log.debug("[ticket=%s] partial 快照失败(不影响主流程): %s", ticket_id, se)
+    finally:
+        s.close()
+
+
 def _persist_round(ticket_id: int, content: str, full_response: str,
                    tool_calls_log: list, user_id: int) -> None:
     """SSE stream 收尾持久化：checkpoint + agent 历史 + 审计（在 worker 线程调用，
@@ -1664,26 +1747,7 @@ def _persist_round(ticket_id: int, content: str, full_response: str,
             except Exception as ge:
                 _log.warning(f"[ticket={ticket_id}] get_state for B3 失败: {ge}")
             if state_msgs:
-                msgs_for_db = []
-                for m in state_msgs:
-                    entry = {"type": getattr(m, "type", None) or "unknown"}
-                    c = getattr(m, "content", None)
-                    entry["content"] = (c if isinstance(c, str) else str(c or ""))[:4000]
-                    tcs = getattr(m, "tool_calls", None)
-                    if tcs:
-                        entry["tool_calls"] = [
-                            {"name": tc.get("name", "?"),
-                             "id": tc.get("id"),
-                             "args": {k: str(v)[:600] for k, v in (tc.get("args") or {}).items()}}
-                            for tc in tcs
-                        ]
-                    tcid = getattr(m, "tool_call_id", None)
-                    if tcid:
-                        entry["tool_call_id"] = tcid
-                    mname = getattr(m, "name", None)
-                    if mname:
-                        entry["name"] = mname
-                    msgs_for_db.append(entry)
+                msgs_for_db = _b3_serialize_msgs(state_msgs)
                 rec = s.query(_TAgent).filter(_TAgent.ticket_id == ticket_id).first()
                 if rec:
                     _b3_stamp_ts(msgs_for_db, str(rec.last_messages_json) if rec.last_messages_json else None)
@@ -1794,6 +1858,27 @@ async def stream_agent_message(
             _tc_acc: dict = {}        # index → {id, name, args_str}（分块累积）
             _tc_emitted: set = set()  # 已推过的 tool_call id（去重）
 
+            # T9-U 轮中快照：每有 tool 进展且距上次 ≥20s，把 langgraph state 已成形消息
+            # 以 {"messages":[...], "_partial":{...}} 形状写 B3（轮末 _persist_round 覆盖=转正）。
+            # get_state 只读内存 checkpointer，毫秒级；失败静默（下轮再来）。
+            _snap_ts = [0.0]
+            def _maybe_snapshot():
+                _now = time.time()
+                if _now - _snap_ts[0] < 20:
+                    return
+                _snap_ts[0] = _now
+                try:
+                    st = sess.agent.get_state(sess.config)
+                    _msgs = _b3_serialize_msgs((st.values or {}).get("messages", []) if st else [])
+                    if _msgs:
+                        _b3_partial_snapshot(ticket_id, {
+                            "messages": _msgs,
+                            "_partial": {"round_started_at": datetime.utcnow().isoformat(),
+                                         "admin_content": content.strip()[:500]},
+                        })
+                except Exception as _se:
+                    _log.debug("[ticket=%s] partial 快照异常(跳过): %s", ticket_id, _se)
+
             def _safe_put(item):
                 """put_nowait 满则吞掉 + 计数（不抛 QueueFull 把 worker 弄崩）"""
                 nonlocal _n_dropped
@@ -1823,6 +1908,7 @@ async def stream_agent_message(
                     "input": _args,
                     "content": f"[{_name or '?'}] {_cmd[:120]}" if _cmd else f"[{_name or '?'}] (无参数)",
                 })
+                _maybe_snapshot()
             try:
                 for chunk in sess.agent.stream(
                     {"messages": [{"role": "user", "content": content.strip()}]},
@@ -1892,6 +1978,7 @@ async def stream_agent_message(
                             "tool_call_id": getattr(msg, "tool_call_id", "") or "",
                             "content": _tout[:1200],
                         })
+                        _maybe_snapshot()
             except AssertionError as e:
                 agent_unavailable = True
                 err = f"⚠️ Agent 工具调用暂时不可用：{e}"

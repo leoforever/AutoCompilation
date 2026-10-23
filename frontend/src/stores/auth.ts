@@ -39,9 +39,10 @@ export const useAuthStore = defineStore('auth', () => {
     const res: any = await api.post('/auth/login', formData)
     
     token.value = res.data.access_token
-    user.value = res.user
     localStorage.setItem('token', res.data.access_token)
-    localStorage.setItem('user', JSON.stringify(res.user))
+    // 10-23 修复：login 响应里没有 user 对象（旧代码 res.user → undefined 落 localStorage，
+    // user 一直 null → isAdmin false / 路由守卫把 admin 路由弹回 workbench）。补拉 /auth/me。
+    await fetchMe()
     return res
   }
 

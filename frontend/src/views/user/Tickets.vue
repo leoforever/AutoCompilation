@@ -56,6 +56,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 
 const tickets = ref<any[]>([])
 const currentTicket = ref<any>(null)
@@ -89,7 +90,7 @@ function ticketStatusText(status: string) {
 }
 
 function formatDate(dateStr: string) {
-  return new Date(dateStr).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  return fmtDateTime(dateStr, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 async function openChat(ticket: any) {

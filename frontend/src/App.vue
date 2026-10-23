@@ -59,7 +59,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted , watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage } from 'element-plus'
@@ -67,6 +67,9 @@ import { ElMessage } from 'element-plus'
 const router = useRouter()
 const authStore = useAuthStore()
 const role = ref<'user' | 'admin'>(authStore.isAdmin ? 'admin' : 'user')
+// 10-23 修复：fetchMe 是异步的（onMounted 才拉），上面求值时 user 常为 null →
+// admin 登录后侧栏停用户视图、须手点一次"管理员后台"才同步。身份到位后自动对齐。
+watch(() => authStore.isAdmin, (v) => { if (v) role.value = 'admin' })
 
 const menuItems = computed(() => {
   if (role.value === 'user') {
@@ -94,6 +97,8 @@ const currentRoute = computed(() => router.currentRoute.value.name as string)
 
 function setRole(r: 'user' | 'admin') {
   role.value = r
+  // T9-U 10-23：切后台落统计看板、切前台落在线编译工作台（原先只换侧栏不跳转）
+  router.push({ name: r === 'admin' ? 'dashboard' : 'workbench' })
 }
 
 function navigateTo(page: string) {

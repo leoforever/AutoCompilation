@@ -74,6 +74,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 
 const experiences = ref<any[]>([])
 const stats = ref({ total: 0, approved: 0, reviewing: 0, rejected: 0 })
@@ -120,7 +121,7 @@ function expStatusText(status: string) {
 }
 
 function formatDate(dateStr: string) {
-  return new Date(dateStr).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  return fmtDateTime(dateStr, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 function previewSkill(exp: any) {

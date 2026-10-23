@@ -159,6 +159,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const tasks = ref<any[]>([])
@@ -206,8 +207,9 @@ function statusText(status: string) {
 
 function formatDate(dateStr: string) {
   // 完整日期时间 YYYY-MM-DD HH:MM（跨天任务也看得出来）
-  const d = new Date(dateStr)
-  if (isNaN(d.getTime())) return dateStr
+  // 10-23 时区修复：后端 naive UTC，parseServerDate 补 Z 按 UTC 解析再转本地
+  const d = parseServerDate(dateStr)
+  if (!d) return dateStr
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
          `${pad(d.getHours())}:${pad(d.getMinutes())}`

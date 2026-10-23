@@ -59,6 +59,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '@/utils/request'
+import { fmtDateTime, parseServerDate } from '@/utils/datetime'
 import { ElMessage } from 'element-plus'
 
 const route = useRoute()
@@ -68,7 +69,7 @@ const newMessage = ref('')
 const chatBox = ref<HTMLElement>()
 
 function formatDate(dateStr: string) {
-  return new Date(dateStr).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  return fmtDateTime(dateStr, { hour: '2-digit', minute: '2-digit' })
 }
 
 async function loadMessages() {
