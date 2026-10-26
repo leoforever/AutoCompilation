@@ -17,6 +17,14 @@ class UserCreate(BaseModel):
     role: UserRole = UserRole.USER
 
 
+class PasswordChange(BaseModel):
+    """用户自改密码（C-1：原 query 明文进 URL/access log，收进 body；
+    端点当前无前端消费方，改动零波及）"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    old_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
+
+
 class UserPasswordReset(BaseModel):
     """管理员重置指定用户密码"""
     model_config = ConfigDict(str_strip_whitespace=True)

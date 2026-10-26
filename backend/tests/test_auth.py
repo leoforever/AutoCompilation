@@ -250,7 +250,7 @@ def test_change_password_success():
     # 修改密码
     response = client.post(
         "/api/auth/change-password",
-        params={"old_password": "oldpass123", "new_password": "newpass456"},
+        json={"old_password": "oldpass123", "new_password": "newpass456"},  # C-1: body 而非 query
         headers={"Authorization": f"Bearer {token}"}
     )
     assert response.status_code == 200
@@ -281,7 +281,7 @@ def test_change_password_wrong_old():
     # 使用错误原密码修改
     response = client.post(
         "/api/auth/change-password",
-        params={"old_password": "wrong_password", "new_password": "newpass456"},
+        json={"old_password": "wrong_password", "new_password": "newpass456"},  # C-1: body
         headers={"Authorization": f"Bearer {token}"}
     )
     assert response.status_code == 400

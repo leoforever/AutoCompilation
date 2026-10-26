@@ -136,3 +136,20 @@ def artifacts_dir():
         base = Path(__file__).resolve().parents[2] / base
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+# AI 三件套单源读取（C-3，2026-10-26：原 compile_engine/experience_generator 两份
+# 拷贝合一；死默认值 agnes-2.5-flash 已删——env 未配时返回空串，由消费点显式报错，
+# 静默用错模型=烧钱+诡异行为）。env 优先；yaml ai 段可作部署级默认（可选）。
+def _ai_from_yaml(key: str) -> str:
+    raw = _load_yaml()
+    return str(((raw.get("ai") or {}).get(key)) or "")
+
+def ai_model() -> str:
+    return os.environ.get("AI_MODEL") or _ai_from_yaml("model")
+
+def ai_api_key() -> str:
+    return os.environ.get("AI_API_KEY") or _ai_from_yaml("api_key")
+
+def ai_base_url() -> str:
+    return os.environ.get("AI_BASE_URL") or _ai_from_yaml("base_url")

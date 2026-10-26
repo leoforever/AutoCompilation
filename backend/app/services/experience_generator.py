@@ -23,17 +23,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 # LLM 配置：复用 compile_engine 的环境变量约定（AI_MODEL / AI_API_KEY / AI_BASE_URL）
 # 不 import compile_engine 是因为它会触发 docker_backend → deepagents 连锁 import
 # （deepagents 当前和 anthropic 版本不兼容，会让本 service 不可 import）
-def _ai_model() -> str:
-    import os
-    return os.environ.get("AI_MODEL", "agnes-2.5-flash")
-
-def _ai_api_key() -> str:
-    import os
-    return os.environ.get("AI_API_KEY", "")
-
-def _ai_base_url() -> str:
-    import os
-    return os.environ.get("AI_BASE_URL", "")
+# C-3（2026-10-26）：单源归 config.py（本文件原拷贝已删，别名同 compile_engine）
+from app.config import ai_model as _ai_model, ai_api_key as _ai_api_key, ai_base_url as _ai_base_url
 
 from app.services.skill_loader import _SKILL_NAME_RE
 

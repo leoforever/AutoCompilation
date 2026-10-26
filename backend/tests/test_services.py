@@ -250,19 +250,8 @@ def test_ws_broadcaster_pubsub():
     assert msg == {"type": "log", "msg": "ping"}
 
 
-# ===================== worker =====================
-def test_worker_constants():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "worker", str(REPO_ROOT / "backend" / "worker.py")
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert mod.WORKER_ID.startswith("worker-")
-    assert mod.POLL_INTERVAL == 5
-    assert mod.HEARTBEAT_INTERVAL == 60
-    assert callable(mod.main_loop)
-    assert callable(mod.make_log_callback)
+# worker.py / run.py 已删（C-7/C-5，2026-10-26：废弃独立 worker 进程与零引用启动
+# 脚本；对应 test_worker_constants 同删——防"55 绿变红"必须先清断言）
 
 
 # ===================== routes/compile =====================

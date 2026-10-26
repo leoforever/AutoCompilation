@@ -10,7 +10,7 @@ import jwt
 import bcrypt
 
 from app.models import get_db, User
-from app.schemas import UserCreate, ApiResponse, TokenResponse, UserOut
+from app.schemas import UserCreate, ApiResponse, TokenResponse, UserOut, PasswordChange
 from app.config import get_settings
 from app.dependencies import get_current_user
 
@@ -95,17 +95,17 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 @router.post("/change-password", response_model=ApiResponse)
 async def change_password(
-    old_password: str,
-    new_password: str,
+    body: PasswordChange,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """修改密码"""
-    if not bcrypt.checkpw(old_password.encode(), current_user.password_hash.encode()):
+    """修改密码（C-1：口令走 JSON body，不再进 URL query——query 会被
+    access log/代理日志/浏览器历史留痕）"""
+    if not bcrypt.checkpw(body.old_password.encode(), current_user.password_hash.encode()):
         raise HTTPException(status_code=400, detail="原密码错误")
     
     current_user.password_hash = bcrypt.hashpw(
-        new_password.encode(),
+        body.new_password.encode(),
         bcrypt.gensalt(rounds=12)
     ).decode()
     db.commit()

@@ -198,11 +198,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS 配置
+# CORS 配置（#4，2026-10-26）：allow_credentials 关闭——本平台认证走 Bearer JWT
+# （localStorage 手动塞 Authorization 头），不依赖 Cookie，credentials=True 只有
+# "任意站点可跨源带凭据"的反模式风险而无收益。若将来改用 Cookie 会话，必须同时
+# 把 allow_origins 收窄到具体部署域（* + credentials 是规范互斥组合）。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

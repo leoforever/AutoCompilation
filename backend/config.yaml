@@ -50,4 +50,3 @@ docker_exec:
 
 upload:
   max_size: 2147483648        # 上传大小上限（2GB）
-  upload_dir: ./uploads       # 上传暂存目录

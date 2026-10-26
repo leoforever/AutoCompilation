@@ -38,15 +38,10 @@ from app.services.docker_backend import DockerBackend, get_docker_client
 from app.services.skill_loader import get_skills_paths, SKILLS_DIR_HOST, SKILLS_DIR_CONTAINER
 
 
-# ==================== AI / Engine 配置（按 spec：不写死，从环境变量读）====================
-def _ai_model() -> str:
-    return os.environ.get("AI_MODEL", "agnes-2.5-flash")
-
-def _ai_api_key() -> str:
-    return os.environ.get("AI_API_KEY", "")
-
-def _ai_base_url() -> str:
-    return os.environ.get("AI_BASE_URL", "")
+# ==================== AI / Engine 配置 ====================
+# C-3（2026-10-26）：三件套单源归 config.py（此前本文件与 experience_generator 各
+# 一份拷贝、带同一个 agnes 死默认，已删）；消费点函数名保持本地别名零改动
+from app.config import ai_model as _ai_model, ai_api_key as _ai_api_key, ai_base_url as _ai_base_url
 
 def _max_retries() -> int:
     return int(get_cfg("compile.max_retries", 4, env_alias="MAX_RETRIES"))
