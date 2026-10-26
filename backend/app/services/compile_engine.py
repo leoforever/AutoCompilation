@@ -51,14 +51,8 @@ def _ai_base_url() -> str:
 def _max_retries() -> int:
     return int(get_cfg("compile.max_retries", 4, env_alias="MAX_RETRIES"))
 
-def _artifacts_dir() -> Path:
-    base = Path(get_cfg("compile.artifact_dir", get_settings().artifact_dir, env_alias="ARTIFACTS_DIR"))
-    if not base.is_absolute():
-        # 从本文件位置推断仓库根（services/compile_engine.py → 往上一层到 backend/app/services → 上 2 层到 backend → 上 3 层到仓库根）
-        project_root = Path(__file__).resolve().parents[3]
-        base = project_root / base
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+# Q2 步3：解析逻辑归一 config.artifacts_dir()（本函数保留为别名，39 处引用零改动）
+from app.config import artifacts_dir as _artifacts_dir
 
 
 # ==================== 状态定义 ====================
@@ -872,15 +866,22 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
             artifacts_dir = Path(state["work_dir"]) / "artifacts"
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             chunks, _ = container.get_archive(state["output_dir"])
-            with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
-                for chunk in chunks:
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8")
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-            with tarfile.open(tmp_path) as tar:
-                tar.extractall(path=artifacts_dir)
-            os.unlink(tmp_path)
+            # 批3-补（2026-10-26 C2/Q2 方案步1）：stage6 是第三处裸 extractall，
+            # 与 admin resolve 同信任级（容器产物 tar 可被恶意上游植入越界/symlink
+            # 成员二次传导宿主机）——统一走 safe_extract，tmp 补 finally 清理
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
+                    for chunk in chunks:
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode("utf-8")
+                        tmp.write(chunk)
+                    tmp_path = tmp.name
+                from app.services import safe_extract
+                safe_extract.safe_extract_tar(tmp_path, artifacts_dir)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
             _log(state, "success", f"[阶段6] 产物归档: {artifacts_dir}", on_log)
 
             # 顺便打一份 tar.gz 整体包（用户点"下载全部产物"时直接返这个文件，避免每次都重打）

@@ -163,6 +163,14 @@ do_install() {
         fi
         cp "${ENV_FILE}.example" "$ENV_FILE"
         info "已从模板创建 $ENV_FILE（AI 三件套必填；运维参数在 config.yaml）"
+        # C1（2026-10-26）：JWT 密钥自动生成——fail-fast 配套，操作员无需手造
+        if ! grep -q "^export JWT_SECRET_KEY=\".\+\"" "$ENV_FILE" 2>/dev/null; then
+            _jwt="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+            [ -n "$_jwt" ] || error "生成 JWT_SECRET_KEY 失败（需 openssl 或 /dev/urandom）"
+            grep -q "^export JWT_SECRET_KEY" "$ENV_FILE" || echo "" >> "$ENV_FILE"
+            sed -i "s|^export JWT_SECRET_KEY=.*|export JWT_SECRET_KEY="$_jwt"|" "$ENV_FILE"
+            info "已自动生成 JWT_SECRET_KEY（32B 随机；缺失则拒绝启动）"
+        fi
         warn "请立刻编辑 $ENV_FILE，至少填好以下 3 项："
         warn "  1) AI_API_KEY  —— LLM API 密钥（AI 调用必需）"
         warn "  2) AI_BASE_URL —— LLM API base URL"
@@ -295,6 +303,12 @@ detect_init_pybin() {
 # ========== 初始化（建表 + 幂等迁移 + 默认账号） ==========
 do_init() {
     [ -f "$ENV_FILE" ] || error "缺少 $ENV_FILE，worker/数据库配置会缺"
+    # C1 现网升级路径：老 .env.compile 没有 JWT_SECRET_KEY → 补生成一次（此后固定）
+    if ! grep -q "^export JWT_SECRET_KEY=\".\+\"" "$ENV_FILE" 2>/dev/null; then
+        _jwt="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        echo "export JWT_SECRET_KEY="$_jwt"" >> "$ENV_FILE"
+        warn "已在 $ENV_FILE 补生成 JWT_SECRET_KEY（首次升级自动执行；全员旧 token 失效需重登）"
+    fi
     cd "$BACKEND_DIR"
     set -a; source "$ENV_FILE"; set +a
 

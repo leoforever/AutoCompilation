@@ -18,5 +18,7 @@ except ImportError:
     pass
 
 # 默认环境变量（worker / engine 读到）
+# C1 fail-fast 配套：测试进程自带 dummy 密钥（真密钥唯 .env.compile，测试不读它）
+os.environ.setdefault("JWT_SECRET_KEY", "dummy-test-secret-key-for-pytest-only")
 os.environ.setdefault("DOCKER_IMAGE", "loongnix-build:23.2")
 os.environ.setdefault("MAX_RETRIES", "4")

@@ -145,13 +145,9 @@ async def upload_and_submit(
 
     # 4. 生成 task_id + 写文件到 artifacts/sources/
     settings = get_settings()
-    from app.config import get_cfg as _gcfg2
-    artifact_dir = Path(_gcfg2("compile.artifact_dir", settings.artifact_dir, env_alias="ARTIFACTS_DIR"))
-    if not artifact_dir.is_absolute():
-        # 相对路径按仓库根解析（routes/compile.py → parents[2]=backend → parents[3]=仓库根），
-        # 与 compile_engine._artifacts_dir() 同款，换部署目录不失效（教训：旧版写死绝对路径）
-        artifact_dir = Path(__file__).resolve().parents[3] / artifact_dir
-    sources_dir = artifact_dir / "sources"
+    # Q2 步3：统一走 config.artifacts_dir()（与引擎同口径，此前同款逻辑双份实现）
+    from app.config import artifacts_dir as _adir
+    sources_dir = _adir() / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
 
     task_id = f"T-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"

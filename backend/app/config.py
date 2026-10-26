@@ -67,6 +67,16 @@ def get_settings() -> Settings:
             artifact_dir=str(c.get("artifact_dir", "./artifacts")),
             max_upload_size=int(u.get("max_size", 2 * 1024 * 1024 * 1024)),
         )
+        # C1（2026-10-26 方案步4）：env > yaml > 无值拒绝——泄露串已出清 git/yaml，
+        # 密钥唯 .env.compile 一个来源（env 优先级与配置链 v2 的 env>yaml 规则一致）
+        _sk = os.environ.get("JWT_SECRET_KEY") or _settings.secret_key
+        if not _sk:
+            raise RuntimeError(
+                "JWT_SECRET_KEY 未配置，拒绝启动（密钥泄露已轮换）。"
+                "生成：bash setup.sh install 自动写入，或 "
+                "openssl rand -hex 32 后追加 JWT_SECRET_KEY=<串> 到 backend/.env.compile"
+            )
+        _settings.secret_key = _sk
     return _settings
 
 
@@ -114,3 +124,15 @@ def get_cfg(key: str, default: Any = None, env_alias: "str | list[str] | None" =
 def load_config() -> dict:
     """加载完整配置（兼容旧调用名）"""
     return get_settings().model_dump()
+
+def artifacts_dir():
+    """产物根目录唯一权威解析（Q2 步3，2026-10-26：原 compile_engine._artifacts_dir
+    与 routes/compile.py 各写一份同款逻辑，统一到此）。
+    env ARTIFACTS_DIR > yaml compile.artifact_dir > 默认；相对路径按仓库根解析
+    （config.py 在 app/ 下 → parents[2]=仓库根），换部署目录不失效。"""
+    from pathlib import Path
+    base = Path(get_cfg("compile.artifact_dir", get_settings().artifact_dir, env_alias="ARTIFACTS_DIR"))
+    if not base.is_absolute():
+        base = Path(__file__).resolve().parents[2] / base
+    base.mkdir(parents=True, exist_ok=True)
+    return base
