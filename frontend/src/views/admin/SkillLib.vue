@@ -400,7 +400,7 @@ function showAddDialog() {
   skillDialogVisible.value = true
 }
 
-function editSkill(skill: any) {
+async function editSkill(skill: any) {
   isEdit.value = true
   skillForm.value = {
     skill_id: skill.skill_id,
@@ -409,11 +409,20 @@ function editSkill(skill: any) {
     version: skill.version || '',
     description: skill.description || '',
     system_ids: Array.isArray(skill.system_ids) ? [...skill.system_ids] : [],
-    skill_content: skill.skill_content || '',
-    script_content: skill.script_content || '',
+    // 3e：列表已 defer 掉正文，编辑器从详情端点单查填充
+    skill_content: '',
+    script_content: '',
   }
   skillMdTab.value = 'edit'
   skillDialogVisible.value = true
+  try {
+    const res: any = await api.get(`/admin/skills/${skill.skill_id}`)
+    const d = res.data || {}
+    skillForm.value.skill_content = d.skill_content || ''
+    skillForm.value.script_content = d.script_content || ''
+  } catch (e: any) {
+    ElMessage.error('加载 Skill 正文失败: ' + (e?.message || ''))
+  }
 }
 
 async function saveSkill() {

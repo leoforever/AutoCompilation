@@ -123,7 +123,7 @@ def write_terminal(db, task, state: dict) -> None:
         _ws_warn(task_id_str, f"任务终态入库失败（{e.__class__.__name__}），状态可能滞留，管理员页将见对账提示")
 
     # ── 块2：log_output（磁盘 build.log 才是权威，DB 列只是缓存）──
-    log_out = sanitize_text(state.get("log_output", ""))
+    log_out = sanitize_text(state.get("log_output", ""))[-200_000:]  # 3d：终态同样只存尾 200KB
     try:
         task.log_output = log_out
         db.commit()
@@ -144,7 +144,9 @@ def write_log_cache(db, task, log_output: str) -> None:
     """周期提交的日志缓存刷新：净化后写，失败静默（不连坐、不哨兵刷屏——
     周期写失败下轮还会再试；终态哨兵才是结论性事件）。"""
     try:
-        task.log_output = sanitize_text(log_output)
+        # 3d（2026-10-23）：DB 列只是缓存，磁盘 build.log 为权威——周期写只留尾 200KB
+        # （torch 级任务全量日志数 MB，整列重写是接口肥大/O(n²) 源头）
+        task.log_output = sanitize_text(log_output[-200_000:])
         db.commit()
     except Exception:
         db.rollback()

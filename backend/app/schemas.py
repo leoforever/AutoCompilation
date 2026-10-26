@@ -85,6 +85,41 @@ class CompileTaskCreate(BaseModel):
     source_type: str = Field(..., pattern="^(upload|git)$")
     source_path: Optional[str] = None
     git_url: Optional[str] = None
+
+    @field_validator("git_url")
+    @classmethod
+    def _git_url_scheme(cls, v):
+        # 3f（2026-10-23）：仅 http(s)/git 协议。file://可 clone 宿主机任意 git 仓
+        # （含他人任务源码），ssh://带宿主 key 可内网横探测；git:// 必须放行
+        # （skaware 系源码 443 被墙时唯一通道，93/801346 实测）。
+        import re as _re
+        if v and not _re.match(r"^(https?|git)://", v):
+            raise ValueError("git_url 仅支持 http(s):// 或 git:// 协议")
+        return v
+
+    @field_validator("source_path")
+    @classmethod
+    def _source_path_scope(cls, v):
+        # 3a：source_path 只允许平台 artifacts 区（upload 落盘 sources/ 或任务工作区），
+        # 防"提交任务指向宿主机任意路径"的读取通道。resolve 后判前缀（兼容符号链接目录）。
+        if not v:
+            return v
+        import os as _os
+        # 与 compile_engine._artifacts_dir 同口径解析根（懒导入防模块环；配置链权威）
+        try:
+            from app.services.compile_engine import _artifacts_dir
+            root = str(_artifacts_dir().resolve())
+        except Exception:
+            root = _os.path.realpath(_os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)), "..", "..", "artifacts"))
+        rp = _os.path.realpath(v)
+        try:
+            ok = _os.path.commonpath([root, rp]) == root
+        except ValueError:
+            ok = False
+        if not ok:
+            raise ValueError("source_path 仅允许指向平台 artifacts 目录内")
+        return v
     git_branch: Optional[str] = "main"
     build_args: Optional[dict] = None
     compile_mode: CompileMode = CompileMode.CONTAINER

@@ -349,6 +349,10 @@ def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]
     src_dir = work_dir / "container_work" / "src"
 
     if state["source_type"] == "git" and state.get("git_url"):
+        # 3f 纵深（2026-10-23）：库内存量脏行/retry 复制路径不过 schema，执行前再拦一道
+        import re as _re
+        if not _re.match(r"^(https?|git)://", state["git_url"] or ""):
+            raise RuntimeError(f"git_url 协议不允许（仅 http(s)/git）：{state['git_url']!r}")
         # git clone（原有逻辑，原样保留）
         # 复用已有 clone（节省时间）
         if src_dir.exists() and (src_dir / ".git").exists():
@@ -368,8 +372,12 @@ def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]
 
             _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch or 'default'})", on_log)
             try:
+                # 3f 加固：隔离宿主全局/系统 gitconfig（url.insteadOf 重定向面）
+                import os as _os2
+                _git_env = {**_os2.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
                 proc = subprocess.Popen(
                     cmd,
+                    env=_git_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -412,6 +420,16 @@ def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]
         archive_path = Path(archive)
         if not archive_path.exists():
             raise RuntimeError(f"上传的源码包不存在：{archive_path}")
+        # 3a 纵深：包体必须落在 artifacts 区内（同 retry 脏数据兜底）
+        import os as _os
+        _root = str(_artifacts_dir().resolve())
+        _rp = _os.path.realpath(str(archive_path))
+        try:
+            _inside = _os.path.commonpath([_root, _rp]) == _root
+        except ValueError:
+            _inside = False
+        if not _inside:
+            raise RuntimeError(f"source_path 越界（仅允许 artifacts 区内）：{_rp}")
 
         # 复用已有解压（节省时间）
         if src_dir.exists() and any(src_dir.iterdir()):
@@ -436,58 +454,17 @@ def _extract_archive_safely(
     on_log: Optional[LogCallback],
     state: TaskState,
 ) -> None:
-    """解压 .tar.gz / .zip 到 dst_dir
-
-    安全防护：
-      - 解压文件数 ≤ 50,000（防 zip bomb 大量小文件）
-      - 解压后总字节 ≤ 10 GB（防 zip bomb 单文件超大）
-      - 文件路径必须落到 dst_dir 内（防 zip slip）
-    """
-    MAX_FILES = 50_000
-    MAX_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
-
-    suffix = archive_path.suffix.lower()
-    if archive_path.name.lower().endswith(".tar.gz") or suffix == ".tgz":
-        import tarfile
-        members = 0
-        total_bytes = 0
-        dst_resolved = dst_dir.resolve()
-        with tarfile.open(archive_path, "r:gz") as tf:
-            for member in tf:
-                members += 1
-                if members > MAX_FILES:
-                    raise RuntimeError(f"压缩包内文件数超过 {MAX_FILES}，疑似 zip bomb")
-                # zip slip 检查：解压后路径必须在 dst_dir 内
-                target_path = (dst_dir / member.name).resolve()
-                if not str(target_path).startswith(str(dst_resolved)):
-                    raise RuntimeError(f"非法解压路径（zip slip?）：{member.name}")
-                total_bytes += member.size or 0
-                if total_bytes > MAX_BYTES:
-                    raise RuntimeError(f"解压后总字节超过 {MAX_BYTES // (1024**3)} GB")
-                if on_log and members % 200 == 0:
-                    _log(state, "info", f"[阶段4a] 解压中... {members} 文件", on_log)
-            tf.extractall(dst_dir)
-    elif suffix == ".zip":
-        import zipfile
-        members = 0
-        total_bytes = 0
-        dst_resolved = dst_dir.resolve()
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            for info in zf.infolist():
-                members += 1
-                if members > MAX_FILES:
-                    raise RuntimeError(f"压缩包内文件数超过 {MAX_FILES}，疑似 zip bomb")
-                target_path = (dst_dir / info.filename).resolve()
-                if not str(target_path).startswith(str(dst_resolved)):
-                    raise RuntimeError(f"非法解压路径（zip slip?）：{info.filename}")
-                total_bytes += info.file_size or 0
-                if total_bytes > MAX_BYTES:
-                    raise RuntimeError(f"解压后总字节超过 {MAX_BYTES // (1024**3)} GB")
-                if on_log and members % 200 == 0:
-                    _log(state, "info", f"[阶段4a] 解压中... {members} 文件", on_log)
-            zf.extractall(dst_dir)
+    """解压 .tar.gz / .zip / .tgz 到 dst_dir —— 委托 services/safe_extract（批3 3b：
+    commonpath 边界 + 拒 symlink/hardlink/设备成员 + 数量/体积双上限）"""
+    from app.services import safe_extract
+    name = archive_path.name.lower()
+    prog = (lambda n: _log(state, "info", f"[阶段4a] 解压中... {n} 文件", on_log)) if on_log else None
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        safe_extract.safe_extract_tar(archive_path, dst_dir, on_progress=prog)
+    elif name.endswith(".zip"):
+        safe_extract.safe_extract_zip(archive_path, dst_dir, on_progress=prog)
     else:
-        raise RuntimeError(f"不支持的源码包格式：{suffix}（仅 .tar.gz / .zip / .tgz）")
+        raise RuntimeError(f"不支持的源码包格式：{name}（仅 .tar.gz / .zip / .tgz）")
 
 
 # ==================== 阶段 4 ====================
@@ -1184,11 +1161,11 @@ def _collect_artifacts(container, output_dir: str, source_dir: str = "") -> list
                 candidates = _find_files_smart(container, source_dir)
                 if candidates:
                     # 自动复制到 /work/output
-                    container.exec_run(["bash", "-c", f"mkdir -p {output_dir}"])
-                    # 用 xargs 批量复制
-                    cmd_str = " ".join(f"'{f}'" for f in candidates)
-                    container.exec_run(["bash", "-c",
-                        f"cp -a {cmd_str} {output_dir}/ 2>/dev/null || true"])
+                    container.exec_run(["mkdir", "-p", output_dir])
+                    # 3c（2026-10-23）：原 cmd_str 手拼单引号，文件名含 ' 即逃逸；
+                    # 改参数列表直传（exec_run 不经 shell，无转义面），逐个 cp 容错
+                    for f in candidates:
+                        container.exec_run(["cp", "-a", "--", f, output_dir + "/"])
                     # 重新扫 output_dir
                     r2 = container.exec_run(["find", output_dir, "-type", "f", "-maxdepth", "3"])
                     if r2.exit_code == 0 and r2.output:

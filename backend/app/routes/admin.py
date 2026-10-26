@@ -320,15 +320,21 @@ async def resolve_ticket(
                 try:
                     c = cli.containers.get(sess.container_id)
                     bits, _ = c.get_archive("/work/output")
-                    import tarfile, tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
-                        for chunk in bits:
-                            tmp.write(chunk if isinstance(chunk, bytes) else chunk.encode())
-                        tmp_path = tmp.name
-                    with tarfile.open(tmp_path) as tar:
-                        tar.extractall(path=str(host_out))
-                    import os as _os
-                    _os.unlink(tmp_path)
+                    import tempfile
+                    from app.services import safe_extract
+                    tmp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
+                            for chunk in bits:
+                                tmp.write(chunk if isinstance(chunk, bytes) else chunk.encode())
+                            tmp_path = tmp.name
+                        # 批3 3b：产物 tar 同样过安全解包（此前裸 extractall，
+                        # 恶意上游可在构建时植入越界/symlink 成员二次传导到宿主机）
+                        safe_extract.safe_extract_tar(tmp_path, host_out)
+                    finally:
+                        if tmp_path:
+                            import os as _os
+                            _os.unlink(tmp_path)
                 except Exception as e:
                     print(f"[resolve] 产物归档失败: {e}")
             # 写新 task 行（继承原 task 的 user_id/system/source）
@@ -583,8 +589,13 @@ async def list_skills(
     """获取 Skill 列表（按 name/description 模糊匹配）
 
     默认不显示已软删的（deleted_at IS NOT NULL），传 include_deleted=true 显示全部
+
+    3e（2026-10-23）：列表 defer 掉 skill_content/script_content 大字段（MB 级 TOAST 读，
+    编辑器填充改走 /admin/skills/{skill_id} 详情端点单查）；ORM 未加载列序列化恒 None，
+    前端旧消费点形状兼容。
     """
-    query = db.query(Skill)
+    from sqlalchemy.orm import defer
+    query = db.query(Skill).options(defer(Skill.skill_content), defer(Skill.script_content))
 
     if not include_deleted:
         query = query.filter(Skill.deleted_at.is_(None))
@@ -600,7 +611,19 @@ async def list_skills(
 
     skills = query.order_by(Skill.created_at.desc()).all()
 
-    return ApiResponse(data=[SkillResponse.model_validate(s).model_dump() for s in skills])
+    # 3e：手搭 dict 而非 model_validate——后者 from_attributes 会 getattr 触发
+    # defer 列懒加载，defer 白做（实测击穿）。正文两字段恒 None，编辑器走详情端点
+    data = []
+    for sk in skills:
+        data.append({
+            "skill_id": sk.skill_id, "name": sk.name, "type": sk.type,
+            "description": sk.description,
+            "system_ids": sk.system_ids if isinstance(sk.system_ids, list) else [],
+            "version": sk.version, "is_active": sk.is_active, "source": sk.source,
+            "skill_content": None, "script_content": None,
+            "deleted_at": sk.deleted_at.isoformat() if sk.deleted_at else None,
+        })
+    return ApiResponse(data=data)
 
 
 @router.post("/skills", response_model=ApiResponse)
@@ -842,6 +865,23 @@ async def reconcile_skills(db: Session = Depends(get_db)):
 async def list_trash_skills(db: Session = Depends(get_db)):
     """回收站机制已下线（删 = 真删）。保留接口返空，兼容前端可能残留的菜单"""
     return ApiResponse(message="回收站机制已下线，删除即真删", data=[])
+
+
+@router.get("/skills/{skill_id}", response_model=ApiResponse)
+async def get_skill_detail(skill_id: int, db: Session = Depends(get_db)):
+    """3e：单 Skill 详情（含正文大字段）——列表已 defer，编辑器/预览从这里取"""
+    sk = db.query(Skill).filter(Skill.skill_id == skill_id).first()
+    if not sk:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    return ApiResponse(data={
+        "skill_id": sk.skill_id, "name": sk.name, "type": sk.type,
+        "description": sk.description,
+        "system_ids": sk.system_ids if isinstance(sk.system_ids, list) else [],
+        "version": sk.version, "is_active": sk.is_active, "source": sk.source,
+        "skill_content": str(sk.skill_content or ""),
+        "script_content": str(sk.script_content or ""),
+        "deleted_at": sk.deleted_at.isoformat() if sk.deleted_at else None,
+    })
 
 
 @router.post("/skills/{skill_id}/restore", response_model=ApiResponse)
