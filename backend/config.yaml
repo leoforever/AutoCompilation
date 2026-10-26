@@ -6,7 +6,8 @@ database:
     host: localhost
     port: 5432
     username: compile_user
-    password: compile123
+    # password 不在此配置（T-9：口令唯 backend/.env.compile 的 DB_PASSWORD，
+    # setup.sh rotate-db-password 生成轮换；git 公开仓不养凭据）
     database: compile_platform
   sqlite:
     path: ./cache/compile_platform.db   # 仅 type=sqlite 时生效

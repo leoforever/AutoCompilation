@@ -267,7 +267,7 @@ async def list_skill_options(
 
 def _bundle_size_for(task_id: str) -> int | None:
     """下载真实传输量=artifacts.tar.gz 字节（与产物清单口径配套，2026-10-22）"""
-    from app.services.compile_engine import _artifacts_dir
+    from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
     b = _artifacts_dir() / task_id / "artifacts.tar.gz"
     try:
         return b.stat().st_size if b.is_file() else None
@@ -370,7 +370,7 @@ async def get_compile_log(
     if current_user.role != "admin" and task.user_id != current_user.user_id:
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
-    from app.services.compile_engine import _artifacts_dir
+    from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
     log_file = _artifacts_dir() / real_task_id / "build.log"
     if log_file.exists():
         try:
@@ -391,7 +391,7 @@ async def download_compile_log(
     文件兜底：每个任务运行时的所有 _log() 都会 append 到 build.log
     前端 onMounted 恢复路径用这个端点拉历史日志
     """
-    from app.services.compile_engine import _artifacts_dir
+    from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
     task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -421,7 +421,7 @@ async def download_artifacts_bundle(
       1. 优先用 stage6 预打的 artifacts/{task_id}.tar.gz（CPU 0 成本，瞬时返）
       2. 缺失则实时打包（兜底，stage6 失败时也能下载）
     """
-    from app.services.compile_engine import _artifacts_dir
+    from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
 
     task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
     if not task:

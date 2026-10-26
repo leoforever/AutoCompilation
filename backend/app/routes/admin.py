@@ -301,7 +301,7 @@ async def resolve_ticket(
     sess = MANAGER.get(ticket_id)
     if sess is not None and ticket:
         try:
-            from app.services.compile_engine import _artifacts_dir
+            from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
             # sess.task 是接单时那个 request session 的对象，已 Detached →
             # 用当前 session 重新 join 的 ticket.task（同一行，绑定本 session）
             src_task = ticket.task
@@ -464,7 +464,7 @@ def _task_has_log(t) -> bool:
     """详情懒加载判断：build.log 文件非空 或 DB log_output 非空 → 前端才给"展开日志"入口。
     纯 stat/length 判断不读全文，成本可忽略；任何异常按"无日志"处理（宁缺勿错）。"""
     try:
-        from app.services.compile_engine import _artifacts_dir
+        from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
         lf = _artifacts_dir() / t.task_id / "build.log"
         if lf.is_file() and lf.stat().st_size > 0:
             return True
@@ -1246,7 +1246,7 @@ async def accept_ticket_and_start_agent(
     # 异步启动 agent（不阻塞 admin 立刻看到详情抽屉）
     import asyncio
     from app.services.ticket_agent import MANAGER
-    from app.services.compile_engine import _artifacts_dir
+    from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
 
     async def _start():
         try:

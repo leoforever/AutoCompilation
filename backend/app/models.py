@@ -27,15 +27,28 @@ else:
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
 
 def load_db_config():
-    """从 config.yaml 加载数据库配置"""
+    """数据库配置：env > config.yaml（T-9 2026-10-26：口令出清 git 并轮换；
+    口令唯 .env.compile 的 DB_PASSWORD，yaml 无值且 env 无值 → 拒绝启动）"""
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
     db = cfg.get('database', {})
     db_type = db.get('type', 'postgresql')
     if db_type == 'postgresql':
-        pg = db.get('postgresql', {})
+        pg = dict(db.get('postgresql', {}) or {})
+        host = os.environ.get("DB_HOST") or pg.get('host', 'localhost')
+        port = os.environ.get("DB_PORT") or pg.get('port', 5432)
+        user = os.environ.get("DB_USER") or pg.get('username')
+        dbname = os.environ.get("DB_NAME") or pg.get('database')
+        password = os.environ.get("DB_PASSWORD") or pg.get('password')
+        if not password:
+            raise RuntimeError(
+                "DB_PASSWORD 未配置，拒绝启动。生成：bash setup.sh rotate-db-password"
+                "（ALTER USER + 写 .env.compile 一步闭环），或手动 openssl rand -hex 16"
+                " 追加 DB_PASSWORD=<串> 到 backend/.env.compile"
+            )
+        from urllib.parse import quote_plus
         return {
-            'url': f"postgresql://{pg['username']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}",
+            'url': f"postgresql://{quote_plus(user)}:{quote_plus(str(password))}@{host}:{port}/{dbname}",
             'pool_pre_ping': True,
             'pool_recycle': 3600
         }

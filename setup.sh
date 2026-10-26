@@ -236,8 +236,13 @@ do_install() {
         info "docker 已安装"
     fi
 
-    info "创建数据库用户和数据库..."
-    sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD 'compile123';" 2>/dev/null || true
+    # T-9（2026-10-26）：口令不再硬编码——.env.compile 已有 DB_PASSWORD 用之，
+    # 没有则生成并写入（与 rotate-db-password 同一把钥匙），再建用户
+    ensure_db_password
+    info "创建数据库用户和数据库...（口令取自 .env.compile，不回显）"
+    ( set -a; source "$ENV_FILE"; set +a
+      sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD '$DB_PASSWORD';" 2>/dev/null \
+        || warn "CREATE USER 失败（local md5 下 sudo -u postgres 免密不可用属预期）——全新环境请 sudo -u postgres psql 手工建 user/db，口令取自 $ENV_FILE 的 DB_PASSWORD" )
     sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
 
     info "配置 PG 认证：pg_hba.conf 把 host 行的 ident 改 md5（修复 Ident 认证失败）..."
@@ -301,6 +306,61 @@ detect_init_pybin() {
 }
 
 # ========== 初始化（建表 + 幂等迁移 + 默认账号） ==========
+# T-9（2026-10-26）：DB 口令生成与轮换——口令唯 .env.compile 的 DB_PASSWORD（git 不养凭据）
+ensure_db_password() {
+    # 已有非空 DB_PASSWORD → 不动；否则生成写入（install/init 自愈路径，幂等）
+    [ -f "$ENV_FILE" ] || return 0
+    if ! grep -q "^export DB_PASSWORD=\".\+\"" "$ENV_FILE" 2>/dev/null; then
+        _dbp="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        grep -q "^export DB_PASSWORD" "$ENV_FILE" || echo "" >> "$ENV_FILE"
+        sed -i "s|^export DB_PASSWORD=.*|export DB_PASSWORD="$_dbp"|" "$ENV_FILE"
+        unset _dbp
+        warn "已在 $ENV_FILE 生成 DB_PASSWORD（首次升级自动执行；库侧口令需 setup.sh rotate-db-password 对齐）"
+    fi
+}
+
+do_rotate_db_password() {
+    # 一条命令闭环：备份→生成→ALTER USER→写 env→验证新口令→提示 restart
+    # （"只挪文件不轮换=没修"——本命令让轮换成为可执行动作而非手工 SQL）
+    [ -f "$ENV_FILE" ] || { error "缺少 $ENV_FILE"; exit 1; }
+    set -a; source "$ENV_FILE"; set +a
+    local old_pass="${DB_PASSWORD:-}"
+    local new_pass
+    new_pass="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    [ -n "$new_pass" ] || { error "生成失败（需 openssl 或 /dev/urandom）"; exit 1; }
+
+    info "① 备份整库（pg_dump → cache/pre-rotate-latest.sql.gz）"
+    mkdir -p "$BACKEND_DIR/cache"
+    if [ -n "$old_pass" ] && PGPASSWORD="$old_pass" psql -h localhost -U compile_user -d compile_platform -t -A -c "SELECT 1" >/dev/null 2>&1; then
+        PGPASSWORD="$old_pass" pg_dump -h localhost -U compile_user compile_platform | gzip > "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz"
+        info "  备份完成：$BACKEND_DIR/cache/pre-rotate-latest.sql.gz ($(du -h "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz" | cut -f1))"
+    else
+        warn "  旧口令连不上（可能已轮换过/env 与库不一致），跳过备份继续"
+    fi
+
+    info "② ALTER USER compile_user（PG 侧改密，数据/权限零变化）"
+    # 注：本机 pg_hba local 已被改 md5，sudo -u postgres 裸 socket 会要密码——
+    # 用旧口令自连执行 ALTER（rotate 的前提就是 env 里旧口令可用，此路必通）
+    if ! PGPASSWORD="$old_pass" psql -h localhost -U compile_user -d compile_platform \
+          -c "ALTER USER compile_user WITH PASSWORD '$new_pass';" >/dev/null 2>&1; then
+        error "ALTER 失败（旧口令连不上？）。手工执行：psql -U compile_user 后 ALTER USER ... PASSWORD '<新串>'，env 已预写新值请保持一致"
+        exit 1
+    fi
+
+    info "③ 写入 .env.compile"
+    grep -q "^export DB_PASSWORD" "$ENV_FILE" || echo "" >> "$ENV_FILE"
+    sed -i "s|^export DB_PASSWORD=.*|export DB_PASSWORD="$new_pass"|" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    info "④ 验证新口令可登录"
+    if PGPASSWORD="***" psql -h localhost -U compile_user -d compile_platform -t -A -c "SELECT 1" | grep -q 1; then
+        info "  新口令验证 OK —— 请 bash setup.sh restart 让后端带新凭据重启（数据零影响；仅重启窗 ~1min）"
+    else
+        error "  新口令验证失败！手工回滚：sudo -u postgres psql -c 'ALTER USER compile_user WITH PASSWORD ...' 重置回旧值；env 此时未被修改仍是旧口令"
+        exit 1
+    fi
+}
+
 do_init() {
     [ -f "$ENV_FILE" ] || error "缺少 $ENV_FILE，worker/数据库配置会缺"
     # C1 现网升级路径：老 .env.compile 没有 JWT_SECRET_KEY → 补生成一次（此后固定）
@@ -309,6 +369,8 @@ do_init() {
         echo "export JWT_SECRET_KEY="$_jwt"" >> "$ENV_FILE"
         warn "已在 $ENV_FILE 补生成 JWT_SECRET_KEY（首次升级自动执行；全员旧 token 失效需重登）"
     fi
+    # T-9 同款：DB 口令缺失补生成（仅写 env；库侧对齐用 rotate-db-password）
+    ensure_db_password
     cd "$BACKEND_DIR"
     set -a; source "$ENV_FILE"; set +a
 
@@ -481,7 +543,9 @@ do_uninstall() {
     db_pass=$(awk '/postgresql:/{f=1;next} f&&/password:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
     db_host="${db_host:-localhost}"; db_port="${db_port:-5432}"
     db_user="${db_user:-compile_user}"; db_name="${DB_NAME:-${db_name:-compile_platform}}"
-    db_pass="${DB_PASS:-${db_pass:-compile123}}"
+    # T-9：config.yaml 已无 password 行——env DB_PASS > .env.compile DB_PASSWORD > 报错
+    [ -z "$db_pass" ] && [ -f "$ENV_FILE" ] && db_pass="$(source "$ENV_FILE" 2>/dev/null && echo "$DB_PASSWORD")"
+    db_pass="${DB_PASS:-$db_pass}"
     # 统一走 -h（TCP）+ 密码：pg_hba 把 local 也设成了 md5，sudo -u postgres 裸 socket 会 fe_sendauth
     local PSQLU="psql -h $db_host -p $db_port -U $db_user"
     export PGPASSWORD="***"
@@ -691,10 +755,11 @@ case "${1:-start}" in
     restart) do_restart "$2" ;;  # 透传模式参数；不传 = 保持 COMPILE_MODE
     status)  do_status ;;
     uninstall) do_uninstall "${@:2}" ;;   # 可选 --purge / --yes
+    rotate-db-password) do_rotate_db_password ;;  # T-9：DB 口令一键轮换（备份→ALTER→env→验证）
     dev)     do_start dev ;;     # 显式 dev：uvicorn --reload
     prod)    do_start prod ;;    # 显式 prod：无 --reload
     *)
-        echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|uninstall [--purge] [--yes]|dev|prod}"
+        echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|uninstall [--purge] [--yes]|rotate-db-password|dev|prod}"
         echo
         echo "  start         生产模式启动（默认；无 --reload）"
         echo "  start dev     开发模式启动（uvicorn --reload，改 .py 自动重启）"

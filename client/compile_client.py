@@ -31,6 +31,21 @@ LOG_DIR = Path.home() / ".compile-platform" / "logs"
 ARTIFACT_DIR = Path.home() / ".compile-platform" / "artifacts"
 
 
+def _git_clone(url: str, branch: str, dst: str) -> int:
+    """T-8②：原 os.system(f"...{git_url}") 为宿主命令注入面（$()/反引号/分号）。
+    改参数列表直传（不经 shell 无转义面）+ 协议白名单（与后端 schemas 同款规则，
+    客户端独立部署不便 import 服务端代码，注明来源即可）。"""
+    import re as _re
+    import subprocess
+    if not _re.match(r"^(https?|git)://", url or ""):
+        raise ValueError(f"git_url 协议不允许（仅 http(s)/git）：{url!r}")
+    cmd = ["git", "clone", "--depth", "1"]
+    if branch:
+        cmd += ["--branch", branch]
+    cmd += [url, dst]
+    return subprocess.run(cmd, capture_output=True, text=True).returncode
+
+
 def load_config() -> dict:
     """加载客户端配置"""
     if CONFIG_PATH.exists():
@@ -117,7 +132,7 @@ def compile_local(software_name: str, source_path: str = None,
         # TODO: 实现源码解压逻辑
     elif git_url:
         logger.info(f"克隆源码：{git_url} (branch: {git_branch})")
-        os.system(f"git clone --depth 1 --branch {git_branch} {git_url} {work_dir / 'src'}")
+        _git_clone(git_url, git_branch, str(work_dir / "src"))
     
     # 匹配本地 Skill
     logger.info("匹配本地 Skill...")
@@ -138,8 +153,8 @@ def compile_local(software_name: str, source_path: str = None,
 def report_ticket(task_id: int, error_log: str, source: str = "client"):
     """上报编译失败工单"""
     import requests
-    from config import load_config
-    
+    # T-8①（2026-10-26）：原 from config import load_config 必抛 ImportError——
+    # load_config 就在本模块，直接调用即可，否则 report 路径一用即崩
     config = load_config()
     headers = {"Authorization": f"Bearer {config['token']}"}
     

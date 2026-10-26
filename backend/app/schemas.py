@@ -105,9 +105,9 @@ class CompileTaskCreate(BaseModel):
         if not v:
             return v
         import os as _os
-        # 与 compile_engine._artifacts_dir 同口径解析根（懒导入防模块环；配置链权威）
+        # 与引擎同口径：公共权威 config.artifacts_dir（config 不依赖 models/schemas，无环）
         try:
-            from app.services.compile_engine import _artifacts_dir
+            from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
             root = str(_artifacts_dir().resolve())
         except Exception:
             root = _os.path.realpath(_os.path.join(
