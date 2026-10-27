@@ -183,6 +183,37 @@ _local_ipv4s() {
     echo "localhost"
 }
 
+# ========== nginx 生产前端 ==========
+# conf 入库 deploy/；主 conf 注入两行 include（openEuler nginx 默认不 include conf.d，
+# 不动用户主 conf 的其余内容，幂等判据=compile-platform-managed 标记）。
+# root 指 /srv/compile-platform/dist——发布目录方案两个红利：
+# ① 仓库若在 /root 下（权限 700）nginx worker 读不进去，/srv 免疫；
+# ② 仓库目录搬迁/改名不影响 serving（rsync 每次同步）。
+install_nginx_conf() {
+    local conf_src="$PROJECT_DIR/deploy/compile-platform.nginx.conf"
+    [ -f "$conf_src" ] || { warn "缺 $conf_src，跳过 nginx 配置（prod 将回退 vite preview）"; return 0; }
+    if ! command -v nginx >/dev/null 2>&1; then
+        warn "nginx 未安装——prod 将回退 vite preview。建议: sudo dnf install -y nginx"
+        return 0
+    fi
+    sudo cp "$conf_src" /etc/nginx/compile-platform.conf
+    # 主 conf include 注入（幂等：标记在则跳过）
+    # 判据直接用 include 行本身（比标记注释更不易错位；现场注入过缺标记的教训）
+    if ! sudo grep -q "include /etc/nginx/compile-platform.conf" /etc/nginx/nginx.conf; then
+        # 只注入单行——openEuler 该机 conf.d/openclaw-https.conf 与主 conf 内联的
+        # 443 server 内容重复，通配 include conf.d 会 duplicate server 炸 nginx -t
+        sudo sed -i '0,/http {/s//http {\n    # compile-platform-managed\n    include \/etc\/nginx\/compile-platform.conf;/' /etc/nginx/nginx.conf
+        info "已注入主 conf include（原文件备份 /etc/nginx/nginx.conf.compile-platform.bak）"
+    fi
+    if ! sudo nginx -t >/dev/null 2>&1; then
+        sudo nginx -t 2>&1 | tail -3
+        error "nginx -t 失败——配置已动过，回滚：sudo cp /etc/nginx/nginx.conf.compile-platform.bak /etc/nginx/nginx.conf && sudo nginx -s reload"
+    fi
+    sudo mkdir -p /srv/compile-platform
+    sudo systemctl enable nginx >/dev/null 2>&1 || true
+    info "nginx 前端配置就绪：/etc/nginx/compile-platform.conf（listen $FRONTEND_PORT，root /srv/compile-platform/dist）"
+}
+
 # ========== 安装（一次性） ==========
 do_install() {
     # .env.compile 不入库（真实 AI key/Docker 配置），首次安装从模板复制
@@ -324,6 +355,10 @@ SQL
     fi
     info "  依赖安装目标解释器: $_py"
     "$_py" -m pip install -r requirements.txt -q
+
+    # nginx 生产前端（2026-10-27）：静态托管 dist + /api /ws 反代，3000 沿用；
+    # serving 路径不再有常驻 node（preview/esbuild 死亡类事故根除）
+    install_nginx_conf
 
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
@@ -565,6 +600,11 @@ do_start() {
         # `vite preview` 静态服务（复用已构建 dist，代理走 vite.config preview.proxy）。
         # dist 缺失则先 build（npm run build 失败带日志退出，不静默）
         if [ "$mode" = "dev" ]; then
+            # dev 与 nginx 同抢 3000：开发模式先停 nginx（restart prod 时自动恢复）
+            if systemctl is-active nginx >/dev/null 2>&1; then
+                info "dev 模式：停 nginx 让出 $FRONTEND_PORT 端口"
+                sudo systemctl stop nginx
+            fi
             info "启动前端（dev server：HMR，仅开发用）..."
             setsid nohup npm run dev -- --host 0.0.0.0 \
                 >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
@@ -580,9 +620,23 @@ do_start() {
             if [ -n "$(find src index.html vite.config.ts -newer dist/index.html 2>/dev/null | head -1)" ]; then
                 warn "dist 比 src/index.html/vite.config 旧——展示的是旧版界面；更新请: cd frontend && npx vite build"
             fi
-            info "启动前端（prod：vite preview 静态服务）..."
-            setsid nohup npm run preview -- --host 0.0.0.0 \
-                >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
+            if [ -f "/etc/nginx/compile-platform.conf" ] && command -v nginx >/dev/null 2>&1; then
+                # nginx 生产托管：build 检查在上（dist 可能刚重建）→ rsync 发布 → reload
+                info "启动前端（prod：nginx 静态托管 + /api /ws 反代）..."
+                sudo mkdir -p /srv/compile-platform
+                sudo rsync -a --delete "$FRONTEND_DIR/dist/" /srv/compile-platform/dist/
+                if sudo nginx -t >/dev/null 2>&1; then
+                    sudo systemctl restart nginx
+                else
+                    sudo nginx -t 2>&1 | tail -2
+                    error "nginx -t 失败，未启动前端（/etc/nginx/compile-platform.conf 或主 conf 需修正；备份 nginx.conf.compile-platform.bak）"
+                fi
+            else
+                info "启动前端（prod：vite preview 静态服务——nginx 未配置，回退）..."
+                sudo mkdir -p /srv/compile-platform && sudo rsync -a --delete "$FRONTEND_DIR/dist/" /srv/compile-platform/dist/ 2>/dev/null || true
+                setsid nohup npm run preview -- --host 0.0.0.0 \
+                    >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
+            fi
         fi
         disown || true
         for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -860,7 +914,12 @@ active_work_gate() {
 # ========== 停止 ==========
 do_stop() {
     active_work_gate   # A2：先闸后杀
-    kill_port "$FRONTEND_PORT" "前端"
+    if systemctl is-active nginx >/dev/null 2>&1 && [ -f /etc/nginx/compile-platform.conf ]; then
+        info "停止 前端（nginx systemctl）"
+        sudo systemctl stop nginx
+    else
+        kill_port "$FRONTEND_PORT" "前端"
+    fi
     kill_port "$BACKEND_PORT"  "后端"
     # 手工 nohup 起的孤儿 worker.py 不在端口进程树里，必须显式清理（见上）
     kill_legacy_workers
