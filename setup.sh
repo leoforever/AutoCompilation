@@ -14,6 +14,7 @@
 #   init          仅做"建表 + 默认 admin 账号"，便于重置或首次启动
 #   status        按端口探活看后端/前端/PG 状态
 #   rotate-db-password   DB 口令一键轮换（备份→ALTER→验证→写 env→提示 restart）
+#   reset-admin-password 管理员登录密码一键重置（忘密码出路；重登生效，token 面不受扰）
 #   FORCE_RESTART=1 restart   有活跃编译/工单轮次时跳过闸门强停（默认拦截并确认）
 
 set -e
@@ -298,19 +299,38 @@ do_install() {
         info "docker 已安装"
     fi
 
+    # 免密①（2026-10-27）：local 行 md5→peer——openEuler 模板 local all=all 带 md5
+    # （当年只改了 host 行），sudo -u postgres 裸 socket 从此要一个从未设过的密码：
+    # install 的 CREATE USER/DATABASE 一直死等输入或静默失败。SHOW hba_file 自身
+    # 要认证（鸡生蛋）→用固定路径。peer 安全边界=OS 层（仅 root/sudo 化身
+    # postgres）；host 行不动，应用仍 TCP+env 口令（T-9 治理不受影响）。幂等：已 peer 则跳
+    HBA_STD="/var/lib/pgsql/data/pg_hba.conf"
+    if [ -f "$HBA_STD" ] && sudo grep -qE '^local[[:space:]]+all[[:space:]]+all[[:space:]]+md5' "$HBA_STD"; then
+        sudo sed -i 's/^local\(\s\+\)all\(\s\+\)all\(\s\+\)md5/local\1all\2all\3peer/' "$HBA_STD"
+        sudo systemctl reload postgresql 2>/dev/null \
+          || sudo -u postgres pg_ctl reload -D /var/lib/pgsql/data 2>/dev/null || true
+        info "pg_hba local 行已回 peer（sudo -u postgres 裸 socket 免密恢复）"
+    fi
+
     # T-9（2026-10-26）：口令不再硬编码——.env.compile 已有 DB_PASSWORD 用之，
     # 没有则生成并写入（与 rotate-db-password 同一把钥匙），再建用户
     ensure_db_password
     info "创建数据库用户和数据库...（口令取自 .env.compile，不回显）"
     ( set -a; source "$ENV_FILE"; set +a
       # C1 修（2026-10-27）：口令经 stdin 进 psql，不落 ps 命令行（旧 -c 全进程表可见）
+      # C1b 补（同日，实锤于卡死 install 的 ps 现场）：-v pw="$..." 又把口令放回
+      # argv——heredoc 非引号即 bash 展开，先 SQL 转义（'→''）再内插；PGPASSWORD
+      # 走 env（/proc/…/environ 0400，仅属主/root 可读，是标准可接受面）
       # B-10：空口令拒绝（占位空串未填就建库=埋匿名账号）
       [ -n "${DB_PASSWORD:-}" ] || { warn "DB_PASSWORD 为空（$ENV_FILE 未填）——跳过 CREATE USER"; false; } && true
-      sudo -u postgres psql -v ON_ERROR_STOP=1 -v pw="$DB_PASSWORD" >/dev/null 2>&1 <<SQL || warn "CREATE USER 失败（local md5 下 sudo -u postgres 免密不可用属预期）——全新环境请 sudo -u postgres psql 手工建 user/db，口令取自 $ENV_FILE 的 DB_PASSWORD"
-CREATE USER compile_user WITH PASSWORD :'pw';
+      _pwq="${DB_PASSWORD//\'/\'\'}"   # SQL 字面量转义：单引号翻倍
+      sudo -u postgres psql -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL || warn "CREATE USER 失败（local md5 下 sudo -u postgres 免密不可用属预期）——全新环境请 sudo -u postgres psql 手工建 user/db，口令取自 $ENV_FILE 的 DB_PASSWORD"
+CREATE USER compile_user WITH PASSWORD '${_pwq}';
 SQL
     )
-    sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
+    # 静默 || true 改出声（u9 演练实锤过"库没建成无人知"）；已存在=正常
+    sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null \
+      || warn "CREATE DATABASE 未执行（库已存在=正常；全新环境请 \du \l 核对）"
 
     info "配置 PG 认证：pg_hba.conf 把 host 行的 ident 改 md5（修复 Ident 认证失败）..."
     # 默认 PG 是 peer 认证（基于 OS 用户），应用通过 tcp 连接时密码不参与验证
@@ -453,8 +473,9 @@ do_rotate_db_password() {
     # 注：本机 pg_hba local 已改 md5，sudo -u postgres 裸 socket 要密码——
     # 用旧口令自连执行 ALTER（rotate 前提=env 旧口令可用，此路必通）
     # C1 修：ALTER 经 stdin（heredoc）——新旧口令不再进 ps 进程命令行
-    if ! PGPASSWORD="$old_pass" psql -v newpw="$new_pass" -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" >/dev/null 2>&1 <<SQL
-ALTER USER "$db_user" WITH PASSWORD :'newpw';
+    _npq="${new_pass//\'/\'\'}"   # C1b：hex 无引号仍统一转义；口令不出 argv
+    if ! PGPASSWORD="$old_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" >/dev/null 2>&1 <<SQL
+ALTER USER "$db_user" WITH PASSWORD '${_npq}';
 SQL
     then
         error "ALTER 失败（旧口令连不上？）。手工执行：psql -U $db_user 后 ALTER ...；env 尚未改动仍是旧值"
@@ -475,6 +496,42 @@ SQL
     info "  完成 —— 请 bash setup.sh restart 让后端带新凭据重启（数据零影响；仅重启窗 ~1min）"
 }
 
+do_reset_admin_password() {
+    # 免密③（2026-10-27）：已部署环境忘 admin 密码的一键出路（此前只能手工 psql）
+    # bcrypt(12) 与 init 建号同源；只改 hash——旧 token 不失效，重登即用新密码
+    [ -f "$ENV_FILE" ] || { error "缺少 $ENV_FILE"; exit 1; }
+    set -a; source "$ENV_FILE"; set +a
+    read_db_params
+    local target="${ADMIN_INIT_USERNAME:-admin}" pw1 pw2
+    pw1="${ADMIN_NEW_PASSWORD:-}"
+    if [ -z "$pw1" ]; then
+        if [ -t 0 ]; then
+            read -sp "为 $target 设置新密码: " pw1; echo
+            read -sp "确认新密码: " pw2; echo
+            [ "$pw1" = "$pw2" ] || error "两次输入不一致"
+        else
+            error "交互执行，或 ADMIN_NEW_PASSWORD='<密码>' bash setup.sh reset-admin-password"
+        fi
+    fi
+    [ ${#pw1} -ge 8 ] || error "密码至少 8 位"
+    export RESET_TARGET="$target"
+    cd "$BACKEND_DIR"   # python 段 import app.*，缺 cd 必 ModuleNotFound（终验抓到）
+    PGPASSWORD="${DB_PASSWORD:-}" RESET_PW="$pw1" "$(detect_pybin)" <<'PY'
+import os
+from app.models import engine
+from sqlalchemy import text
+import bcrypt
+with engine.connect() as conn:
+    h = bcrypt.hashpw(os.environ["RESET_PW"].encode(), bcrypt.gensalt(rounds=12)).decode()
+    r = conn.execute(text("UPDATE users SET password_hash=:p WHERE username=:u"),
+                     {"p": h, "u": os.environ["RESET_TARGET"]})
+    conn.commit()
+    if r.rowcount == 0:
+        raise SystemExit("用户不存在: " + os.environ["RESET_TARGET"])
+print("  ✅ 密码已重置（旧 token 不失效，重新登录生效）")
+PY
+}
+
 do_init() {
     [ -f "$ENV_FILE" ] || error "缺少 $ENV_FILE，worker/数据库配置会缺"
     # C1 现网升级路径：老 .env.compile 没有 JWT_SECRET_KEY → 补生成一次（此后固定）
@@ -492,10 +549,17 @@ do_init() {
     cd "$BACKEND_DIR"
     set -a; source "$ENV_FILE"; set +a
 
-    # 密码策略（T2）：ADMIN_INIT_PASSWORD 环境变量显式传入；
-    # 未设时交互式终端 read -s 输入；非交互 fail-fast（拒绝弱默认密码建库）
+    # 密码策略（T2 + 免密② 2026-10-27）：只有"真要建 admin"时才问——旧版问在
+    # 顶部，已部署环境每次 init/install 被白问一遍（答错还 fail 全流程）。
+    # 先经 TCP+env 口令探测 users 计数：>0 跳过询问；==0/查不到才走 env→交互→fail-fast
     local admin_user="${ADMIN_INIT_USERNAME:-admin}"
-    if [ -z "${ADMIN_INIT_PASSWORD:-}" ]; then
+    read_db_params
+    local _ucount
+    _ucount=$(PGPASSWORD="${DB_PASSWORD:-}" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+              -t -A -c "SELECT count(*) FROM users;" 2>/dev/null || echo "")
+    if [ -n "$_ucount" ] && [ "$_ucount" != "0" ]; then
+        info "  管理员账号已存在（users=${_ucount}），本次无需设置密码"
+    elif [ -z "${ADMIN_INIT_PASSWORD:-}" ]; then
         if [ -t 0 ]; then
             local pw1 pw2
             read -sp "设置管理员($admin_user)密码: " pw1; echo
@@ -978,7 +1042,8 @@ case "${1:-start}" in
     restart) do_restart "$2" ;;  # 透传模式参数；不传 = 保持 COMPILE_MODE
     status)  do_status ;;
     uninstall) do_uninstall "${@:2}" ;;   # 可选 --purge / --yes
-    rotate-db-password) do_rotate_db_password ;;  # T-9：DB 口令一键轮换（备份→ALTER→env→验证）
+    rotate-db-password) do_rotate_db_password ;;
+    reset-admin-password) do_reset_admin_password ;;  # T-9：DB 口令一键轮换（备份→ALTER→env→验证）
     # B-4（2026-10-27）：旧版直调 do_start——端口被占只 warn 跳过，"切模式"静默
     # no-op。语义即切换 → 走 restart（顺带受 A2 活跃作业闸门保护）
     dev)     do_restart dev ;;
