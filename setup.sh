@@ -4,7 +4,8 @@
 #
 #   start         生产模式启动（默认；uvicorn 无 --reload）
 #   start dev     开发模式启动（uvicorn --reload，改 .py 自动热加载）
-#   dev / prod    等同 'start dev' / 'start prod'
+#   dev / prod    切换模式重启（B-4 修：旧版端口被占时静默 no-op，现走 restart
+#                 语义——活跃编译/工单会被 A2 闸门拦下确认）
 #   restart       重启（保持当前模式，可用 restart dev/prod 切换）
 #   restart dev   切到开发模式重启
 #   restart prod  切到生产模式重启
@@ -12,6 +13,8 @@
 #   install       一次性环境准备（装 PG、建库装表、装 Python/前端依赖、默认账号）
 #   init          仅做"建表 + 默认 admin 账号"，便于重置或首次启动
 #   status        按端口探活看后端/前端/PG 状态
+#   rotate-db-password   DB 口令一键轮换（备份→ALTER→验证→写 env→提示 restart）
+#   FORCE_RESTART=1 restart   有活跃编译/工单轮次时跳过闸门强停（默认拦截并确认）
 
 set -e
 # 路径：默认是 setup.sh 所在目录的父目录（即仓库根），可被环境变量覆盖
@@ -35,13 +38,33 @@ info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+# A1 修（2026-10-27）：env 键值统一"写带引号、测带引号"同口径 helper。
+# 旧 bug：sed 写成 export KEY=*** *未再包引号），检测却要求
+#   ^export KEY="[^"]+"$ —— 永检不到 → 每次 install/init 重复生成覆写：
+#   DB_PASSWORD 与库侧脱钩（下次起后端连不上 DB）、JWT 每次换钥（全员 token
+#   静默作废）。根因=写/测口径漂移，从此写测必须同源。
+env_set_quoted() {  # FILE KEY VALUE
+    local f="$1" k="$2" v="$3"
+    grep -Eq "^export ${k}=" "$f" 2>/dev/null || printf 'export %s=""\n' "$k" >> "$f"
+    sed -i "s|^export ${k}=.*|export ${k}=\"${v}\"|" "$f"
+}
+env_has_value() {   # FILE KEY → 0 当且仅当存在非空带引号值
+    grep -Eq "^export $2=\"[^\"]+\"" "$1" 2>/dev/null
+}
+gen_secret() {      # [$字节数] → hex 随机串（openssl 首选，urandom 兜底）
+    local n="${1:-32}"
+    openssl rand -hex "$n" 2>/dev/null \
+        || head -c "$n" /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
 # 通用探活：按端口找监听 PID
 port_pid() {
+    # C3（2026-10-27）：awk 匹配行尾锚定 :$port$，防 :8000 前缀误命中 :80001
     local port=$1
     ss -tlnp 2>/dev/null \
-        | awk -v p=":$port" '$4 ~ p {print $0}' \
+        | awk -v p=":$port" '$4 ~ (p"$") {print $0}' \
         | grep -oP 'pid=\K[0-9]+' \
-        | head -1
+        | sort -u
 }
 
 # 杀端口上跑的东西（杀 pid 本身 + 递归子进程）
@@ -49,7 +72,7 @@ kill_port() {
     local port=$1
     local label=$2
     local pid
-    pid=$(port_pid "$port")
+    pid=$(port_pid "$port" | tr '\n' ' ' | sed 's/^ *//;s/ *$//')   # B-11：双栈多根全收
     if [ -z "$pid" ]; then
         info "$label 未运行（端口 $port 空闲）"
         return 0
@@ -89,11 +112,17 @@ kill_port() {
     done
     warn "$label ${grace}s 内未退出，强制 SIGKILL（lifespan 卡住走 fallback）"
     # 杀整个进程组（kill_port 拿到的 pid 是监听进程；进程组还包括 worker thread / child）
-    local pgid
-    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    if [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
-        kill -KILL "-$pgid" 2>/dev/null || true
-    fi
+    # B-2：setsid 后每根服务自成一组——逐根取 pgid 连坐（组内只有自家树），
+    # 不再拿第一根的组赌全部；setsid 缺位的极老环境此路径仍保底
+    local one pgids=""
+    for one in $pids_to_kill; do
+        local g
+        g=$(ps -o pgid= -p "$one" 2>/dev/null | tr -d ' ' || true)
+        [ -n "$g" ] && [ "$g" != "0" ] && pgids="$pgids $g"
+    done
+    for g in $(echo "$pgids" | tr ' ' '\n' | sort -u | grep -v '^$'); do
+        kill -KILL "-$g" 2>/dev/null || true
+    done
     # 再 KILL 一遍树里剩余的 pid（pgid 没覆盖到子进程 / worker thread 的）
     for p in $pids_to_kill; do
         kill -KILL "$p" 2>/dev/null || true
@@ -117,11 +146,12 @@ http_alive() {
 # 后端健康探针（必须先 source env，让 settings 可用）
 # 输出 "READY:<code>" / "FAIL:<code>"，code=000 表示连不上
 backend_healthcheck() {
+    # B-9 修（2026-10-27）：旧版每次探活 POST 假用户 login——高频轮询制造成堆失败
+    # 登录审计，且后端防时序攻击会做 dummy bcrypt（~250ms/次白烧 CPU）。
+    # 改探无鉴权静态路由 /docs：200=进程+路由+中间件全活，零副作用
     local code
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
-        -X POST "http://localhost:$BACKEND_PORT/api/auth/login" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        -d "username=__hc__&password=__hc__" 2>/dev/null)
+        "http://localhost:$BACKEND_PORT/docs" 2>/dev/null)
     : "${code:=000}"
     if [ "$code" = "000" ] || [ "$code" = "404" ]; then
         echo "FAIL:$code"
@@ -164,11 +194,12 @@ do_install() {
         cp "${ENV_FILE}.example" "$ENV_FILE"
         info "已从模板创建 $ENV_FILE（AI 三件套必填；运维参数在 config.yaml）"
         # C1（2026-10-26）：JWT 密钥自动生成——fail-fast 配套，操作员无需手造
-        if ! grep -q "^export JWT_SECRET_KEY=\".\+\"" "$ENV_FILE" 2>/dev/null; then
-            _jwt="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        # A1 修：走 env_set_quoted/env_has_value，写测同口径（防重复覆写换钥）
+        if ! env_has_value "$ENV_FILE" JWT_SECRET_KEY; then
+            _jwt="$(gen_secret 32)"
             [ -n "$_jwt" ] || error "生成 JWT_SECRET_KEY 失败（需 openssl 或 /dev/urandom）"
-            grep -q "^export JWT_SECRET_KEY" "$ENV_FILE" || echo "" >> "$ENV_FILE"
-            sed -i "s|^export JWT_SECRET_KEY=.*|export JWT_SECRET_KEY="$_jwt"|" "$ENV_FILE"
+            env_set_quoted "$ENV_FILE" JWT_SECRET_KEY "$_jwt"
+            unset _jwt
             info "已自动生成 JWT_SECRET_KEY（32B 随机；缺失则拒绝启动）"
         fi
         warn "请立刻编辑 $ENV_FILE，至少填好以下 3 项："
@@ -241,8 +272,13 @@ do_install() {
     ensure_db_password
     info "创建数据库用户和数据库...（口令取自 .env.compile，不回显）"
     ( set -a; source "$ENV_FILE"; set +a
-      sudo -u postgres psql -c "CREATE USER compile_user WITH PASSWORD '$DB_PASSWORD';" 2>/dev/null \
-        || warn "CREATE USER 失败（local md5 下 sudo -u postgres 免密不可用属预期）——全新环境请 sudo -u postgres psql 手工建 user/db，口令取自 $ENV_FILE 的 DB_PASSWORD" )
+      # C1 修（2026-10-27）：口令经 stdin 进 psql，不落 ps 命令行（旧 -c 全进程表可见）
+      # B-10：空口令拒绝（占位空串未填就建库=埋匿名账号）
+      [ -n "${DB_PASSWORD:-}" ] || { warn "DB_PASSWORD 为空（$ENV_FILE 未填）——跳过 CREATE USER"; false; } && true
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -v pw="$DB_PASSWORD" >/dev/null 2>&1 <<SQL || warn "CREATE USER 失败（local md5 下 sudo -u postgres 免密不可用属预期）——全新环境请 sudo -u postgres psql 手工建 user/db，口令取自 $ENV_FILE 的 DB_PASSWORD"
+CREATE USER compile_user WITH PASSWORD :'pw';
+SQL
+    )
     sudo -u postgres psql -c "CREATE DATABASE compile_platform OWNER compile_user;" 2>/dev/null || true
 
     info "配置 PG 认证：pg_hba.conf 把 host 行的 ident 改 md5（修复 Ident 认证失败）..."
@@ -279,12 +315,25 @@ do_install() {
 
     info "安装 Python 依赖（fastapi / sqlalchemy / psycopg2-binary / python-jose / passlib / langchain-openai 等）..."
     cd "$BACKEND_DIR"
-    pip install -r requirements.txt -q
+    # B-5（2026-10-27）：装进取向统一——优先"已具备后端运行时依赖"的解释器；
+    # 一个都没有则认 pip 自己的宿主 python（pip --version 同源），杜绝装进 A 跑 B
+    _py="$(detect_pybin)"
+    if ! "$_py" -c 'import uvicorn' >/dev/null 2>&1; then
+        _pipowner="$(pip --version 2>/dev/null | grep -oP 'python \d+\.\d+' | head -1)"
+        [ -n "$_pipowner" ] && command -v "python$_pipowner" >/dev/null 2>&1 && _py="python$_pipowner"
+    fi
+    info "  依赖安装目标解释器: $_py"
+    "$_py" -m pip install -r requirements.txt -q
 
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
     # npm install 本身幂等（已装会 skip）；加 --no-audit --no-fund 加速
-    npm install --no-audit --no-fund --silent 2>&1 | tail -20
+    # A3 修（2026-10-27）：`npm … | tail` 管道退出码=tail 的 0，npm 失败被吞、
+    # 一路"成功"到启动才爆。重定向日志+查返回值，失败带尾部上下文退出
+    if ! npm install --no-audit --no-fund --silent > "$LOG_DIR/npm-install.log" 2>&1; then
+        tail -20 "$LOG_DIR/npm-install.log"
+        error "npm install 失败（详见 $LOG_DIR/npm-install.log）"
+    fi
     # 不主动拉 docker 镜像：每个目标系统的镜像地址 / tag 由部署者配 DOCKER_IMAGE，
     # 第一次编译任务提交时 worker 会自动 docker pull。强制 install 阶段拉只会拖慢。
 
@@ -294,79 +343,113 @@ do_install() {
 
 # ========== 后端解释器探测（init 用；需 sqlalchemy+bcrypt） ==========
 # PATH 的 python3 可能没装依赖（本机 3.13 无 sqlalchemy/bcrypt，3.11 有），逐个试取第一个可用的
-detect_init_pybin() {
+# B-5（2026-10-27）：旧版三处解释器逻辑互不知情（install 裸 pip / init 判 sqlalchemy /
+# start 判 uvicorn），本机 python3=3.13 与 pip→3.11 已分家——统一判据=uvicorn+
+# sqlalchemy+bcrypt 三依赖齐活，三调用点共用本函数（init 兼容别名见下）
+detect_pybin() {
     local cand
     for cand in python3 /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3; do
-        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sqlalchemy, bcrypt' >/dev/null 2>&1; then
+        if command -v "$cand" >/dev/null 2>&1 \
+           && "$cand" -c 'import uvicorn, sqlalchemy, bcrypt' >/dev/null 2>&1; then
             echo "$cand"
             return 0
         fi
     done
     echo python3
 }
+detect_init_pybin() { detect_pybin; }
 
 # ========== 初始化（建表 + 幂等迁移 + 默认账号） ==========
 # T-9（2026-10-26）：DB 口令生成与轮换——口令唯 .env.compile 的 DB_PASSWORD（git 不养凭据）
 ensure_db_password() {
     # 已有非空 DB_PASSWORD → 不动；否则生成写入（install/init 自愈路径，幂等）
+    # A1 修：检测/写入同口径后此函数真正幂等——旧版永判"缺失"每次 init 覆写新值，
+    # 与 PG 库侧脱钩（后端连不上 DB）；C6：生成结果断非空
     [ -f "$ENV_FILE" ] || return 0
-    if ! grep -q "^export DB_PASSWORD=\".\+\"" "$ENV_FILE" 2>/dev/null; then
-        _dbp="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-        grep -q "^export DB_PASSWORD" "$ENV_FILE" || echo "" >> "$ENV_FILE"
-        sed -i "s|^export DB_PASSWORD=.*|export DB_PASSWORD="$_dbp"|" "$ENV_FILE"
+    if ! env_has_value "$ENV_FILE" DB_PASSWORD; then
+        _dbp="$(gen_secret 16)"
+        [ -n "$_dbp" ] || error "生成 DB_PASSWORD 失败（需 openssl 或 /dev/urandom）"
+        env_set_quoted "$ENV_FILE" DB_PASSWORD "$_dbp"
         unset _dbp
         warn "已在 $ENV_FILE 生成 DB_PASSWORD（首次升级自动执行；库侧口令需 setup.sh rotate-db-password 对齐）"
     fi
 }
 
+# B2 修（2026-10-27）：DB 连接参数统一读取——install/rotate/uninstall 同一份口径
+# （旧版 rotate 硬编码 localhost/compile_user/compile_platform、uninstall 自带 awk 五连，
+#  影子测试/非默认部署必打错库）；env 同名变量优先（DB_HOST/PORT/USER/NAME）
+read_db_params() {
+    db_host=$(awk '/postgresql:/{f=1;next} f&&/host:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_port=$(awk '/postgresql:/{f=1;next} f&&/port:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_user=$(awk '/postgresql:/{f=1;next} f&&/username:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_name=$(awk '/postgresql:/{f=1;next} f&&/database:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+    db_host="${DB_HOST:-${db_host:-localhost}}"; db_port="${DB_PORT:-${db_port:-5432}}"
+    db_user="${DB_USER:-${db_user:-compile_user}}"; db_name="${DB_NAME:-${db_name:-compile_platform}}"
+}
+
 do_rotate_db_password() {
-    # 一条命令闭环：备份→生成→ALTER USER→写 env→验证新口令→提示 restart
+    # 一条命令闭环：备份→生成→ALTER→验证新口令→写 env→提示 restart
     # （"只挪文件不轮换=没修"——本命令让轮换成为可执行动作而非手工 SQL）
+    # C2 修：验证先于写 env——旧顺序"验证失败"提示"env 未修改"与事实不符（③已写）
     [ -f "$ENV_FILE" ] || { error "缺少 $ENV_FILE"; exit 1; }
     set -a; source "$ENV_FILE"; set +a
+    read_db_params
     local old_pass="${DB_PASSWORD:-}"
     local new_pass
-    new_pass="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    new_pass="$(gen_secret 16)"
     [ -n "$new_pass" ] || { error "生成失败（需 openssl 或 /dev/urandom）"; exit 1; }
 
     info "① 备份整库（pg_dump → cache/pre-rotate-latest.sql.gz）"
     mkdir -p "$BACKEND_DIR/cache"
-    if [ -n "$old_pass" ] && PGPASSWORD="$old_pass" psql -h localhost -U compile_user -d compile_platform -t -A -c "SELECT 1" >/dev/null 2>&1; then
-        PGPASSWORD="$old_pass" pg_dump -h localhost -U compile_user compile_platform | gzip > "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz"
+    if [ -n "$old_pass" ] && PGPASSWORD="$old_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -A -c "SELECT 1" >/dev/null 2>&1; then
+        # A3 修：pg_dump|gzip 管道中 pg_dump 失败 gzip 仍 0 收尾——"备份完成"可能是假的；
+        # 查 PIPESTATUS[0]，失败清半成品并中止（备份先行=承诺不是装饰）
+        PGPASSWORD="$old_pass" pg_dump -h "$db_host" -p "$db_port" -U "$db_user" "$db_name" 2>/dev/null | gzip > "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz"
+        if [ "${PIPESTATUS[0]}" != "0" ]; then
+            rm -f "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz"
+            error "pg_dump 备份失败，轮换中止（env/库均未改动）"
+        fi
         info "  备份完成：$BACKEND_DIR/cache/pre-rotate-latest.sql.gz ($(du -h "$BACKEND_DIR/cache/pre-rotate-latest.sql.gz" | cut -f1))"
     else
         warn "  旧口令连不上（可能已轮换过/env 与库不一致），跳过备份继续"
     fi
 
-    info "② ALTER USER compile_user（PG 侧改密，数据/权限零变化）"
-    # 注：本机 pg_hba local 已被改 md5，sudo -u postgres 裸 socket 会要密码——
-    # 用旧口令自连执行 ALTER（rotate 的前提就是 env 里旧口令可用，此路必通）
-    if ! PGPASSWORD="$old_pass" psql -h localhost -U compile_user -d compile_platform \
-          -c "ALTER USER compile_user WITH PASSWORD '$new_pass';" >/dev/null 2>&1; then
-        error "ALTER 失败（旧口令连不上？）。手工执行：psql -U compile_user 后 ALTER USER ... PASSWORD '<新串>'，env 已预写新值请保持一致"
+    info "② ALTER USER $db_user（PG 侧改密，数据/权限零变化）"
+    # 注：本机 pg_hba local 已改 md5，sudo -u postgres 裸 socket 要密码——
+    # 用旧口令自连执行 ALTER（rotate 前提=env 旧口令可用，此路必通）
+    # C1 修：ALTER 经 stdin（heredoc）——新旧口令不再进 ps 进程命令行
+    if ! PGPASSWORD="$old_pass" psql -v newpw="$new_pass" -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" >/dev/null 2>&1 <<SQL
+ALTER USER "$db_user" WITH PASSWORD :'newpw';
+SQL
+    then
+        error "ALTER 失败（旧口令连不上？）。手工执行：psql -U $db_user 后 ALTER ...；env 尚未改动仍是旧值"
         exit 1
     fi
 
-    info "③ 写入 .env.compile"
-    grep -q "^export DB_PASSWORD" "$ENV_FILE" || echo "" >> "$ENV_FILE"
-    sed -i "s|^export DB_PASSWORD=.*|export DB_PASSWORD="$new_pass"|" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-
-    info "④ 验证新口令可登录"
-    if PGPASSWORD="***" psql -h localhost -U compile_user -d compile_platform -t -A -c "SELECT 1" | grep -q 1; then
-        info "  新口令验证 OK —— 请 bash setup.sh restart 让后端带新凭据重启（数据零影响；仅重启窗 ~1min）"
+    info "③ 验证新口令可登录（先验证后落 env——C2）"
+    if PGPASSWORD="$new_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -A -c "SELECT 1" 2>/dev/null | grep -q 1; then
+        info "  新口令验证 OK"
     else
-        error "  新口令验证失败！手工回滚：sudo -u postgres psql -c 'ALTER USER compile_user WITH PASSWORD ...' 重置回旧值；env 此时未被修改仍是旧口令"
+        error "  新口令验证失败！回滚：PGPASSWORD=\"$old_pass\" psql -h $db_host -U $db_user 执行 ALTER USER \"$db_user\" WITH PASSWORD '<旧值>'；env 未写入，重启即恢复旧链"
         exit 1
     fi
+
+    info "④ 写入 .env.compile"
+    env_set_quoted "$ENV_FILE" DB_PASSWORD "$new_pass"   # A1：写测同口径
+    chmod 600 "$ENV_FILE"
+    info "  完成 —— 请 bash setup.sh restart 让后端带新凭据重启（数据零影响；仅重启窗 ~1min）"
 }
 
 do_init() {
     [ -f "$ENV_FILE" ] || error "缺少 $ENV_FILE，worker/数据库配置会缺"
     # C1 现网升级路径：老 .env.compile 没有 JWT_SECRET_KEY → 补生成一次（此后固定）
-    if ! grep -q "^export JWT_SECRET_KEY=\".\+\"" "$ENV_FILE" 2>/dev/null; then
-        _jwt="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-        echo "export JWT_SECRET_KEY="$_jwt"" >> "$ENV_FILE"
+    # A1 修：旧版 echo >> 追加且写入不带引号——每次 init 追加一行+重生成=静默全员换
+    # token；改走同口径 helper（有值即跳过，绝不重复追加）
+    if ! env_has_value "$ENV_FILE" JWT_SECRET_KEY; then
+        _jwt="$(gen_secret 32)"
+        [ -n "$_jwt" ] || error "生成 JWT_SECRET_KEY 失败（需 openssl 或 /dev/urandom）"
+        env_set_quoted "$ENV_FILE" JWT_SECRET_KEY "$_jwt"
+        unset _jwt
         warn "已在 $ENV_FILE 补生成 JWT_SECRET_KEY（首次升级自动执行；全员旧 token 失效需重登）"
     fi
     # T-9 同款：DB 口令缺失补生成（仅写 env；库侧对齐用 rotate-db-password）
@@ -443,24 +526,20 @@ do_start() {
         set -a; source "$ENV_FILE"; set +a
         # 选解释器：PATH 的 python3 可能没装依赖（本机 3.13 无 uvicorn，3.11 有）
         # 逐个试 import uvicorn，取第一个能用的；全都不行才回退 python3（报原来的错）
-        PYBIN=""
-        for cand in python3 /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3; do
-            if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import uvicorn' >/dev/null 2>&1; then
-                PYBIN="$cand"; break
-            fi
-        done
-        [ -z "$PYBIN" ] && PYBIN=python3
+        PYBIN="$(detect_pybin)"   # B-5：与 install/init 同一探测
         info "后端解释器: $PYBIN ($($PYBIN --version 2>&1))"
         # 按模式决定是否加 --reload
         if [ "$mode" = "dev" ]; then
-            nohup "$PYBIN" -m uvicorn app.main:app \
+            # B-2（2026-10-27）：setsid 使守护自立进程组——nohup 不脱组，无 job control
+            # 环境（cron/远程 sh）下服务继承调用终端 pgid，kill_port 的 -pgid 兜底连坐
+            setsid nohup "$PYBIN" -m uvicorn app.main:app \
                 --host 0.0.0.0 --port "$BACKEND_PORT" --reload \
                 --reload-dir app \
-                >> "$LOG_DIR/backend.log" 2>&1 &
+                >> "$LOG_DIR/backend.log" 2>&1 9>&- &   # C5修：fd9 不随 exec 继承给守护
         else
-            nohup "$PYBIN" -m uvicorn app.main:app \
+            setsid nohup "$PYBIN" -m uvicorn app.main:app \
                 --host 0.0.0.0 --port "$BACKEND_PORT" \
-                >> "$LOG_DIR/backend.log" 2>&1 &
+                >> "$LOG_DIR/backend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：同上
         fi
         disown || true
         # 等最多 15 秒探活
@@ -480,10 +559,31 @@ do_start() {
     if [ -n "$(port_pid "$FRONTEND_PORT")" ]; then
         warn "前端已在运行（端口 $FRONTEND_PORT 已被占用，PID $(port_pid "$FRONTEND_PORT")）"
     else
-        info "启动前端..."
         cd "$FRONTEND_DIR"
-        nohup npm run dev -- --host 0.0.0.0 \
-            >> "$LOG_DIR/frontend.log" 2>&1 &
+        # B1 修（2026-10-27）：prod 模式不再把 vite dev server 当生产服务——dev 常驻
+        # 有 esbuild 子服务死亡→页面随机崩的既往事故（第二套部署实测）；改
+        # `vite preview` 静态服务（复用已构建 dist，代理走 vite.config preview.proxy）。
+        # dist 缺失则先 build（npm run build 失败带日志退出，不静默）
+        if [ "$mode" = "dev" ]; then
+            info "启动前端（dev server：HMR，仅开发用）..."
+            setsid nohup npm run dev -- --host 0.0.0.0 \
+                >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
+        else
+            if [ ! -f "dist/index.html" ]; then
+                info "dist 缺失，先构建（npm run build）..."
+                if ! npm run build > "$LOG_DIR/frontend-build.log" 2>&1; then
+                    tail -20 "$LOG_DIR/frontend-build.log"
+                    error "前端构建失败（详见 $LOG_DIR/frontend-build.log）"
+                fi
+            fi
+            # 新鲜度提示：源码比 dist 新只提醒不阻断（发布时机由人决定）
+            if [ -n "$(find src index.html vite.config.ts -newer dist/index.html 2>/dev/null | head -1)" ]; then
+                warn "dist 比 src/index.html/vite.config 旧——展示的是旧版界面；更新请: cd frontend && npx vite build"
+            fi
+            info "启动前端（prod：vite preview 静态服务）..."
+            setsid nohup npm run preview -- --host 0.0.0.0 \
+                >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
+        fi
         disown || true
         for i in 1 2 3 4 5 6 7 8 9 10; do
             sleep 1
@@ -505,7 +605,7 @@ do_start() {
     local main_ip
     main_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
     if [ -z "$main_ip" ] || [ "$main_ip" = "1.1.1.1" ]; then
-        main_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+        main_ip=$(_local_ipv4s | head -1)   # B-7：复用统一探测，消重复实现
     fi
     if [ -z "$main_ip" ]; then
         main_ip="localhost"
@@ -546,6 +646,12 @@ do_uninstall() {
     # T-9：config.yaml 已无 password 行——env DB_PASS > .env.compile DB_PASSWORD > 报错
     [ -z "$db_pass" ] && [ -f "$ENV_FILE" ] && db_pass="$(source "$ENV_FILE" 2>/dev/null && echo "$DB_PASSWORD")"
     db_pass="${DB_PASS:-$db_pass}"
+    # B-8d 修：口令链路显式化——config/env 都取不到 DB_PASSWORD 时直接报错指路，
+    # 不再让后面 psql 认证失败被 2>/dev/null + || warn 吞成"无声退出"
+    if [ -z "${db_pass:-}" ] && [ -f "$ENV_FILE" ]; then
+        db_pass="$(grep -oP '^export DB_PASSWORD="\K[^"]+' "$ENV_FILE" 2>/dev/null)"
+    fi
+    [ -n "${db_pass:-}" ] || error "拿不到 DB_PASSWORD（config/env 均无）——uninstall 中止；影子测试请显式 DB_PASS=xxx 传入"
     # 统一走 -h（TCP）+ 密码：pg_hba 把 local 也设成了 md5，sudo -u postgres 裸 socket 会 fe_sendauth
     local PSQLU="psql -h $db_host -p $db_port -U $db_user"
     export PGPASSWORD="***"
@@ -555,9 +661,22 @@ do_uninstall() {
     local skills_dir="${SKILLS_DIR:-$PROJECT_DIR/skills}"
     local dist_dir="$FRONTEND_DIR/dist"
     local nm_dir="$FRONTEND_DIR/node_modules"
-    local art_dir="${UNINSTALL_ART_DIR:-$PROJECT_DIR/artifacts}"
+    # B-8b 修：artifacts 根此前只认 $PROJECT_DIR/artifacts——若部署用 ARTIFACTS_DIR/
+    # config.yaml 指到别处就漏删；与后端 config.artifacts_dir() 同口径解析
+    local art_dir="${UNINSTALL_ART_DIR:-}"
+    if [ -z "$art_dir" ]; then
+        art_dir=$(awk '/compile:/{f=1;next} f&&/artifact_dir:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
+        art_dir="${ARTIFACTS_DIR:-${art_dir:-./artifacts}}"
+        case "$art_dir" in /*) : ;; *) art_dir="$PROJECT_DIR/${art_dir#./}" ;; esac
+    fi
     local log_dir="${UNINSTALL_LOG_DIR:-$PROJECT_DIR/logs}"
-    local cache_dir="${UNINSTALL_CACHE_DIR:-$PROJECT_DIR/cache}"
+    # B-8a 修（2026-10-27）：cache 实际在 backend/cache/（sqlite/备份都落那），
+    # 旧版指 $PROJECT_DIR/cache 是不存在的顶层目录=删了个寂寞
+    if [ -d "$BACKEND_DIR/cache" ]; then
+        local cache_dir="${UNINSTALL_CACHE_DIR:-$BACKEND_DIR/cache}"
+    else
+        local cache_dir="${UNINSTALL_CACHE_DIR:-$PROJECT_DIR/cache}"
+    fi
 
     info "===== uninstall${purge:+（--purge 全清档）} 目标 ====="
     echo "  数据库: $db_name@$db_host:$db_port（pg_dump 备份后 DROP）"
@@ -613,7 +732,9 @@ do_uninstall() {
         # label 口径（引擎 stage3 建容器统一带）；grep -v 防无匹配时把整仓库容器全清
         local ids
         ids=$(docker ps -aq --filter 'label=task_id' --filter 'label=phase=infrastructure' 2>/dev/null | grep -v '^$' || true)
-        ids=$(echo "$ids" $(docker ps -aq --filter 'label=ticket_id' 2>/dev/null || true) | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+        # B-8c 修（2026-10-27）：工单会话容器的 label 实为 compile.ticket（引擎实况
+        # ticket_agent.py:373）——旧过滤键 label=ticket_id 永不匹配=工单容器全漏网
+        ids=$(echo "$ids" $(docker ps -aq --filter 'label=compile.ticket' 2>/dev/null || true) | tr ' ' '\n' | grep -v '^$' | sort -u || true)
         if [ -n "$ids" ]; then
             echo "$ids" | xargs -r docker rm -f >/dev/null && info "  ✅ 删除 label 容器 $(echo "$ids" | wc -l) 个"
         else
@@ -708,8 +829,37 @@ kill_legacy_workers() {
     fi
 }
 
+# A2 修（2026-10-27）：stop/restart 活跃作业闸门——kill_port 30s 优雅期后 SIGKILL，
+# 进行中的编译任务（合法 1~3 小时）与工单 Agent 轮次必被腰斩；此前靠"重启前手查
+# DB"的操作纪律，现内建为脚本行为。查询失败（库未 init/连不上）按无活跃放行——
+# 反正后端也起不来，拦了没意义。强停逃生口：FORCE_RESTART=1（非交互必备）。
+active_work_gate() {
+    [ -f "$ENV_FILE" ] || return 0
+    local db_host db_port db_user db_name out
+    set -a; source "$ENV_FILE" 2>/dev/null; set +a
+    read_db_params
+    out=$(PGPASSWORD="${DB_PASSWORD:-}" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -A -F, \
+        -c "SELECT (SELECT count(*) FROM compile_tasks WHERE status IN ('compiling','submitted')), (SELECT count(*) FROM tickets WHERE status='processing');" 2>/dev/null) || return 0
+    [[ "$out" =~ ^[0-9]+,[0-9]+$ ]] || return 0
+    local ntask="${out%%,*}" nticket="${out##*,}"
+    [ "$((ntask + nticket))" -eq 0 ] && return 0
+    warn "检测到活跃作业：编译任务 $ntask 个（compiling/submitted）、工单 Agent 轮次 $nticket 个（processing）"
+    warn "停止会腰斩它们（编译靠 reconcile 自愈、Agent 轮次将中断且 partial 快照留存）"
+    if [ "${FORCE_RESTART:-0}" = "1" ]; then
+        warn "FORCE_RESTART=1 → 跳过确认继续"
+        return 0
+    fi
+    if [ -t 0 ]; then
+        read -p "仍要停止? 输入 yes 继续: " ans
+        [ "$ans" = "yes" ] || error "已取消（活跃作业保护；确要强停用 FORCE_RESTART=1 bash setup.sh ${CMD:-restart}）"
+    else
+        error "非交互环境拒绝强停活跃作业。确知安全则：FORCE_RESTART=1 bash setup.sh ${CMD:-restart}"
+    fi
+}
+
 # ========== 停止 ==========
 do_stop() {
+    active_work_gate   # A2：先闸后杀
     kill_port "$FRONTEND_PORT" "前端"
     kill_port "$BACKEND_PORT"  "后端"
     # 手工 nohup 起的孤儿 worker.py 不在端口进程树里，必须显式清理（见上）
@@ -741,12 +891,26 @@ do_status() {
     else
         echo "  前端: 已停止"
     fi
+    # B-12 修：头注释声称"探 PG"而旧版未探——补 pg_isready（名实相符）
+    if command -v pg_isready >/dev/null 2>&1; then
+        if pg_isready -q 2>/dev/null; then echo "  PostgreSQL: 运行中"; else echo "  PostgreSQL: 不可达"; fi
+    fi
     echo ""
     echo "=== 监听端口 ==="
     ss -tlnp 2>/dev/null | grep -E ":($BACKEND_PORT|$FRONTEND_PORT|5432)\b" | awk '{printf "  %-30s %s\n", $4, $6}'
 }
 
 # ========== 主入口 ==========
+# C5 修：变更类命令加文件锁（flock fd=9，脚本退出自动释放）——此前两人同跑
+# install/rotate 会互踩（env 双写、DB 双 ALTER、restart 交叉起停）；status 只读不锁
+CMD="${1:-start}"
+case "$CMD" in
+    status) : ;;
+    install|init|start|stop|restart|uninstall|dev|prod|rotate-db-password)
+        exec 9>"$PID_DIR/setup.lock"
+        flock -n 9 || error "另一个 setup.sh 正在运行（锁: $PID_DIR/setup.lock）——若确认是残留锁可删后重试"
+        ;;
+esac
 case "${1:-start}" in
     install) do_install ;;
     init)    do_init ;;
@@ -756,14 +920,16 @@ case "${1:-start}" in
     status)  do_status ;;
     uninstall) do_uninstall "${@:2}" ;;   # 可选 --purge / --yes
     rotate-db-password) do_rotate_db_password ;;  # T-9：DB 口令一键轮换（备份→ALTER→env→验证）
-    dev)     do_start dev ;;     # 显式 dev：uvicorn --reload
-    prod)    do_start prod ;;    # 显式 prod：无 --reload
+    # B-4（2026-10-27）：旧版直调 do_start——端口被占只 warn 跳过，"切模式"静默
+    # no-op。语义即切换 → 走 restart（顺带受 A2 活跃作业闸门保护）
+    dev)     do_restart dev ;;
+    prod)    do_restart prod ;;
     *)
         echo "用法: $0 {install|init|start [dev|prod]|stop|restart [dev|prod]|status|uninstall [--purge] [--yes]|rotate-db-password|dev|prod}"
         echo
         echo "  start         生产模式启动（默认；无 --reload）"
         echo "  start dev     开发模式启动（uvicorn --reload，改 .py 自动重启）"
-        echo "  dev / prod    等同 'start dev' / 'start prod'"
+        echo "  dev / prod    切换模式重启（端口占用时不再静默跳过；受活跃作业闸门保护）"
         echo "  restart       重启（保持当前模式，可用 restart dev/prod 切换）"
         echo "  restart dev   切到开发模式重启"
         echo "  restart prod  切到生产模式重启"
