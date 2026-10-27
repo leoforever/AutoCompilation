@@ -352,7 +352,7 @@
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { fmtDateTime } from '@/utils/datetime'
 
 const tickets = ref<any[]>([])
 const filterStatus = ref<string>('')
@@ -434,7 +434,7 @@ async function loadCounts() {
   const all = r.data || []
   counts.all = all.length
   for (const s of ['pending', 'processing', 'resolved', 'closed']) {
-    counts[s] = all.filter((t: any) => t.status === s).length
+    ;(counts as Record<string, number>)[s] = all.filter((t: any) => t.status === s).length
   }
 }
 
@@ -486,10 +486,10 @@ async function openDetail(row: any) {
   // 现在顺序遍历 B3：human→管理员气泡（与 TicketMessage 按内容配对拿权威 created_at），
   // ai→Agent 气泡，tool_calls→工具气泡（输出按 tcId 合并回调用气泡），ts 缺的旧行继承不上也不乱序。
   const combined: any[] = []
-  const b3HumanKeys = new Set(agentMsgs.filter(m => m.type === 'human').map(m => (m.content || '').slice(0, 80)))
+  const b3HumanKeys = new Set(agentMsgs.filter((m: any) => m.type === 'human').map((m: any) => (m.content || '').slice(0, 80)))
   for (const m of agentMsgs) {
     if (m.type === 'human') {
-      const adm = adminHistory.find(a => (a.content || '').slice(0, 80) === (m.content || '').slice(0, 80))
+      const adm = adminHistory.find((a: any) => (a.content || '').slice(0, 80) === (m.content || '').slice(0, 80))
       combined.push({
         id: `hist-admin-${adm?.id ?? combined.length}`,
         role: 'admin',
@@ -517,7 +517,7 @@ async function openDetail(row: any) {
     }
   }
   // B3 里没有的指令行（历史裁剪/旧 session）按 created_at 插入正确位置，不整块沉底
-  const strays = adminHistory.filter(a => !b3HumanKeys.has((a.content || '').slice(0, 80)))
+  const strays = adminHistory.filter((a: any) => !b3HumanKeys.has((a.content || '').slice(0, 80)))
   if (strays.length) {
     for (const m of strays) {
       const idx = combined.findIndex(x => x.created_at && new Date(x.created_at) > new Date(m.created_at))
@@ -553,7 +553,6 @@ async function openDetail(row: any) {
 // 2026-10-19 进一步：按 ticketId 分组持久化 _phaseLastSeq（重入不重头）
 let _phasePollTimer: any = null
 let _phaseLastSeqMap: Map<number, number> = new Map()  // ticketId → 已读最大 seq
-let _lastPhaseTicketId: number = 0  // 当前轮询的 ticketId（迁移用，可保留）
 // 2026-10-19：当前阶段（顶部状态条，**不**进 localChat 历史气泡）
 const currentPhaseLabel = ref<string>('')  // 空 = 不显示
 // T8-U: 启动/恢复已耗时（秒），进入 processing-未active 轮询时重置
@@ -584,7 +583,6 @@ function startPhasePolling(ticketId: number) {
   stopPhasePolling()
   // 2026-10-19：按 ticketId 分组持久化 _phaseLastSeq（避免重入时重复显示已完成阶段）
   // 跨 stop/start 保留进度，跨 ticket 隔离
-  _lastPhaseTicketId = ticketId
   const seenSeq = _phaseLastSeqMap.get(ticketId) || 0
   _phasePollTimer = setInterval(async () => {
     try {
@@ -898,8 +896,8 @@ async function sendAgentMessage() {
     content,
     username: '我',
     created_at: new Date().toISOString(),
+    kind: 'agent_cmd',  // T8: 线别标记，不串进 tab1（11 月 vue-tsc2：kind 随字面量声明，不再事后挂属性）
   }
-  adminMsg.kind = 'agent_cmd'  // T8: 线别标记，不串进 tab1
   localChat.value.push(adminMsg)
   console.log('[FE] pushed adminMsg', { id: adminMsg.id, localChat_len: localChat.value.length })
   agentThinking.value = '（Agent 思考中…）'

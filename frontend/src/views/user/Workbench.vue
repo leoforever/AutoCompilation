@@ -177,7 +177,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
 
@@ -225,7 +225,7 @@ async function fetchAvailableSkills() {
 // ============== 编译状态 ==============
 const compiling = ref(false)
 const logLines = ref<{ text: string; type: string }[]>([])
-const compileResult = ref<{ status: 'success' | 'failed'; task_id?: string; artifact?: string } | null>(null)
+const compileResult = ref<{ status: 'success' | 'failed' | 'cancelled'; task_id?: string; artifact?: string } | null>(null)
 const matchedSkills = ref<Array<{ name: string; type: 'generic' | 'specific' }>>([])
 // 已加载的 Skills（知识库全量，从 /api/compile/options/skills 拉，登录级只读）
 // 与 matchedSkills 的区别：availableSkills 是"实际可用"，matchedSkills 是"log 命中"
@@ -425,8 +425,6 @@ onMounted(async () => {
 })
 
 // ============== 匹配结果 ==============
-const genericSkills = computed(() => matchedSkills.value.filter(s => s.type === 'generic'))
-const specificSkills = computed(() => matchedSkills.value.filter(s => s.type === 'specific'))
 const availableGenericCount = computed(() => availableSkills.value.filter(s => s.type === 'generic').length)
 const availableSpecificCount = computed(() => availableSkills.value.filter(s => s.type === 'specific').length)
 // 判断某个 available skill 是否被 log 命中
@@ -448,10 +446,6 @@ function handleFileChange(e: Event) {
   }
 }
 
-function clearUploadedFile() {
-  uploadedFile.value = null
-  if (fileInput.value) fileInput.value.value = ''
-}
 
 // ============== 提交编译（真实链路） ==============
 async function submitCompile() {
@@ -667,7 +661,7 @@ function extractSkillsFromLine(text: string) {
 }
 
 // 整段文本扫（重新 mount 时用）：逐行匹配 + WS skills_matched 名单并入
-function extractSkillsFromText(text: string, wsNames?: string[]) {
+function extractSkillsFromText(text: string, _wsNames?: string[]) {
   if (!text) return
   for (const line of text.split('\n')) {
     const n = _matchSkillName(line)
@@ -739,9 +733,9 @@ const pendingMsg = ref<any>(null)
 function showPendingMsg() {
   // 同上：带软件名+业务任务号（Workbench 的 compileResult 里有）
   hidePendingMsg()
-  const t = compileResult.value || {}
+  const t: { task_id?: string } = compileResult.value || {}
   pendingMsg.value = ElMessage({
-    message: `正在为 ${form.softwareName || t.software_name || ''}（${t.task_id || ''}）生成 AI 经验草稿（约 1~4 分钟，请稍候）…`,
+    message: `正在为 ${form.softwareName || ''}（${t.task_id || ''}）生成 AI 经验草稿（约 1~4 分钟，请稍候）…`,
     type: 'info',
     duration: 0,
     showClose: false,

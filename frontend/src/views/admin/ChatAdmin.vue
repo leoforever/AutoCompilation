@@ -59,7 +59,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { fmtDateTime } from '@/utils/datetime'
 import { ElMessage } from 'element-plus'
 
 const route = useRoute()

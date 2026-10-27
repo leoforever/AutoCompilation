@@ -92,7 +92,7 @@ const router = createRouter({
 })
 
 // 路由守卫：检查认证与角色权限
-router.beforeEach((to, from, next) => {
+router.beforeEach((to, _from, next) => {
   const authStore = useAuthStore()
   const requiresAuth = to.meta.requiresAuth as boolean
   const requiredRole = to.meta.role as string

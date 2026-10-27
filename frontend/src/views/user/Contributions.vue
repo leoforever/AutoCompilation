@@ -72,9 +72,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted } from 'vue'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { fmtDateTime } from '@/utils/datetime'
 
 const experiences = ref<any[]>([])
 const stats = ref({ total: 0, approved: 0, reviewing: 0, rejected: 0 })

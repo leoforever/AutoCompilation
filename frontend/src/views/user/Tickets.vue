@@ -56,7 +56,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { fmtDateTime } from '@/utils/datetime'
 
 const tickets = ref<any[]>([])
 const currentTicket = ref<any>(null)

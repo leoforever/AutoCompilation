@@ -159,7 +159,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import api from '@/utils/request'
-import { fmtDateTime, parseServerDate } from '@/utils/datetime'
+import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const tasks = ref<any[]>([])
@@ -179,7 +179,7 @@ async function loadTasks() {
   if (filterStatus.value) params.status = filterStatus.value
   if (searchText.value) params.search = searchText.value
   
-  const res = await api.get('/compile/tasks', { params })
+  const res: any = await api.get('/compile/tasks', { params })
   // /compile/tasks 直接返 {total, tasks}（没包 ApiResponse）—— 与单 task 接口不同
   tasks.value = res.tasks || []
   pagination.value.total = res.total || 0
@@ -241,7 +241,7 @@ function formatSize(bytes: number): string {
 
 async function viewLog(task: any) {
   currentTask.value = task
-  const res = await api.get(`/compile/tasks/${task.task_id}/log`)
+  const res: any = await api.get(`/compile/tasks/${task.task_id}/log`)
   // axios 拦截器已 unwrap response.data，res 直接是 {task_id, log}
   const log = res.log || res.data?.log || ''
   // 解析 [HH:MM:SS] [LEVEL] 前缀分级（与 Workbench mapLevel 对齐；旧版按 [OK] 关键词全对不上后端的 SUCCESS/DEBUG）

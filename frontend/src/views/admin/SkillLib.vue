@@ -235,7 +235,7 @@
               {{ t.type === 'generic' ? '通用' : '专用' }}
             </el-tag>
             <span class="trash-name">{{ t.name }}</span>
-            <span class="trash-time">{{ formatDate(t.deleted_at) }}</span>
+            <span class="trash-time">{{ fmtDateTime(t.deleted_at) }}</span>
           </div>
           <div v-if="t.description" class="trash-desc">{{ t.description }}</div>
           <div class="trash-actions">
@@ -261,6 +261,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import api from '@/utils/request'
+import { fmtDateTime } from '@/utils/datetime'  // 10-27 vue-tsc2：模板原引用的 formatDate 从未定义（潜伏 bug），改现成 fmtDateTime
 import { ElMessage, ElMessageBox, type FormInstance } from 'element-plus'
 
 // ============ 状态 ============
