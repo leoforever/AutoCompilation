@@ -231,7 +231,7 @@ async def generate_experience_draft(
     - 草稿不入 DB，前端拿到后由用户编辑再走 /experience/submit
     - LLM 配置复用 compile_engine：AI_API_KEY / AI_BASE_URL / AI_MODEL
     """
-    from app.services.experience_generator import generate_draft
+    from app.services.experience_generator import generate_draft  # noqa: F401 终态校验等语义复用
 
     task_id = body.get("task_id") if isinstance(body, dict) else None
     if not isinstance(task_id, int):
@@ -243,21 +243,115 @@ async def generate_experience_draft(
     if current_user.role != "admin" and task.user_id != current_user.user_id:
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
-    try:
-        result = generate_draft(db, task_id)
-    except LookupError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        # 任务未结束 / LLM 失败 / 草稿不合法
-        msg = str(e)
-        if "未结束" in msg:
-            raise HTTPException(status_code=400, detail=msg)
-        raise HTTPException(status_code=500, detail=msg)
-
+    # 批2-乙（2026-10-26）：不再同步等 LLM（1~4min 占死事件循环）——
+    # 起后台线程秒回，前端轮询 /generate-draft/status。前置校验（存在/终态/属主）
+    # （存在/属主）在本请求内；终态校验在线程内 generate_draft 兜（error 经 status 透传）。
+    from app.services.experience_generator import start_draft_job
+    from app.models import SessionLocal
+    job = start_draft_job(SessionLocal, task_id)
     return ApiResponse(
-        message="草稿生成成功",
-        data=result,
+        data={"status": job["status"]},
+        message="草稿生成中" if job["status"] == "running" else "生成任务已存在",
     )
+
+
+@router.get("/generate-draft/stream")
+async def generate_draft_stream(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """SSE 终态推送（2026-10-26 方案 A）：人盯着等时的快通道，替代 3s 轮询空窗。
+    骨架照 /agent/stream（thread→loop 投递用批2-③ 的 call_soon_threadsafe 姿势），
+    但草稿无 token 流——SSE 退化为"挂着的单次推送"：done/error 一个终态事件即关流。
+
+    事件（data: {"type": ...}）：
+      done(result) / error(message) / none(未起 job，前端应改 POST) /
+      timeout(超 6min，前端降级轮询)。
+    进来先查终态：done/error 直接送——断线重连、关窗再来天然覆盖。
+    /generate-draft/status 保留为降级兜底通道（推拉结合）。
+    """
+    import asyncio, json
+    from fastapi.responses import StreamingResponse
+    from app.services.experience_generator import (
+        get_draft_job, register_draft_waiter, unregister_draft_waiter)
+    from app.models import CompileTask
+
+    task = db.query(CompileTask).filter(CompileTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task 不存在")
+    if current_user.role != "admin" and task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+
+    async def event_gen():
+        def _ev(**kw):
+            return "data: " + json.dumps(kw, ensure_ascii=False) + "\n\n"
+        # 顺序=先注册再查状态：堵"查得 running → 注册前 worker 投递终态 → 无人收件
+        # 白等 6min"的窗口；注册后先排空收件箱，再看 job 快照
+        q = register_draft_waiter(task_id)
+        try:
+            drained = []
+            while True:
+                try:
+                    drained.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if drained:
+                d0 = drained[-1]
+                yield _ev(type=d0["status"], result=d0.get("result"),
+                          message=d0.get("error"))
+                return
+            job = get_draft_job(task_id)
+            if not job:
+                yield _ev(type="none")
+                return
+            if job["status"] != "running":
+                yield _ev(type=job["status"], result=job.get("result"),
+                          message=job.get("error"))
+                return
+            deadline = 360.0  # LLM 1~4min 常规，超 6min 视为异常→让前端降级轮询
+            while True:
+                try:
+                    snap = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield _ev(type=snap["status"], result=snap.get("result"),
+                              message=snap.get("error"))
+                    return
+                except asyncio.TimeoutError:
+                    deadline -= 15.0
+                    if deadline <= 0:
+                        yield _ev(type="timeout")
+                        return
+                    yield ": ping\n\n"   # SSE 注释心跳，防代理闲置断连
+        finally:
+            unregister_draft_waiter(task_id, q)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.get("/generate-draft/status", response_model=ApiResponse)
+async def generate_draft_status(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """轮询 AI 草稿任务：running / done(result) / error(message) / none(未启动)
+    （批2-乙，工单 preview-job/status 同款；属主校验与触发生成同规则）"""
+    from app.services.experience_generator import get_draft_job
+    task = db.query(CompileTask).filter(CompileTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task 不存在")
+    if current_user.role != "admin" and task.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+    job = get_draft_job(task_id)
+    if not job:
+        return ApiResponse(data={"status": "none"})
+    return ApiResponse(data={
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "elapsed": round(__import__("time").time() - job["started_at"], 1),
+    })
 
 
 import json

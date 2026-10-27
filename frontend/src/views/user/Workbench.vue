@@ -742,9 +742,11 @@ const draftForm = reactive({
 // 持久提示（duration: 0）：让用户知道正在调用 LLM 生成草稿
 const pendingMsg = ref<any>(null)
 function showPendingMsg() {
+  // 同上：带软件名+业务任务号（Workbench 的 compileResult 里有）
   hidePendingMsg()
+  const t = compileResult.value || {}
   pendingMsg.value = ElMessage({
-    message: '正在生成 AI 经验草稿（约 1~4 分钟，请稍候）…',
+    message: `正在为 ${form.softwareName || t.software_name || ''}（${t.task_id || ''}）生成 AI 经验草稿（约 1~4 分钟，请稍候）…`,
     type: 'info',
     duration: 0,
     showClose: false,
@@ -774,20 +776,119 @@ async function onGenerateDraft() {
   showPendingMsg()
   try {
     const dbId = await fetchTaskDbId(compileResult.value.task_id)
-    // 草稿生成 LLM 要 1-4 分钟，默认 30s 超时不够 → 5 分钟
-    const r: any = await api.post('/experience/generate-draft', { task_id: dbId }, { timeout: 300000 })
-    const data = r?.data ?? r
-    draftForm.skill_name = data?.skill_name || ''
-    draftForm.skill_type = (data?.skill_type === 'generic' || data?.skill_type === 'specific') ? data.skill_type : 'specific'
-    draftForm.skill_content = data?.draft_content || ''
-    draftSource.value = 'ai'
-    draftVisible.value = true
+    // 批2-乙+SSE（2026-10-26）：异步秒回 + SSE 终态即时推送，断连重连一次后降级轮询
+    // 状态优先（2026-10-27）：done→秒开不重烧；running→挂 SSE；error/none→才 POST 起新 job
+    const st: any = await api.get('/experience/generate-draft/status', { params: { task_id: dbId } })
+    const d0 = st?.data ?? {}
+    if (d0.status === 'done' && d0.result) {
+      applyDraft(d0.result); draftSource.value = 'ai'; draftVisible.value = true; finishDraftUI(); return
+    }
+    if (d0.status === 'running') { watchDraftSSE(dbId); return }
+    await api.post('/experience/generate-draft', { task_id: dbId })
+    watchDraftSSE(dbId)
   } catch (e: any) {
     const msg = e?.response?.data?.detail || e?.response?.data?.message || e?.message || String(e)
-    ElMessage.error('草稿生成失败：' + msg)
-  } finally {
+    ElMessage.error('草稿生成启动失败：' + msg)
     generatingDraft.value = false
     hidePendingMsg()
+  }
+}
+
+let _draftPollTimer: any = null
+let _pollFails = 0   // 轮询降级连续失败计数（声明随轮询函数区放置）
+function stopDraftPolling() {
+  if (_draftPollTimer) { clearInterval(_draftPollTimer); _draftPollTimer = null }
+}
+function finishDraftUI() {
+  stopDraftPolling()
+  generatingDraft.value = false
+  hidePendingMsg()
+}
+function pollDraftStatus(dbId: number) {
+  stopDraftPolling()
+  _draftPollTimer = setInterval(async () => {
+    try {
+      const r: any = await api.get('/experience/generate-draft/status', { params: { task_id: dbId } })
+      const d = r?.data ?? {}
+      if (d.status === 'done' && d.result) {
+        applyDraft(d.result)
+        draftSource.value = 'ai'
+        draftVisible.value = true
+        finishDraftUI()
+      } else if (d.status === 'error') {
+        ElMessage.error('草稿生成失败：' + (d.error || '未知错误'))
+        finishDraftUI()
+      }
+      _pollFails = 0
+    } catch {
+      _pollFails += 1
+      if (_pollFails >= 5) {   // 修"一次抖动即弃"
+        ElMessage.error('草稿状态查询失败（连续 5 次）')
+        finishDraftUI()
+      }
+    }
+  }, 3000)
+}
+
+// —— SSE 快通道（2026-10-26 方案 A）：与 Tasks.vue 同款（终态推送/重连一次/轮询兜底）——
+function applyDraft(res: any) {
+  draftForm.skill_name = res.skill_name || ''
+  draftForm.skill_type = (res.skill_type === 'generic' || res.skill_type === 'specific') ? res.skill_type : 'specific'
+  draftForm.skill_content = res.draft_content || ''
+}
+let _draftAbort: AbortController | null = null
+function stopDraftWatch() {
+  stopDraftPolling()
+  if (_draftAbort) { try { _draftAbort.abort() } catch {} _draftAbort = null }
+}
+async function watchDraftSSE(dbId: number, attempt = 0) {
+  const baseURL = (api.defaults?.baseURL || '').replace(/\/$/, '') || window.location.origin
+  const token = localStorage.getItem('token') || ''
+  _draftAbort = new AbortController()
+  try {
+    // baseURL 已是 '/api'，路径不再叠 /api（曾错写成 baseURL+'/api/...' → /api/api/ 404）
+    const resp = await fetch(`${baseURL}/experience/generate-draft/stream?task_id=${dbId}`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: _draftAbort.signal,
+    })
+    if (!resp.ok || !resp.body) throw new Error(`stream HTTP ${resp.status}`)
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let terminal = false
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2)
+        const line = chunk.split('\n').find(l => l.startsWith('data: '))
+        if (!line) continue
+        const d = JSON.parse(line.slice(6))
+        if (d.type === 'done' && d.result) {
+          applyDraft(d.result)
+          draftSource.value = 'ai'
+          draftVisible.value = true
+          finishDraftUI()
+          terminal = true
+        } else if (d.type === 'error') {
+          ElMessage.error('草稿生成失败：' + (d.message || '未知错误'))
+          finishDraftUI()
+          terminal = true
+        } else if (d.type === 'none' || d.type === 'timeout') {
+          terminal = true
+          pollDraftStatus(dbId)
+        }
+      }
+      if (terminal) return
+    }
+    if (attempt === 0) { await new Promise(r => setTimeout(r, 1000)); watchDraftSSE(dbId, 1) }
+    else pollDraftStatus(dbId)
+  } catch (e: any) {
+    if (e?.name === 'AbortError') return
+    if (attempt === 0) { await new Promise(r => setTimeout(r, 1000)); watchDraftSSE(dbId, 1) }
+    else pollDraftStatus(dbId)
   }
 }
 
@@ -818,6 +919,8 @@ async function onSubmitDraft() {
 }
 
 onUnmounted(() => {
+  stopDraftWatch()  // 卸载停 SSE/轮询
+  hidePendingMsg()  // 收全局灰条
   if (ws) try { ws.close() } catch {}
   cleanup()
 })

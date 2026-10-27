@@ -444,3 +444,93 @@ def _infer_skill_type(llm_type: str, software_name: str) -> str:
         return "specific"
     # 兜底：默认 specific（用户提交时可改）
     return "specific"
+
+# ---- AI 草稿异步任务表（批2-乙，2026-10-26）：generate-draft 同步占事件循环
+# 1~4 分钟致全站 API 卡死（工单侧 preview-job 同款病，照其已实战骨架迁移）----
+_DRAFT_JOBS: dict = {}   # task_db_id -> {status, result, error, started_at}
+
+
+def start_draft_job(db_factory, task_db_id: int) -> dict:
+    """后台线程跑 LLM 草稿生成，重复点返回已有任务（线程内自建 session，
+    不携带请求级 db——批2 'create_task 捕获请求 session' 教训的规避位）。
+
+    SSE 化（2026-10-26，方案 A）：在 HTTP 请求协程里捕获事件循环句柄存入 job，
+    worker 线程 done/error 后经 loop.call_soon_threadsafe 把终态投给该任务的
+    waiter 队列（_DRAFT_WAITERS）——thread→loop 投递姿势同批2-③ ws_broadcaster。"""
+    import threading, time as _t, asyncio
+    job = _DRAFT_JOBS.get(task_db_id)
+    if job and job["status"] == "running":
+        return job
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    job = {"status": "running", "result": None, "error": None,
+           "started_at": _t.time(), "loop": loop}
+    _DRAFT_JOBS[task_db_id] = job
+
+    def _run():
+        s = db_factory()
+        try:
+            from app.models import CompileTask
+            task = s.query(CompileTask).filter(CompileTask.id == task_db_id).first()
+            if not task:
+                job["status"], job["error"] = "error", "task 不存在"
+                return
+            job["result"] = generate_draft(s, task_db_id)
+            job["status"] = "done"
+        except Exception as e:
+            job["status"], job["error"] = "error", f"{type(e).__name__}: {e}"
+        finally:
+            s.close()
+            _notify_draft_waiters(task_db_id, job)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return job
+
+
+def get_draft_job(task_db_id: int):
+    return _DRAFT_JOBS.get(task_db_id)
+
+
+# ---- SSE waiter 注册表：task_db_id -> [asyncio.Queue]（多标签页可同看一任务）----
+_DRAFT_WAITERS: dict = {}
+
+
+def register_draft_waiter(task_db_id: int) -> "asyncio.Queue":
+    import asyncio
+    q: asyncio.Queue = asyncio.Queue(maxsize=8)
+    # 队列归属循环句柄记在队列自身：唤醒必须用"读它的循环"，不是起 job 的循环
+    #（生产同 uvicorn 循环两者相同；测试/多进程下可差——按队列投递才永远正确）
+    try:
+        q._owner_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        q._owner_loop = None
+    _DRAFT_WAITERS.setdefault(task_db_id, []).append(q)
+    return q
+
+
+def unregister_draft_waiter(task_db_id: int, q) -> None:
+    lst = _DRAFT_WAITERS.get(task_db_id)
+    if lst and q in lst:
+        lst.remove(q)
+        if not lst:
+            _DRAFT_WAITERS.pop(task_db_id, None)
+
+
+def _notify_draft_waiters(task_db_id: int, job: dict) -> None:
+    """worker 线程调用：把终态快照投递到该任务所有 waiter 的循环线程里执行
+    （asyncio.Queue 非线程安全，跨线程必须 call_soon_threadsafe，同 ws_broadcaster）"""
+    waiters = list(_DRAFT_WAITERS.get(task_db_id, []))
+    if not waiters:
+        return
+    snap = {"status": job["status"], "result": job.get("result"), "error": job.get("error")}
+    for q in waiters:
+        try:
+            oloop = getattr(q, "_owner_loop", None)
+            if oloop is not None:
+                oloop.call_soon_threadsafe(q.put_nowait, snap)
+            else:
+                q.put_nowait(snap)   # 无归属循环（罕见）：直投，SSE 端靠心跳/轮询兜底
+        except Exception:
+            pass

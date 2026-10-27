@@ -73,6 +73,26 @@ class TicketAgentManager:
             self._errors.pop(ticket.ticket_id, None)
             return sess
 
+
+    async def start_agent_background(self, ticket_id: int) -> None:
+        """批2-①（2026-10-26）：后台起 agent 的唯一正确姿势——fire-and-forget 闭包
+        不得捕获请求级 db/session（响应一返回即关，后台再用=Detached/连接池串数据，
+        B3 sess.task Detached 旧案的读侧同款病）。本方法自建 session、按 id 重查、
+        用完即关；错误统一落 _errors（admin 轮询状态可见）。"""
+        from app.models import SessionLocal, Ticket
+        db = SessionLocal()
+        try:
+            ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+            if not ticket:
+                self._errors[ticket_id] = "TicketError: 工单不存在"
+                return
+            await self.get_or_create(ticket, db)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._errors[ticket_id] = f"{type(e).__name__}: {e}"
+        finally:
+            db.close()
+
     def get(self, ticket_id: int) -> Optional[_Session]:
         return self._sessions.get(ticket_id)
 

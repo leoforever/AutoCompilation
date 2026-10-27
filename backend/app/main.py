@@ -161,7 +161,9 @@ async def lifespan(app: FastAPI):
             # 任务对账自愈（2026-10-21 Step 0）：入库断链滞留的 compiling，按磁盘现场恢复
             try:
                 from app.services.task_reconciler import reconcile_stuck_tasks
-                rs = reconcile_stuck_tasks()
+                # 批2-②（2026-10-26）：纯同步 DB 函数裸跑在事件循环上——DB 打嗝即
+                # 全站冻结（generate-draft 同族病）；搬进线程池
+                rs = await asyncio.to_thread(reconcile_stuck_tasks)
                 if any(k != "at" and v for k, v in rs.items()):
                     logger.info(f"[reconcile] 任务对账: {rs}")
             except Exception:
@@ -169,10 +171,15 @@ async def lifespan(app: FastAPI):
             # 草稿 job 表 GC：done/error 超 1h 清掉（防长期不重启内存增长）
             try:
                 from app.services.skill_draft import _PREVIEW_JOBS
+                from app.services.experience_generator import _DRAFT_JOBS
                 cutoff = __import__('time').time() - 3600
                 for k in [k for k, v in _PREVIEW_JOBS.items()
                           if v.get('status') in ('done', 'error') and v.get('started_at', 0) < cutoff]:
                     _PREVIEW_JOBS.pop(k, None)
+                # 批2-乙 的 task 草稿 job 表同款 GC（昨日漏并，今补——内存不涨）
+                for k in [k for k, v in _DRAFT_JOBS.items()
+                          if v.get('status') in ('done', 'error') and v.get('started_at', 0) < cutoff]:
+                    _DRAFT_JOBS.pop(k, None)
             except Exception:
                 pass
             await asyncio.sleep(int(_get_cfg("worker.sweep_interval", 3600)))

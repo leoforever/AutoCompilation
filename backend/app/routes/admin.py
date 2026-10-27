@@ -448,13 +448,9 @@ async def admin_change_ticket_status(
     if (old == TicketStatus.PENDING and target == TicketStatus.PROCESSING):
         import asyncio
         from app.services.ticket_agent import MANAGER
-        async def _start():
-            try:
-                await MANAGER.get_or_create(ticket, db)
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                MANAGER._errors[ticket.ticket_id] = f"{type(e).__name__}: {e}"
-        asyncio.create_task(_start())
+        # 批2-①：闭包不再捕获请求级 ticket/db（原病：响应返回 session 即关，
+        # 后台 get_or_create 用死 session/detached ORM）——MANAGER 自建 session 收口
+        asyncio.create_task(MANAGER.start_agent_background(ticket.ticket_id))
         msg_extra = "，agent session 正在创建（容器 + 拉源码 + DeepAgent 启动）"
 
     return ApiResponse(message=f"工单状态已变更为 {target.value}{msg_extra}")
@@ -1248,16 +1244,8 @@ async def accept_ticket_and_start_agent(
     from app.services.ticket_agent import MANAGER
     from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
 
-    async def _start():
-        try:
-            await MANAGER.get_or_create(ticket, db)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[agent start] 失败: {e}")
-
-    # fire-and-forget（FastAPI 后台任务）
-    asyncio.create_task(_start())
+    # 批2-①：同上；此现场旧版失败只 print 不落 _errors（admin 看不到错误），一并纠
+    asyncio.create_task(MANAGER.start_agent_background(ticket_id))
 
     return ApiResponse(message="工单已接单，agent session 正在创建（容器 + 拉源码 + DeepAgent 启动）")
 
@@ -2254,13 +2242,8 @@ async def retry_ticket_agent(
 
     # 异步重试
     import asyncio
-    async def _start():
-        try:
-            await MANAGER.get_or_create(ticket, db)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            MANAGER._errors[ticket_id] = f"{type(e).__name__}: {e}"
-    asyncio.create_task(_start())
+    # 批2-①：同上，请求级 ticket/db 不进后台闭包
+    asyncio.create_task(MANAGER.start_agent_background(ticket_id))
 
     return ApiResponse(message="agent 重新启动已触发，请稍候查看状态")
 
