@@ -126,27 +126,8 @@
           <strong>✅ 解决说明：</strong>{{ current.resolution }}
         </div>
 
-        <!-- 3. 失败日志（懒加载：默认折叠不请求；has_log_content 才给展开入口；任何状态都不弹错） -->
-        <template v-if="current.task">
-          <h4>
-            📄 失败日志
-            <template v-if="current.task.has_log_content">
-              <el-button v-if="!logExpanded" link type="primary" size="small" style="margin-left:8px" @click="expandLog">
-                ▶ 展开
-              </el-button>
-              <template v-else>
-                <el-tag v-if="logLoading" type="info" size="small" effect="plain" style="margin-left:8px">加载中…</el-tag>
-                <el-button v-else link type="primary" size="small" style="margin-left:8px" @click="loadFullLog(current.task.db_id)">
-                  🔄 刷新
-                </el-button>
-                <el-button link size="small" style="margin-left:6px" @click="logExpanded = false">收起</el-button>
-              </template>
-            </template>
-            <span v-else class="log-hint" style="margin-left:8px">（暂无日志）</span>
-          </h4>
-          <pre v-if="logExpanded && fullLog" class="log">{{ fullLog }}</pre>
-          <div v-else-if="logExpanded && !logLoading && !fullLog" class="log-hint">（日志为空）</div>
-        </template>
+        <!-- 3.（已移除）失败日志全景区·2026-10-27：工单域不再取全文——自动流转零消费者，
+             人工深挖走任务页；工单日志=上报时自动附进 description 的末 50 行，自包含 -->
 
         <!-- 4. Agent 工作台（醒目卡片；pending 也显示占位，admin 一眼看到） -->
         <div class="agent-board">
@@ -407,10 +388,6 @@ async function sendUserReply() {
     sendingReply.value = false
   }
 }
-const fullLog = ref('')
-const logLoaded = ref(false)
-const logLoading = ref(false)
-const logExpanded = ref(false)  // 懒加载：默认折叠，点"展开"才发请求
 const agentThinking = ref('')
 const sendingAgent = ref(false)
 // T9-U 停止当前轮：abort 本地 SSE 读流 + "停止中…"态（收敛前禁误发新指令）
@@ -490,8 +467,6 @@ async function openDetail(row: any) {
       }
     } catch { /* status 探测失败不阻塞打开 */ }
   }
-  logLoaded.value = false
-  fullLog.value = ''
   newMessage.value = ''
   userReply.value = ''
   // T9-U 10-23 用户拍板：工单抽屉一律默认落 Agent 工作台（tab1 用户消息一键可达）
@@ -568,11 +543,6 @@ async function openDetail(row: any) {
   if (r.data.status === 'processing') {
     startPhasePolling(row.ticket_id)
   }
-  // 2026-10-20：失败日志改为懒加载（默认折叠，点"展开"才请求；进抽屉不再自动拉全文）
-  fullLog.value = ''
-  logLoaded.value = false
-  logLoading.value = false
-  logExpanded.value = false
   // 如果已接单但 agent 未启动，轮询等它起来
   if (r.data.status === 'processing' && !r.data.agent_active) {
     pollAgentStart(row.ticket_id)
@@ -1103,30 +1073,6 @@ async function sendAgentMessage() {
   }
 }
 
-async function loadFullLog(taskId: number) {
-  if (!taskId) return
-  logLoading.value = true
-  try {
-    const r: any = await api.get(`/compile/tasks/${taskId}/log`)
-    const log = r.data?.log ?? ''
-    fullLog.value = log
-    logLoaded.value = true
-    if (log) logExpanded.value = true  // 刷新后若当前折叠则自动展开显示
-  } catch (e: any) {
-    // 懒加载场景静默失败：模板里显示"（日志为空）"占位，不打扰用户（控制台留痕便于排查）
-    fullLog.value = ''
-    logLoaded.value = true
-    console.warn('[log] 加载失败:', e?.response?.status, e?.message)
-  } finally {
-    logLoading.value = false
-  }
-}
-
-function expandLog() {
-  logExpanded.value = true
-  if (!logLoaded.value) loadFullLog(current.value?.task?.db_id)
-}
-
 async function cleanupContainer() {
   try {
     await ElMessageBox.confirm('确认清理容器？磁盘产物保留', '提示', { type: 'warning' })
@@ -1236,7 +1182,6 @@ onMounted(loadTickets)
 .desc { background: var(--bg); padding: 12px; border-radius: 6px; white-space: pre-wrap; line-height: 1.6; max-height: 200px; overflow: auto; font-size: 13px }
 .resolution-box { background: #f0f9eb; border-left: 3px solid #67c23a; padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; border-radius: 4px }
 .log { background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 6px; max-height: 280px; overflow: auto; font-size: 12px; font-family: monospace; white-space: pre-wrap }
-.log-hint { color: var(--text3); font-size: 12px; padding: 8px 0 }
 .chat { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow: auto; padding: 8px; background: var(--bg); border-radius: 6px }
 .msg { padding: 8px 12px; border-radius: 6px; max-width: 90% }
 .msg.user { background: #e6f0ff; align-self: flex-start }

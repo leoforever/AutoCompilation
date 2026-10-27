@@ -112,8 +112,8 @@ async def draft_ticket_from_task(
     if task.user_id != current_user.user_id:
         raise HTTPException(status_code=403, detail="只能对自己任务生成草稿")
 
-    # 读失败日志（artifacts/{task_id}/build.log）
-    from app.services.compile_engine import _artifacts_dir
+    # 读失败日志（artifacts/{task_id}/build.log）——Q1b 归一：公共权威不再反向 import 引擎私有
+    from app.config import artifacts_dir as _artifacts_dir
     log_path = _artifacts_dir() / task.task_id / "build.log"
     log_text = _tail_log(log_path, 200)
     if not log_text:
@@ -176,25 +176,30 @@ async def report_ticket(
     db.add(ticket)
     db.flush()  # 先 flush 拿 ticket_id
 
-    # 不管用户有没有填描述，include_log_tail=true 时都把 build.log 末 50 行附到 description 末尾
+    # 工单日志口径（2026-10-27 决策）：工单域自包含、全文归任务页——上报时附
+    # 末 50 行进 description；磁盘 build.log 优先，缺失回退 DB log_output 尾段
+    # （看门狗腰斩单往往只剩 DB 尾巴）；两源皆无/读失败不再静默 pass——
+    # description 显式注记，提单人与 admin 当场知道交的是"无日志工单"
     include_log = getattr(ticket_data, "include_log_tail", True)
     if include_log:
-        from app.services.compile_engine import _artifacts_dir
+        from app.config import artifacts_dir as _artifacts_dir  # Q1b 归一：不再反向 import 引擎私有
+        tail = ""
         log_path = _artifacts_dir() / task.task_id / "build.log"
-        if log_path.exists():
-            try:
-                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                tail = "\n".join(lines[-50:])
-                if tail:
-                    log_block = f"\n\n--- build.log 末尾 50 行（自动附）---\n```\n{tail}\n```"
-                    desc = (ticket_data.description or "").strip()
-                    if desc:
-                        ticket.description = desc + log_block
-                    else:
-                        ticket.description = f"（用户未填描述，自动附 build.log 末 50 行）\n```\n{tail}\n```"
-                    db.flush()
-            except Exception:
-                pass  # 读不到就不附，不阻塞
+        try:
+            if log_path.exists():
+                tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-50:])
+            elif task.log_output:
+                tail = "\n".join(task.log_output.splitlines()[-50:])
+        except Exception:
+            tail = ""
+        if tail:
+            log_block = f"\n\n--- build.log 末尾 50 行（自动附）---\n```\n{tail}\n```"
+            desc = (ticket_data.description or "").strip()
+            ticket.description = (desc + log_block) if desc else f"（用户未填描述，自动附 build.log 末 50 行）\n```\n{tail}\n```"
+        else:
+            note = "\n\n（注：未能附日志尾部——任务目录已清理，或该任务无运行日志记录）"
+            ticket.description = ((ticket.description or "") + note).strip() or note.strip()
+        db.flush()
 
     db.commit()
     db.refresh(ticket)

@@ -138,9 +138,6 @@
           ✨ AI 生成经验草稿
         </el-button>
         <el-button v-if="compileResult?.status === 'success'" type="success" @click="downloadArtifact">📦 下载全部产物 (.tar.gz)</el-button>
-        <el-button v-if="compileResult?.status === 'failed'" type="danger" @click="reportTicket">
-          🐛 一键上报工单
-        </el-button>
       </div>
     </div>
 
@@ -691,9 +688,7 @@ function cleanup() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-function reportTicket() {
-  ElMessage.info('已生成工单跳转到工单中心')
-}
+// reportTicket 空壳已摘（2026-10-27）：只弹提示不提交，误导用户；上报入口收敛到 Tasks 列表
 
 function downloadArtifact() {
   const taskId = compileResult.value?.task_id
