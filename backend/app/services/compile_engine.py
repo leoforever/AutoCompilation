@@ -353,39 +353,65 @@ def stage4a_fetch_source_on_host(state: TaskState, on_log: Optional[LogCallback]
 
             branch = state.get("git_branch", "").strip()
             url = state["git_url"]
-            # 留空时不传 --branch → git clone 拉远端默认分支（main / master 等）
-            if branch:
-                cmd = ["git", "clone", "--depth", "1", "--branch", branch, url, str(src_dir)]
-            else:
-                cmd = ["git", "clone", "--depth", "1", url, str(src_dir)]
-
-            _log(state, "info", f"[阶段4a] 宿主机 git clone: {url} (branch={branch or 'default'})", on_log)
-            try:
-                # 3f 加固：隔离宿主全局/系统 gitconfig（url.insteadOf 重定向面）
-                import os as _os2
-                _git_env = {**_os2.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
-                proc = subprocess.Popen(
-                    cmd,
-                    env=_git_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        _log(state, "info", f"[阶段4a]   {line}", on_log)
-                ret = proc.wait(timeout=600)  # 10 分钟硬上限
-                if ret != 0:
-                    raise RuntimeError(f"git clone exit_code={ret}")
-            except subprocess.TimeoutExpired:
-                try: proc.kill()
-                except Exception: pass
-                raise RuntimeError("git clone 超时（>10 分钟）")
-            except FileNotFoundError:
-                raise RuntimeError("宿主机未安装 git")
+            # clone 加固三合一（2026-10-27，用户报外网断流 EOF 频发）：
+            # ①瞬时故障自动重试（幂等：失败清目录重来）——仅匹配断流特征才重试，
+            #   仓库不存在/认证失败等永久错快速失败（不烧 retry 预算，测试语义保持）
+            # ②git 原生低速率熔断：连续 low_speed_time 秒低于 low_speed_limit 字节/秒
+            #   即主动掐断——"烂而不死"的慢传输 60s 即败入下一次重试
+            # ③硬上限进 config（clone_timeout 默认 1800s=30min；旧 600s 实测拦不住
+            #   981s 慢死——wait 计时在 stdout 读完后才开始，此处保持同款口径但预算可配）
+            _att = max(1, int(get_cfg("compile.clone_attempts", 3)))
+            _to = int(get_cfg("compile.clone_timeout", 1800))
+            _lsl = int(get_cfg("compile.clone_low_speed_limit", 1024))
+            _lst = int(get_cfg("compile.clone_low_speed_time", 60))
+            _TRANSIENT = ("early eof", "文件结束符", "invalid index-pack", "index-pack",
+                          "rpc failed", "curl", "transferred", "empty reply",
+                          "timed out", "connection reset", "connection refused",
+                          "the remote end hung up", "could not resolve", "临时失败",
+                          "无法连接", "网络", "encountered end of file")
+            import os as _os2
+            _git_env = {**_os2.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}  # 3f 隔离不变
+            last_err = "未知失败"
+            for _try in range(1, _att + 1):
+                if src_dir.exists():
+                    shutil.rmtree(src_dir, ignore_errors=True)  # clone 失败自带清，双保险防半截 .git 骗过复用逻辑
+                # 留空时不传 --branch → git clone 拉远端默认分支（main / master 等）
+                cmd = ["git", "-c", f"http.lowSpeedLimit={_lsl}", "-c", f"http.lowSpeedTime={_lst}",
+                       "clone", "--depth", "1"]
+                if branch:
+                    cmd += ["--branch", branch]
+                cmd += [url, str(src_dir)]
+                _log(state, "info", f"[阶段4a] 宿主机 git clone (第{_try}/{_att}次): {url} (branch={branch or 'default'})", on_log)
+                tail_lines = []
+                try:
+                    proc = subprocess.Popen(cmd, env=_git_env, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            tail_lines.append(line)
+                            _log(state, "info", f"[阶段4a]   {line}", on_log)
+                    ret = proc.wait(timeout=_to)
+                except subprocess.TimeoutExpired:
+                    try: proc.kill()
+                    except Exception: pass
+                    tail_lines.append(f"git clone 超时（>{_to}s）")
+                    ret = 124
+                except FileNotFoundError:
+                    raise RuntimeError("宿主机未安装 git")
+                if ret == 0:
+                    last_err = ""
+                    break
+                last_err = " | ".join(tail_lines[-3:])
+                if _try < _att and any(t in last_err.lower() for t in _TRANSIENT):
+                    _sleep = 10 * _try
+                    _log(state, "warn", f"[阶段4a] clone 疑似瞬时断流(exit={ret})，{_sleep}s 后重试…", on_log)
+                    time.sleep(_sleep)
+                    continue
+                break  # 永久错误或已是最后一次
+            if last_err:
+                raise RuntimeError(f"git clone exit_code 非零（{_try} 次尝试）: {last_err[:300]}")
 
         # 读 commit hash
         try:
