@@ -48,6 +48,26 @@ def _system_names_for_tasks(db: Session, system_ids: list[int]) -> dict[int, str
     return {sid: name for sid, name in rows}
 
 
+def _guard_active_quota(db: Session, user_id: int, current_user, request, action_suffix: str = "") -> None:
+    """每用户在途任务限流（2026-10-28：max_active_per_user，默认 1）。
+    目的：防单用户霸屏 worker 槽位 + 刷爆共享 AI 配额（30A127 教训）。
+    边界如实：DB count 非原子，同秒并发提交理论可超限 1——内网低频按"近似限流"
+    取舍，不上 advisory lock（过度设计）。"""
+    from app.config import get_cfg
+    cap = int(get_cfg("compile.max_active_per_user", 1))
+    active = db.query(CompileTask).filter(
+        CompileTask.user_id == user_id,
+        CompileTask.status.in_(["submitted", "compiling"]),
+    ).count()
+    if active >= cap:
+        from app.services.audit import log_audit
+        log_audit(db, user_id=user_id, action="task_submit_rejected", target_type="compile_task",
+                  request=request, details=f"active={active} cap={cap}{action_suffix}")
+        db.commit()
+        raise HTTPException(status_code=400,
+                            detail=f"你已有 {active} 个进行中任务（上限 {cap}），请等待收工后再提交")
+
+
 @router.post("/submit", response_model=ApiResponse)
 async def submit_compile_task(
     task_data: CompileTaskCreate,
@@ -70,6 +90,8 @@ async def submit_compile_task(
     ).first()
     if not system:
         raise HTTPException(status_code=404, detail="目标系统不存在或已禁用")
+
+    _guard_active_quota(db, current_user.user_id, current_user, request)
 
     # 生成任务 ID
     task_id = f"T-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
@@ -147,6 +169,9 @@ async def upload_and_submit(
     ).first()
     if not system:
         raise HTTPException(status_code=404, detail="目标系统不存在或已禁用")
+
+    # 在途限流放写文件之前——拒绝时零副作用可清理（时序考量）
+    _guard_active_quota(db, current_user.user_id, current_user, request, action_suffix=" via=upload")
 
     # 3. 校验 compile_mode
     if compile_mode not in ("container", "local"):
