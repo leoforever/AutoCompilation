@@ -539,6 +539,11 @@ async def cancel_compile_task(
     task.completed_at = datetime.utcnow()
     if task.started_at:
         task.duration_seconds = int((task.completed_at - task.started_at).total_seconds())
+    # T12：admin 代取消→通知属主；本人取消被自发排除兜住
+    from app.services.notify import notify
+    notify(db, user_id=task.user_id, type="task_done",
+           title=f"[已取消] {task.software_name}",
+           link=f"/tasks?focus={task.task_id}", actor_user_id=current_user.user_id)
     db.commit()
 
     # best-effort 杀容器（不影响 API 响应，异步）

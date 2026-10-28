@@ -350,6 +350,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/utils/request'
 import { fmtDateTime } from '@/utils/datetime'
@@ -1148,7 +1149,18 @@ async function submitSkillDraft() {
   }
 }
 
-onMounted(loadTickets)
+const route = useRoute()
+onMounted(async () => {
+  await loadTickets()
+  // T12 通知深链：/admin/tickets?focus=<id> 自动开详情抽屉
+  const f = route.query.focus as string
+  if (f) {
+    const hit = tickets.value.find((t: any) => String(t.ticket_id) === f)
+    if (hit) await openDetail(hit)
+    const q = new URLSearchParams(location.search); q.delete('focus')
+    history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q.toString() : ''))
+  }
+})
 </script>
 
 <style scoped>

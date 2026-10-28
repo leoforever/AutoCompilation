@@ -20,6 +20,7 @@ from app.schemas import (
 )
 from app.dependencies import get_current_user
 from app.services.audit import log_audit
+from app.services.notify import notify
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
 import logging
 
@@ -248,6 +249,12 @@ async def send_ticket_message(
     old_status = ticket.status
     if ticket.status == TicketStatus.PENDING:
         ticket.status = TicketStatus.PROCESSING
+    # T12：通知工单属主（×N 合并去刷屏）；agent_cmd 指令线不通知（非面向用户对话）
+    from app.services.notify import notify
+    _lk = f"/tickets?focus={ticket_id}"
+    notify(db, user_id=ticket.user_id, type="ticket_reply",
+           title=f"管理员回复了你的工单 #{ticket_id}", body=content.strip()[:200],
+           link=_lk, merge_key=_lk)
     db.add(AuditLog(
         user_id=current_user.user_id,
         action="ticket_message",
@@ -355,6 +362,10 @@ async def resolve_ticket(
         except Exception as e:
             print(f"[resolve] 归档新 task 失败: {e}")
 
+    from app.services.notify import notify
+    notify(db, user_id=ticket.user_id, type="ticket_reply",
+           title=f"你的工单 #{ticket_id} 已解决", link=f"/tickets?focus={ticket_id}",
+           actor_user_id=current_user.user_id, merge_key=None)
     db.add(AuditLog(
         user_id=current_user.user_id,
         action="ticket_resolve",

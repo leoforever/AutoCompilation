@@ -158,6 +158,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { useRoute } from 'vue-router'
 import api from '@/utils/request'
 import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -605,9 +606,18 @@ async function onSubmitDraft() {
   }
 }
 
-onMounted(() => {
-  loadTasks()
+const route = useRoute()
+onMounted(async () => {
+  await loadTasks()
   loadExistingTickets()
+  // T12 通知深链：/tasks?focus=<task_id> 自动打开该任务日志（消费后即清参数，防刷新重弹）
+  const f = route.query.focus as string
+  if (f) {
+    const hit = tasks.value.find((t: any) => t.task_id === f)
+    if (hit) viewLog(hit)
+    const q = new URLSearchParams(location.search); q.delete('focus')
+    history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q.toString() : ''))
+  }
 })
 onBeforeUnmount(() => { stopDraftWatch(); hidePendingMsg() })   // 卸载停流+收全局灰条（duration:0 不随路由销毁）
 

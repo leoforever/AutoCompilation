@@ -115,6 +115,8 @@ def reconcile_stuck_tasks() -> dict:
                 task.duration_seconds = int((completed - task.started_at).total_seconds())
             if not task.artifact_path and has_artifacts:
                 task.artifact_path = json.dumps(_rebuild_artifacts(output_dir), ensure_ascii=False)
+            from app.services.notify import notify_task_terminal
+            notify_task_terminal(db, task, "success", "（对账自愈入库）")
             db.commit()
             # 磁盘审计：哨兵改名留档，不删
             try:

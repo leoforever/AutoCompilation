@@ -91,6 +91,8 @@ def dequeue(worker_id: str) -> Optional[str]:
                         f"任务超时无心跳（{HEARTBEAT_TIMEOUT}s 无更新），"
                         f"worker 崩溃，自动标记失败"
                     )
+                    from app.services.notify import notify_task_terminal
+                    notify_task_terminal(db, stale, "failed", stale.error_message)
                     db.commit()
                 # 不返回这个 task，让 worker 继续 dequeue 新任务
                 task = None

@@ -112,6 +112,9 @@ def write_terminal(db, task, state: dict) -> None:
         task.completed_at = now
         if task.started_at:
             task.duration_seconds = int((task.completed_at - task.started_at).total_seconds())
+        # T12 通知：随块1同一事务落（业务成=通知存）
+        from app.services.notify import notify_task_terminal
+        notify_task_terminal(db, task, str(task.status), state.get("last_error", ""))
         db.commit()
         if work_dir and not (Path(work_dir) / ".persist_error").is_file():
             clear_sentinel(work_dir)  # 干净收尾不留陈旧哨兵

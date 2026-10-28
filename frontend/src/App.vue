@@ -18,9 +18,28 @@
       </div>
       <div class="spacer"></div>
       <el-input placeholder="搜索软件 / 工单 / 经验…" />
-      <el-badge :value="3">
-        <el-button circle>🔔</el-button>
-      </el-badge>
+      <el-dropdown trigger="click" @visible-change="onBellOpen" popper-class="notify-pop">
+        <el-badge :value="unreadCount" :hidden="!unreadCount" class="bell-badge">
+          <el-button circle><img src="/emoji/1f514.svg" class="bell-ico" alt="消息" /></el-button>
+        </el-badge>
+        <template #dropdown>
+          <div class="notify-panel">
+            <div class="notify-head">
+              <span>消息提醒</span>
+              <el-button v-if="unreadCount" link type="primary" size="small" @click="markAllRead">全部已读</el-button>
+            </div>
+            <el-scrollbar max-height="320px">
+              <div v-if="!notifList.length" class="notify-empty">暂无消息</div>
+              <div v-for="nt in notifList" :key="nt.id" :class="['notify-item', { unread: nt.unread }]"
+                   @click="openNotif(nt)">
+                <div class="notify-title">{{ nt.title }}</div>
+                <div v-if="nt.body" class="notify-body">{{ nt.body }}</div>
+                <div class="notify-time">{{ fmtNotifTime(nt.created_at) }}</div>
+              </div>
+            </el-scrollbar>
+          </div>
+        </template>
+      </el-dropdown>
       <el-dropdown @command="handleCommand">
         <el-avatar>{{ authStore.user?.username?.charAt(0) || 'U' }}</el-avatar>
         <template #dropdown>
@@ -62,10 +81,40 @@
 import { ref, computed, onMounted , watch } from 'vue'
 import { emojiSrc } from '@/utils/emoji'
 import { useRouter } from 'vue-router'
+import api from '@/utils/request'
+import { fmtDateTime } from '@/utils/datetime'
+
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage } from 'element-plus'
 
 const router = useRouter()
+
+// ── T12 消息提醒（一期纯拉取：route change 刷新 unread；无 WS）──
+const unreadCount = ref(0)
+const notifList = ref<any[]>([])
+async function loadUnread() {
+  try {
+    const r: any = await api.get('/notifications/unread-count')
+    unreadCount.value = r?.data?.count ?? 0
+  } catch { /* 静默：提醒不阻塞主界面 */ }
+}
+async function onBellOpen(visible: boolean) {
+  if (!visible) return
+  try {
+    const r: any = await api.get('/notifications', { params: { limit: 20 } })
+    notifList.value = r?.data || []
+  } catch { notifList.value = [] }
+}
+async function openNotif(nt: any) {
+  if (nt.unread) { try { await api.post('/notifications/read', { id: nt.id }) } catch {} ; loadUnread() }
+  if (nt.link) router.push(nt.link)
+}
+async function markAllRead() {
+  try { await api.post('/notifications/read', { all: true }); loadUnread() } catch {}
+}
+function fmtNotifTime(s0: string) { return s0 ? fmtDateTime(s0, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '' }
+watch(() => router.currentRoute.value.fullPath, loadUnread)   // 切页即拉平
+watch(() => authStore.isLoggedIn, (v) => { if (v) loadUnread(); else { unreadCount.value = 0; notifList.value = [] } })
 const authStore = useAuthStore()
 const role = ref<'user' | 'admin'>(authStore.isAdmin ? 'admin' : 'user')
 // 10-23 修复：fetchMe 是异步的（onMounted 才拉），上面求值时 user 常为 null →
@@ -270,6 +319,17 @@ body {
 }
 
 .nav-item .ico { width: 18px; text-align: center; }
+.bell-badge { margin-right: 6px; }
+.bell-ico { width: 18px; height: 18px; vertical-align: -4px; }
+.notify-panel { width: 320px; padding: 4px 2px; }
+.notify-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; font-weight: 600; border-bottom: 1px solid var(--border); }
+.notify-empty { color: var(--text3); text-align: center; padding: 24px 0; font-size: 13px; }
+.notify-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.notify-item:hover { background: var(--bg2, rgba(128,128,128,.08)); }
+.notify-item.unread .notify-title::before { content: '●'; color: var(--el-color-primary, #409eff); margin-right: 6px; font-size: 10px; }
+.notify-title { font-size: 13px; }
+.notify-body { font-size: 12px; color: var(--text3); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.notify-time { font-size: 11px; color: var(--text3); margin-top: 4px; }
 .nav-item .ico-img { width: 16px; height: 16px; vertical-align: -3px; }
 
 .main {

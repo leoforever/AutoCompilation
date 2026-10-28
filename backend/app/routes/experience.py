@@ -17,6 +17,7 @@ from app.schemas import (
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
 from app.dependencies import get_current_user, require_admin
 from app.services.audit import log_audit
+from app.services.notify import notify
 import logging
 
 router = APIRouter()
@@ -199,6 +200,9 @@ async def approve_experience(
             logger.error("[approve] commit 失败后磁盘恢复也失败: %s", de)
         raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
 
+    notify(db, user_id=experience.user_id, type="exp_result",
+           title=f"你的经验《{experience.skill_name}》已通过审核",
+           link="/contributions", actor_user_id=current_user.user_id)
     _t = db.query(CompileTask).filter(CompileTask.id == experience.task_id).first()
     log_audit(db, user_id=current_user.user_id, action="experience_approve", target_type="experience",
               target_id=experience_id, target_key=str(experience.skill_name), request=request,
@@ -223,6 +227,10 @@ async def reject_experience(
     experience.rejection_reason = reason
     experience.reviewed_at = datetime.utcnow()
     experience.reviewer_id = current_user.user_id
+    notify(db, user_id=experience.user_id, type="exp_result",
+           title=f"你的经验《{experience.skill_name}》被驳回",
+           body=f"原因：{reason or '未填写'}", link="/contributions",
+           actor_user_id=current_user.user_id)
     log_audit(db, user_id=current_user.user_id, action="experience_reject", target_type="experience",
               target_id=experience_id, target_key=str(experience.skill_name), request=request,
               details=f"reason={reason or '未填'}")

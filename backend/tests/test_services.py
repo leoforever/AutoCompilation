@@ -283,10 +283,19 @@ def test_route_ws_uses_broadcaster():
 
 # ===================== 全链路 =====================
 def test_app_load():
-    """FastAPI app + 6 routers 注册成功"""
+    """FastAPI app + 全部 routers 注册成功（数集合不数个数——写死计数每加一个
+    router 就假红，T12 notifications 上线时踩过；且本 FastAPI 版 _IncludedRouter
+    不展平路径（计数/属性两条老路都走不通），取 openapi paths 视图）"""
     from app.main import app
-    included = [r for r in app.routes if type(r).__name__ == "_IncludedRouter"]
-    assert len(included) == 6
+    joined = " ".join(app.openapi().get("paths", {}).keys())
+    # WebSocket 路由不进 openapi，也不在顶层展平（藏在 _IncludedRouter 内）——
+    # 直接探 ws router 自身注册面
+    from app.routes.ws import router as _wsr
+    ws_ok = any(getattr(r, "path", "").startswith("/ws") for r in _wsr.routes)
+    for need in ("/api/auth", "/api/compile", "/api/tickets", "/api/experience",
+                 "/api/admin", "/api/notifications"):
+        assert need in joined, f"router 缺失: {need}"
+    assert ws_ok, "ws router 缺失"
 
 
 def test_skills_middleware_in_container():

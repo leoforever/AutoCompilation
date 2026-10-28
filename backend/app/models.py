@@ -1,7 +1,7 @@
 """
 Database models for LoongArch Compile Platform
 """
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -301,6 +301,25 @@ class Skill(Base):
 
     # 关系
     creator = relationship("User")
+
+
+class Notification(Base):
+    """站内消息提醒（T12 2026-10-28 →references/notify-design-20261028.md）
+
+    append-only + 例外 update 路径（ticket_reply ×N 合并计数、置读 read_at）。
+    link=前端路由串（点击跳转）；一期无 WS 实时推，route change 拉取。"""
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False, index=True)
+    type = Column(String(20), nullable=False)      # task_done | ticket_reply | exp_result
+    title = Column(String(200), nullable=False)
+    body = Column(Text)
+    link = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    read_at = Column(DateTime, nullable=True)      # NULL=未读；naive UTC 纪律
+
+    __table_args__ = (Index("ix_notifications_user_read", "user_id", "read_at"),)
 
 
 class AuditLog(Base):

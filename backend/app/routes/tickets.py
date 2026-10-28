@@ -309,6 +309,16 @@ async def add_ticket_message(
     )
     db.add(msg)
     if role == "user":
+        # T12：通知其他管理员（工单是对话流，对方在场感刚需）
+        from app.services.notify import notify
+        for adm in db.query(User).filter(User.role == "admin", User.is_active == True,
+                                         User.deleted_at.is_(None)).all():
+            notify(db, user_id=adm.user_id, type="ticket_reply",
+                   title=f"用户 {current_user.username} 回复了工单 #{ticket_id}",
+                   body=content.strip()[:200], link=f"/admin/tickets?focus={ticket_id}",
+                   actor_user_id=current_user.user_id,
+                   merge_key=f"/admin/tickets?focus={ticket_id}")
+    if role == "user":
         log_audit(db, user_id=current_user.user_id, action="ticket_message_user",
                   target_type="ticket", target_id=ticket_id, target_key=f"#{ticket_id}",
                   request=request, details=f"len={len(content.strip())}")
