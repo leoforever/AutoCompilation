@@ -3,6 +3,9 @@
     <div class="card">
       <h3>📋 操作日志审计</h3>
       <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap">
+        <el-select v-model="auditFilter.user_id" placeholder="用户" clearable filterable size="small" style="width:150px" @change="loadAuditLogs(1)">
+          <el-option v-for="u in userOptions" :key="u.user_id" :label="u.username" :value="u.user_id" />
+        </el-select>
         <el-select v-model="auditFilter.action" placeholder="操作类型" clearable size="small" style="width:170px" @change="loadAuditLogs(1)">
           <el-option v-for="a in ACTION_OPTIONS" :key="a.value" :label="a.label" :value="a.value" />
         </el-select>
@@ -47,13 +50,23 @@ import { fmtDateTime } from '@/utils/datetime'
 
 const auditLogs = ref<any[]>([])
 const loading = ref(false)
-const auditFilter = ref<{ action: string; target_type: string; q: string }>({ action: '', target_type: '', q: '' })
+const auditFilter = ref<{ user_id: number | ''; action: string; target_type: string; q: string }>({ user_id: '', action: '', target_type: '', q: '' })
+// 用户筛选选项：admin 用户列表（含登录失败等无主行不在此维度——user_id=NULL 行
+// 只有"不限用户"时可见，选中具体用户即看其本人操作）
+const userOptions = ref<any[]>([])
+async function loadUserOptions() {
+  try {
+    const r: any = await api.get('/admin/users', { params: { include_deleted: false } })
+    userOptions.value = r?.data || []   // 拦截器 unwrap 后 {code,data:[...]}，Users.vue 同款消费
+  } catch { /* 选项拉取失败不阻塞审计页主体 */ }
+}
 const auditPage = ref({ page: 1, pageSize: 20, total: 0 })
 
 async function loadAuditLogs(page = 1) {
   loading.value = true
   auditPage.value.page = page
   const params: any = { page, page_size: auditPage.value.pageSize }
+  if (auditFilter.value.user_id !== '') params.user_id = auditFilter.value.user_id
   if (auditFilter.value.action) params.action = auditFilter.value.action
   if (auditFilter.value.target_type) params.target_type = auditFilter.value.target_type
   if (auditFilter.value.q) params.q = auditFilter.value.q.trim()
@@ -88,7 +101,7 @@ function auditActionTag(a: string) {
 }
 const ACTION_OPTIONS = Object.entries(ACTION_LABELS).map(([value, label]) => ({ value, label }))
 
-onMounted(() => loadAuditLogs(1))
+onMounted(() => { loadAuditLogs(1); loadUserOptions() })
 </script>
 
 <style scoped>

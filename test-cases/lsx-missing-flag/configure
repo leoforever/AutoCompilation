@@ -1,0 +1,22 @@
+#!/bin/sh
+# 故意缺陷：架构检测 case 表缺少 loongarch64 条目
+# （模拟上游 autoconf/configure 未适配龙芯的真实常见场景）
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)
+        ARCH_CFLAGS="-msse2"
+        ;;
+    aarch64)
+        ARCH_CFLAGS="-march=armv8-a+simd"
+        ;;
+    *)
+        echo "configure: error: Unsupported architecture: $ARCH" >&2
+        echo "         (arch support table has no entry for this machine)" >&2
+        exit 1
+        ;;
+esac
+
+cat > config.mk <<MK
+ARCH_CFLAGS = $ARCH_CFLAGS
+MK
+echo "configured for $ARCH: ARCH_CFLAGS=$ARCH_CFLAGS"

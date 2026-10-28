@@ -1099,6 +1099,11 @@ async def reset_user_password(
     target = db.query(User).filter(User.user_id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 预置 admin 保护（2026-10-28 口径修正）：仅系统预制 admin 账号口令只能本人
+    # 重置（防任何其他人——含其他管理员——顶掉它接管）；其余用户（含 admin 角色）
+    # 管理员皆可重置
+    if target.username == "admin" and target.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="预制 admin 账号只能本人重置密码")
 
     target.password_hash = bcrypt.hashpw(
         body.new_password.encode(),
@@ -1159,6 +1164,10 @@ async def update_user(
     target = db.query(User).filter(User.user_id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 预置 admin 保护（2026-10-28 口径修正）：仅 admin 账号不可编辑（改角色=降权
+    # 接管、禁用=全站锁死）；其他管理员角色行可编辑（delete 端点仍护所有 admin 角色）
+    if target.username == "admin":
+        raise HTTPException(status_code=403, detail="预制 admin 账号不允许编辑（保护策略）")
 
     if body.role is None and body.is_active is None:
         raise HTTPException(status_code=400, detail="没有需要修改的字段")
