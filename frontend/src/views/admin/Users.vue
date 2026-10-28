@@ -104,7 +104,7 @@
     </el-dialog>
 
     <!-- 编辑用户（角色 + 状态） -->
-    <el-dialog v-model="editVisible" :title="`✎ 编辑用户 — ${editTarget?.username || ''}`" width="420px">
+    <el-dialog v-model="editVisible" :title="`✏ 编辑用户 — ${editTarget?.username || ''}`" width="420px">
       <el-form label-width="70px">
         <el-form-item label="角色">
           <el-radio-group v-model="editForm.role">

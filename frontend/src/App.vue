@@ -43,7 +43,7 @@
           :class="['nav-item', { active: currentRoute === item.id }]"
           @click="navigateTo(item.id)"
         >
-          <span class="ico">{{ item.ico }}</span>
+          <span class="ico"><img v-if="emojiSrc(item.ico)" :src="emojiSrc(item.ico)!" :alt="item.ico" class="ico-img" /><template v-else>{{ item.ico }}</template></span>
           {{ item.label }}
         </div>
       </el-aside>
@@ -60,6 +60,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted , watch } from 'vue'
+import { emojiSrc } from '@/utils/emoji'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage } from 'element-plus'
@@ -269,6 +270,7 @@ body {
 }
 
 .nav-item .ico { width: 18px; text-align: center; }
+.nav-item .ico-img { width: 16px; height: 16px; vertical-align: -3px; }
 
 .main {
   margin-left: 210px;

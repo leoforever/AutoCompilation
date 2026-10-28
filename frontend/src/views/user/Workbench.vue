@@ -86,7 +86,7 @@
             <label>
               知识库 Skill（{{ availableSkills.length }} 个：{{ availableGenericCount }} 通用 · {{ availableSpecificCount }} 专用）
               <span v-if="matchedSkills.length" style="margin-left: 8px; color: #67c23a;">
-                ✓ 本次命中 {{ matchedSkills.length }} 个
+                ✔ 本次命中 {{ matchedSkills.length }} 个
               </span>
             </label>
             <div class="skill-chips">
@@ -99,7 +99,7 @@
               >
                 {{ skill.name }}
                 <el-tag v-if="skill.type === 'specific'" size="small" type="info" class="tag-specific">专用</el-tag>
-                <span v-if="isMatched(skill)" style="margin-left: 4px;">✓</span>
+                <span v-if="isMatched(skill)" style="margin-left: 4px;">✔</span>
               </el-tag>
             </div>
           </div>
