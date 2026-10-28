@@ -7,7 +7,7 @@ Based on design doc section 11.1: POST /api/compile/submit, GET /api/compile/tas
 - WS /ws/compile/log/{id} 改用 worker.BROADCASTER 实时推送
 - POST /upload 新增：上传源码包 + 创建 task（source_type=upload，git 路径不变）
 """
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
@@ -19,6 +19,7 @@ import re
 import os
 from datetime import datetime
 from app.dependencies import get_current_user
+from app.services.audit import log_audit
 from app.models import User
 
 from app.models import get_db, CompileTask, TaskStatus, TargetSystem, Skill
@@ -50,6 +51,7 @@ def _system_names_for_tasks(db: Session, system_ids: list[int]) -> dict[int, str
 @router.post("/submit", response_model=ApiResponse)
 async def submit_compile_task(
     task_data: CompileTaskCreate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -87,6 +89,12 @@ async def submit_compile_task(
         status=TaskStatus.SUBMITTED,
     )
     db.add(task)
+    db.flush()   # 拿主键（审计 target_id；T10 时序教训：add 前 id=None）
+    log_audit(db, user_id=current_user.user_id, action="task_submit", target_type="compile_task",
+              target_id=task.id, target_key=task_id, request=request,
+              details=f"software={task_data.software_name} system_id={task_data.system_id} "
+                      f"source={task_data.source_type} git={task_data.git_url or ''}@{task_data.git_branch or 'default'} "
+                      f"mode={task_data.compile_mode}")
     db.commit()
     db.refresh(task)
 
@@ -111,6 +119,7 @@ async def upload_and_submit(
     git_branch: str = Form("main"),
     compile_mode: str = Form("container"),
     build_args: Optional[str] = Form(None, description='JSON 字符串，如 {"KEY":"VAL"}'),
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -214,6 +223,10 @@ async def upload_and_submit(
             compile_mode=compile_mode,
             status=TaskStatus.SUBMITTED,
         )
+        log_audit(db, user_id=current_user.user_id, action="task_submit", target_type="compile_task",
+                  target_key=task_id, request=request,
+                  details=f"software={software_name} system_id={system_id} source=upload "
+                          f"pkg={original_name} mode={compile_mode}")
         db.add(task)
         db.commit()
         db.refresh(task)
@@ -383,6 +396,7 @@ async def get_compile_log(
 @router.get("/tasks/{task_id}/log/download")
 async def download_compile_log(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -402,6 +416,10 @@ async def download_compile_log(
     log_file = _artifacts_dir() / task_id / "build.log"
     if not log_file.exists():
         return {"task_id": task_id, "log": task.log_output or "", "source": "db"}
+    log_audit(db, user_id=current_user.user_id, action="log_downloaded", target_type="compile_task",
+              target_id=task.id, target_key=task_id, request=request,
+              details=f"size={log_file.stat().st_size}")
+    db.commit()
     return FileResponse(
         path=str(log_file),
         media_type="text/plain",
@@ -412,6 +430,7 @@ async def download_compile_log(
 @router.get("/tasks/{task_id}/artifacts/download")
 async def download_artifacts_bundle(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -447,6 +466,10 @@ async def download_artifacts_bundle(
         with tarfile.open(bundle_path, "w:gz") as tar:
             tar.add(tree, arcname=tree.name)
 
+    log_audit(db, user_id=current_user.user_id, action="artifact_downloaded", target_type="compile_task",
+              target_id=task.id, target_key=task_id, request=request,
+              details=f"bundle_size={bundle_path.stat().st_size}")
+    db.commit()
     return FileResponse(
         path=str(bundle_path),
         media_type="application/gzip",
@@ -457,6 +480,7 @@ async def download_artifacts_bundle(
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_compile_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -481,6 +505,9 @@ async def cancel_compile_task(
             detail=f"任务状态为 {task.status}，无法取消（只能取消 submitted / compiling）"
         )
 
+    log_audit(db, user_id=current_user.user_id, action="task_cancel", target_type="compile_task",
+              target_id=task.id, target_key=task_id, request=request,
+              details=f"pre_status={task.status} container={task.container_id or '无'}")
     # 标 cancelled（worker 下一轮 _periodic_persist 会感知到）
     task.status = "cancelled"
     task.error_message = f"用户 {current_user.username} 主动取消"
@@ -513,6 +540,7 @@ async def cancel_compile_task(
 @router.post("/tasks/{task_id}/retry", response_model=ApiResponse)
 async def retry_compile_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -552,6 +580,10 @@ async def retry_compile_task(
         status=TaskStatus.SUBMITTED.value,
     )
     db.add(new_task)
+    db.flush()   # 拿主键（T10：add 前 id=None）
+    log_audit(db, user_id=current_user.user_id, action="task_retry", target_type="compile_task",
+              target_id=new_task.id, target_key=new_task_id, request=request,
+              details=f"from={task_id} software={src.software_name}")
     db.commit()
     db.refresh(new_task)
 

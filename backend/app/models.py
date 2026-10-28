@@ -307,13 +307,16 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=False)
-    action = Column(String(100), nullable=False)  # 操作类型
+    # T10（2026-10-27）：user_id 可空——登录失败时账号可能不存在，无主可挂
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)
+    action = Column(String(100), nullable=False, index=True)  # 操作类型（T10 加索引）
     target_type = Column(String(50))  # 目标类型：task/ticket/experience/user
     target_id = Column(Integer)
+    # T10：业务号（T-…/工单号/skill 名）——界面只显它，内部整数 ID 不上界面
+    target_key = Column(String(100))
     details = Column(Text)  # JSON 字符串
     ip_address = Column(String(50))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     user = relationship("User", back_populates="audit_logs")
 
@@ -343,6 +346,32 @@ def _safe_drop_column(table_name: str, column_name: str):
     logger.info("Dropped column %s.%s", table_name, column_name)
 
 
+def _relax_auditlog_user_notnull():
+    """T10：存量 audit_logs.user_id 解 NOT NULL（超出 _safe_add_column 能力的已有列约束变更，
+    显式幂等 SQL；PG 对已 nullable 是 no-op）"""
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE audit_logs ALTER COLUMN user_id DROP NOT NULL"))
+    except Exception as e:
+        logger.warning("[init_db] audit_logs.user_id 解 NOT NULL 跳过: %s", e)
+
+
+def _ensure_audit_indexes():
+    """T10：审计查询三索引（CREATE INDEX IF NOT EXISTS，PG/SQLite3 均幂等）"""
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS ix_audit_created_at ON audit_logs (created_at)",
+                "CREATE INDEX IF NOT EXISTS ix_audit_user_id ON audit_logs (user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_logs (action)",
+            ):
+                conn.execute(text(stmt))
+    except Exception as e:
+        logger.warning("[init_db] audit 索引跳过: %s", e)
+
+
 def init_db():
     """初始化数据库（创建所有表 + 幂等迁移 + 种子数据）"""
     Base.metadata.create_all(bind=engine)
@@ -367,6 +396,10 @@ def init_db():
     # 别在这写 db.execute——init_db 作用域没有 session，2026-10-22 启动炸 NameError 教训）
     _safe_add_column("ticket_messages", "is_read", "BOOLEAN NOT NULL DEFAULT TRUE")
     _safe_add_column("ticket_messages", "kind", "VARCHAR(12) NOT NULL DEFAULT 'chat'")
+    # T10 操作审计（2026-10-27）：存量库幂等三段——新库由 create_all 成型，这里全 no-op
+    _safe_add_column("audit_logs", "target_key", "VARCHAR(100)")
+    _relax_auditlog_user_notnull()
+    _ensure_audit_indexes()
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
     _seed_default_target_systems()
     logger.info("Database initialized")

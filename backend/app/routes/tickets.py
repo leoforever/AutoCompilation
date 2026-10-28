@@ -13,12 +13,13 @@
 - POST /api/admin/tickets/{id}/status  admin 改状态
 """
 import os
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime
 
 from app.models import get_db, Ticket, TicketMessage, CompileTask, User, TicketStatus
+from app.services.audit import log_audit
 from app.schemas import TicketCreate, ApiResponse
 from app.dependencies import get_current_user
 
@@ -155,6 +156,7 @@ async def draft_ticket_from_task(
 @router.post("/report", response_model=ApiResponse)
 async def report_ticket(
     ticket_data: TicketCreate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -181,6 +183,7 @@ async def report_ticket(
     # （看门狗腰斩单往往只剩 DB 尾巴）；两源皆无/读失败不再静默 pass——
     # description 显式注记，提单人与 admin 当场知道交的是"无日志工单"
     include_log = getattr(ticket_data, "include_log_tail", True)
+    _tail_state = "not_requested"
     if include_log:
         from app.config import artifacts_dir as _artifacts_dir  # Q1b 归一：不再反向 import 引擎私有
         tail = ""
@@ -193,14 +196,20 @@ async def report_ticket(
         except Exception:
             tail = ""
         if tail:
+            _tail_state = "attached"
             log_block = f"\n\n--- build.log 末尾 50 行（自动附）---\n```\n{tail}\n```"
             desc = (ticket_data.description or "").strip()
             ticket.description = (desc + log_block) if desc else f"（用户未填描述，自动附 build.log 末 50 行）\n```\n{tail}\n```"
         else:
+            _tail_state = "no_log_source"
             note = "\n\n（注：未能附日志尾部——任务目录已清理，或该任务无运行日志记录）"
             ticket.description = ((ticket.description or "") + note).strip() or note.strip()
         db.flush()
 
+    log_audit(db, user_id=current_user.user_id, action="ticket_report", target_type="ticket",
+              target_id=ticket.ticket_id, target_key=f"#{ticket.ticket_id}", request=request,
+              details=f"task={task.task_id} software={task.software_name} "
+                      f"log_tail={_tail_state} source={ticket_data.source}")
     db.commit()
     db.refresh(ticket)
     return ApiResponse(
@@ -275,6 +284,7 @@ async def mark_ticket_read(
 async def add_ticket_message(
     ticket_id: int,
     content: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -298,6 +308,10 @@ async def add_ticket_message(
         is_read=(role != "admin"),  # T8: admin 回复=用户未读；用户自己发的恒已读
     )
     db.add(msg)
+    if role == "user":
+        log_audit(db, user_id=current_user.user_id, action="ticket_message_user",
+                  target_type="ticket", target_id=ticket_id, target_key=f"#{ticket_id}",
+                  request=request, details=f"len={len(content.strip())}")
     # pending 状态下用户回复 = 重新激活，admin 看得到
     if ticket.status == TicketStatus.PENDING and role == "admin":
         ticket.status = TicketStatus.PROCESSING
@@ -309,6 +323,7 @@ async def add_ticket_message(
 @router.post("/{ticket_id}/close", response_model=ApiResponse)
 async def close_my_ticket(
     ticket_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -319,7 +334,11 @@ async def close_my_ticket(
         raise HTTPException(status_code=403, detail="只能关闭自己的工单")
     if ticket.status == TicketStatus.CLOSED:
         raise HTTPException(status_code=400, detail="工单已关闭")
+    pre_st = ticket.status
     ticket.status = TicketStatus.CLOSED
+    log_audit(db, user_id=current_user.user_id, action="ticket_closed", target_type="ticket",
+              target_id=ticket_id, target_key=f"#{ticket_id}", request=request,
+              details=f"pre_status={str(pre_st)}")
     db.commit()
     # 终态回收 agent 容器（异步；work_dir/checkpoint/记录保留）
     import asyncio

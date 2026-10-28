@@ -2,7 +2,7 @@
 Admin routes
 Based on design doc section 11.2: stats, tickets management, skill CRUD, users, systems
 """
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -19,6 +19,7 @@ from app.schemas import (
     StatsOverview, ApiResponse
 )
 from app.dependencies import get_current_user
+from app.services.audit import log_audit
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
 import logging
 
@@ -625,7 +626,9 @@ async def list_skills(
 @router.post("/skills", response_model=ApiResponse)
 async def create_skill(
     skill_data: SkillCreate,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """新增 Skill（同步写盘到 skills/<type>/<name>/SKILL.md）"""
     # 检查名称是否已存在
@@ -674,6 +677,10 @@ async def create_skill(
             import logging as _lg; _lg.getLogger(__name__).error("[create_skill] 盘回滚失败: %s", de)
         raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
     db.refresh(skill)
+    log_audit(db, user_id=current_user.user_id, action="skill_created", target_type="skill",
+              target_id=skill.skill_id, target_key=skill.name, request=request,
+              details=f"type={skill.type} version={skill.version}")
+    db.commit()
 
     return ApiResponse(data=SkillResponse.model_validate(skill).model_dump())
 
@@ -682,7 +689,9 @@ async def create_skill(
 async def update_skill(
     skill_id: int,
     skill_data: SkillUpdate,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """更新 Skill（同步刷新磁盘 SKILL.md）"""
     skill = db.query(Skill).filter(Skill.skill_id == skill_id).first()
@@ -749,6 +758,17 @@ async def update_skill(
             logging.warning("改名时清旧目录失败: %s", e)
 
     db.refresh(skill)
+    _ch = []
+    if skill_data.name: _ch.append(f"name={skill_data.name}")
+    if skill_data.description: _ch.append("desc")
+    if skill_data.system_ids is not None: _ch.append(f"systems={skill_data.system_ids}")
+    if skill_data.version: _ch.append(f"ver={skill_data.version}")
+    if skill_data.is_active is not None: _ch.append(f"active={skill_data.is_active}")
+    if skill_data.skill_content: _ch.append(f"content_len={len(skill_data.skill_content)}")
+    log_audit(db, user_id=current_user.user_id, action="skill_updated", target_type="skill",
+              target_id=skill_id, target_key=str(skill.name), request=request,
+              details="changed:" + ",".join(_ch))
+    db.commit()
 
     return ApiResponse(data=SkillResponse.model_validate(skill).model_dump())
 
@@ -756,7 +776,9 @@ async def update_skill(
 @router.delete("/skills/{skill_id}", response_model=ApiResponse)
 async def delete_skill(
     skill_id: int,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """删除 Skill（真删）：DB 硬删 Skill 行 + 删磁盘 SKILL.md + 级联清关联 Experience 行
 
@@ -805,6 +827,10 @@ async def delete_skill(
     msg = f"Skill 已删除：{skill_name}"
     if related_count:
         msg += f"（同时清理 {related_count} 条关联经验）"
+    log_audit(db, user_id=current_user.user_id, action="skill_deleted", target_type="skill",
+              target_id=skill_id, target_key=skill_name, request=request,
+              details=f"type={skill_type} cascaded_experiences={related_count}")
+    db.commit()
     return ApiResponse(message=msg)
 
 
@@ -839,7 +865,8 @@ def _parse_frontmatter_field(content: str, field: str) -> str | None:
 
 
 @router.post("/skills/reconcile", response_model=ApiResponse)
-async def reconcile_skills(db: Session = Depends(get_db)):
+async def reconcile_skills(request: Request, db: Session = Depends(get_db),
+                           current_user: User = Depends(get_current_user)):
     """手动触发 reconcile（磁盘 → DB 同步）
 
     2 状态机：
@@ -854,6 +881,8 @@ async def reconcile_skills(db: Session = Depends(get_db)):
         f"reconcile 完成：磁盘 {stats['total_disks']} / DB {stats['total_dbs']}，"
         f"新增 {stats['disk_only']}，软删 {stats['db_only']}"
     )
+    log_audit(db, user_id=current_user.user_id, action="skill_reconcile", target_type="skill",
+              request=request, details=msg)
     return ApiResponse(message=msg, data=stats)
 
 
@@ -929,7 +958,9 @@ async def list_systems(
 @router.post("/systems", response_model=ApiResponse)
 async def create_system(
     system_data: TargetSystemCreate,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """新增目标系统"""
     # 唯一性检查（schema 不会报，但 DB unique constraint 会让 commit 抛 IntegrityError）
@@ -947,6 +978,10 @@ async def create_system(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
     db.refresh(system)
+    log_audit(db, user_id=current_user.user_id, action="system_created", target_type="system",
+              target_id=system.system_id, target_key=system.name, request=request,
+              details=f"base_image={system.base_image}")
+    db.commit()
 
     return ApiResponse(data=TargetSystemResponse.model_validate(system).model_dump())
 
@@ -955,7 +990,9 @@ async def create_system(
 async def update_system(
     system_id: int,
     system_data: TargetSystemUpdate,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """更新目标系统配置"""
     system = db.query(TargetSystem).filter(TargetSystem.system_id == system_id).first()
@@ -982,6 +1019,10 @@ async def update_system(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB 更新失败: {e}")
     db.refresh(system)
+    log_audit(db, user_id=current_user.user_id, action="system_updated", target_type="system",
+              target_id=system_id, target_key=system.name, request=request,
+              details=f"fields={list(system_data.model_dump(exclude_unset=True).keys())}")
+    db.commit()
 
     return ApiResponse(data=TargetSystemResponse.model_validate(system).model_dump())
 
@@ -989,7 +1030,9 @@ async def update_system(
 @router.delete("/systems/{system_id}", response_model=ApiResponse)
 async def delete_system(
     system_id: int,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """删除目标系统"""
     system = db.query(TargetSystem).filter(TargetSystem.system_id == system_id).first()
@@ -1005,6 +1048,9 @@ async def delete_system(
     if active_tasks > 0:
         raise HTTPException(status_code=400, detail=f"该系统有 {active_tasks} 个进行中任务，无法删除")
     
+    log_audit(db, user_id=current_user.user_id, action="system_deleted", target_type="system",
+              target_id=system_id, target_key=system.name, request=request,
+              details="result=deleted")
     db.delete(system)
     db.commit()
     
@@ -1042,6 +1088,7 @@ async def list_users(
 async def reset_user_password(
     user_id: int,
     body: UserPasswordReset,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1057,15 +1104,18 @@ async def reset_user_password(
         body.new_password.encode(),
         bcrypt.gensalt(rounds=12)
     ).decode()
+    log_audit(db, user_id=current_user.user_id, action="admin_password_reset", target_type="user",
+              target_id=user_id, target_key=target.username, request=request,
+              details="result=success")   # 零密码痕迹（T10 假审计转正式行）
     db.commit()
 
-    logger.info(f"[audit] admin user_id={current_user.user_id} 重置了 user_id={user_id} ({target.username}) 的密码")
     return ApiResponse(message=f"用户 {target.username} 密码已重置")
 
 
 @router.post("/users", response_model=ApiResponse)
 async def create_user(
     body: UserAdminCreate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1085,9 +1135,12 @@ async def create_user(
         role=body.role,
     )
     db.add(user)
+    db.flush()
+    log_audit(db, user_id=current_user.user_id, action="user_created", target_type="user",
+              target_id=user.user_id, target_key=body.username, request=request,
+              details=f"role={body.role}")
     db.commit()
     db.refresh(user)
-    logger.info(f"[audit] admin user_id={current_user.user_id} 新增用户 {body.username} (role={body.role})")
     return ApiResponse(data={"user_id": user.user_id}, message=f"用户 {user.username} 已创建")
 
 
@@ -1095,6 +1148,7 @@ async def create_user(
 async def update_user(
     user_id: int,
     body: UserAdminUpdate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1121,17 +1175,17 @@ async def update_user(
         target.role = body.role
     if body.is_active is not None:
         target.is_active = body.is_active
+    log_audit(db, user_id=current_user.user_id, action="user_updated", target_type="user",
+              target_id=user_id, target_key=target.username, request=request,
+              details=f"role={body.role} is_active={body.is_active}")
     db.commit()
-    logger.info(
-        f"[audit] admin user_id={current_user.user_id} 编辑用户 {target.username}: "
-        f"role={body.role} is_active={body.is_active}"
-    )
     return ApiResponse(message=f"用户 {target.username} 已更新")
 
 
 @router.delete("/users/{user_id}", response_model=ApiResponse)
 async def delete_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1158,17 +1212,18 @@ async def delete_user(
     target.deleted_by = current_user.user_id
     # 清 password_hash 防 hash 复用登录
     target.password_hash = ""
+    log_audit(db, user_id=current_user.user_id, action="user_deleted", target_type="user",
+              target_id=user_id, target_key=original_name, request=request,
+              details="mode=soft_delete")
     db.commit()
 
-    logger.info(
-        f"[audit] admin user_id={current_user.user_id} 软删用户 {original_name} (id={user_id})"
-    )
     return ApiResponse(message=f"用户 {original_name} 已注销（软删，可恢复）")
 
 
 @router.post("/users/{user_id}/restore", response_model=ApiResponse)
 async def restore_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1198,11 +1253,11 @@ async def restore_user(
     target.deleted_at = None
     target.deleted_by = None
     # 密码留着空，让用户走"重置密码"流程
+    log_audit(db, user_id=current_user.user_id, action="user_restored", target_type="user",
+              target_id=user_id, target_key=restore_name, request=request,
+              details="mode=soft_restore")
     db.commit()
 
-    logger.info(
-        f"[audit] admin user_id={current_user.user_id} 恢复用户 {restore_name} (id={user_id})"
-    )
     return ApiResponse(message=f"用户 {restore_name} 已恢复，请提醒其走'重置密码'流程")
 
 
@@ -2348,3 +2403,56 @@ async def preview_job_status(
 
 # ============== 工单详情：join task 返完整信息（admin 复现需要）=============
 # 已有 admin_get_ticket，扩展返回 git_url / source_path / system_name
+
+
+# ==================== T10 操作日志审计（读层） ====================
+
+@router.get("/audit-logs", response_model=ApiResponse)
+async def list_audit_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    user_id: Optional[int] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    q: Optional[str] = None,               # 模糊：target_key / details
+    date_from: Optional[str] = None,       # naive UTC ISO（前端传本地日 0 点换算，或直带 Z）
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """审计日志分页查询（倒序）。只读端点——无删除/更新路径，append-only 语义保持。
+    details 列表回显截 200 字符（列表瘦身教训同款），全文点开看。"""
+    from app.models import AuditLog as AL
+    from sqlalchemy import or_
+    query = db.query(AL, User.username).outerjoin(User, AL.user_id == User.user_id)
+    if user_id is not None:
+        query = query.filter(AL.user_id == user_id)
+    if action:
+        query = query.filter(AL.action == action)
+    if target_type:
+        query = query.filter(AL.target_type == target_type)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(AL.target_key.ilike(like), AL.details.ilike(like)))
+    for bound, op in ((date_from, "__ge__"), (date_to, "__le__")):
+        if bound:
+            try:
+                dtv = datetime.fromisoformat(bound.replace("Z", "").replace("+00:00", ""))
+                query = query.filter(getattr(AL.created_at, op)(dtv))
+            except ValueError:
+                raise HTTPException(status_code=422, detail="date_from/date_to 需 ISO 格式（如 2026-10-27T00:00）")
+    total = query.count()
+    rows = (query.order_by(AL.created_at.desc())
+            .offset((page - 1) * page_size).limit(page_size).all())
+    items = [{
+        "id": a.id,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "user_id": a.user_id,
+        "username": uname or (a.target_key if a.user_id is None else "?"),
+        "action": a.action,
+        "target_type": a.target_type,
+        "target_id": a.target_id,
+        "target_key": a.target_key,
+        "details": (a.details or "")[:200],
+        "ip_address": a.ip_address,
+    } for a, uname in rows]
+    return ApiResponse(data={"total": total, "items": items})

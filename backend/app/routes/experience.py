@@ -5,7 +5,7 @@ Based on design doc section 11.1: POST /api/experience/submit, GET /api/experien
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
@@ -16,6 +16,7 @@ from app.schemas import (
 )
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
 from app.dependencies import get_current_user, require_admin
+from app.services.audit import log_audit
 import logging
 
 router = APIRouter()
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 @router.post("/submit", response_model=ApiResponse)
 async def submit_experience(
     exp_data: ExperienceSubmit,
+    request: Request,
     db: Session = Depends(get_db),
     # T9批1: 原 `current_user_id: int = 1` 默认参数——token 被无视，全员经验记在 admin 名下
     current_user: User = Depends(get_current_user)
@@ -73,6 +75,10 @@ async def submit_experience(
         skill_content=exp_data.skill_content
     )
     db.add(experience)
+    db.flush()   # 拿主键（T10：add 前 experience_id=None）
+    log_audit(db, user_id=current_user.user_id, action="experience_submit", target_type="experience",
+              target_id=experience.experience_id, target_key=exp_data.skill_name, request=request,
+              details=f"task={task.task_id} type={exp_data.skill_type} system_id={exp_data.system_id}")
     db.commit()
     db.refresh(experience)
     
@@ -118,6 +124,7 @@ async def list_pending_experiences(
 @router.post("/{experience_id}/approve", response_model=ApiResponse)
 async def approve_experience(
     experience_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
@@ -192,6 +199,10 @@ async def approve_experience(
             logger.error("[approve] commit 失败后磁盘恢复也失败: %s", de)
         raise HTTPException(status_code=500, detail=f"DB 写入失败: {e}")
 
+    _t = db.query(CompileTask).filter(CompileTask.id == experience.task_id).first()
+    log_audit(db, user_id=current_user.user_id, action="experience_approve", target_type="experience",
+              target_id=experience_id, target_key=str(experience.skill_name), request=request,
+              details=f"task={_t.task_id if _t else experience.task_id} type={experience.skill_type} version={version}")
     return ApiResponse(message="经验已通过审核，SKILL.md 已同步到磁盘")
 
 
@@ -199,6 +210,7 @@ async def approve_experience(
 async def reject_experience(
     experience_id: int,
     reason: Optional[str] = None,
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
@@ -211,7 +223,9 @@ async def reject_experience(
     experience.rejection_reason = reason
     experience.reviewed_at = datetime.utcnow()
     experience.reviewer_id = current_user.user_id
-
+    log_audit(db, user_id=current_user.user_id, action="experience_reject", target_type="experience",
+              target_id=experience_id, target_key=str(experience.skill_name), request=request,
+              details=f"reason={reason or '未填'}")
     db.commit()
 
     return ApiResponse(message="经验已驳回")
@@ -220,6 +234,7 @@ async def reject_experience(
 @router.post("/generate-draft", response_model=ApiResponse)
 async def generate_experience_draft(
     body: dict,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -248,7 +263,15 @@ async def generate_experience_draft(
     # （存在/属主）在本请求内；终态校验在线程内 generate_draft 兜（error 经 status 透传）。
     from app.services.experience_generator import start_draft_job
     from app.models import SessionLocal
+    # T10：只在真起新 job（消耗 LLM 额度）时记——running 中重复点返回旧 job 不记
+    from app.services.experience_generator import _DRAFT_JOBS
+    _was_running = task_id in _DRAFT_JOBS and _DRAFT_JOBS[task_id]["status"] == "running"
     job = start_draft_job(SessionLocal, task_id)
+    if not _was_running:
+        log_audit(db, user_id=current_user.user_id, action="draft_generated", target_type="compile_task",
+                  target_id=task_id, target_key=task.task_id, request=request,
+                  details=f"software={task.software_name} status={task.status}")
+        db.commit()
     return ApiResponse(
         data={"status": job["status"]},
         message="草稿生成中" if job["status"] == "running" else "生成任务已存在",

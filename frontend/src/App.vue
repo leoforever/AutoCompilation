@@ -88,6 +88,7 @@ const menuItems = computed(() => {
       { id: 'skilllib', ico: '📚', label: '经验库管理' },
       { id: 'systems-admin', ico: '🖥️', label: '目标系统管理' },
       { id: 'users', ico: '👥', label: '用户权限管理' },
+      { id: 'audit-logs', ico: '📋', label: '操作日志审计' },
       { id: 'chat-admin', ico: '💬', label: '对话式答疑' },
     ]
   }

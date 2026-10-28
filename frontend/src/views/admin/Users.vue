@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <div class="page-title">用户权限管理</div>
-        <div class="page-sub">普通用户 / 管理员权限区分 · 操作日志审计</div>
+        <div class="page-sub">普通用户 / 管理员权限区分</div>
       </div>
       <el-button type="primary" @click="openCreate">＋ 新增用户</el-button>
     </div>
@@ -76,16 +76,6 @@
         </el-table>
       </div>
 
-      <!-- 操作日志 -->
-      <div class="card">
-        <h3>📜 操作日志审计</h3>
-        <el-table :data="auditLogs" stripe style="width: 100%" size="small">
-          <el-table-column prop="created_at" label="时间" width="150" />
-          <el-table-column prop="username" label="用户" width="100" />
-          <el-table-column prop="action" label="操作" width="120" />
-          <el-table-column prop="target" label="对象" />
-        </el-table>
-      </div>
     </div>
 
     <!-- 新增用户 -->
@@ -160,7 +150,6 @@ const auth = useAuthStore()
 const meId = computed(() => auth.user?.user_id ?? -1)
 
 const users = ref<any[]>([])
-const auditLogs = ref<any[]>([])
 const userFilter = ref<'active' | 'deleted'>('active')
 const saving = ref(false)
 
@@ -190,16 +179,6 @@ async function loadUsers() {
   }))
 }
 
-async function loadAuditLogs() {
-  // TODO: 实现审计日志接口
-  auditLogs.value = [
-    { created_at: '10:26', username: 'admin', action: '提交经验', target: '#E-209 ollama v0.9.7' },
-    { created_at: '10:25', username: 'admin', action: '发起编译', target: '#1023 ollama' },
-    { created_at: '09:48', username: 'zhangwei', action: '提交经验', target: '#E-205 python v3.12' },
-    { created_at: '09:30', username: 'liming', action: '上报工单', target: '#TK-20260920-011' },
-    { created_at: '09:15', username: 'admin', action: '审核通过', target: '#E-205 python v3.12' },
-  ]
-}
 
 function openCreate() {
   createForm.value = { username: '', password: '', role: 'user' }
@@ -312,7 +291,6 @@ async function restoreUser(user: any) {
 
 onMounted(() => {
   loadUsers()
-  loadAuditLogs()
 })
 </script>
 
