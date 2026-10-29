@@ -18,8 +18,9 @@ allowed-tools: [execute, read_file]
 - 不要用 EOL 版本（v18 以下多数已不再维护）
 
 ## 国内镜像
-- npmmirror: https://registry.npmmirror.com
-- 配置: npm config set registry https://registry.npmmirror.com
+- 主npmmirror loongarch架构专用: https://registry.loongnix.cn:5873
+- 备npmmirror: https://registry.npmmirror.com
+- 配置方法: npm config set registry https://registry.loongnix.cn:5873
 
 ## 安装方式
 ```
