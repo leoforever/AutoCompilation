@@ -93,6 +93,8 @@ const router = useRouter()
 const unreadCount = ref(0)
 const notifList = ref<any[]>([])
 async function loadUnread() {
+  // 未登录不抢跑（否则登录页即刷 401）；authStore 声明在后无碍——函数体在调用时求值
+  if (!authStore.isLoggedIn) return
   try {
     const r: any = await api.get('/notifications/unread-count')
     unreadCount.value = r?.data?.count ?? 0
@@ -113,9 +115,12 @@ async function markAllRead() {
   try { await api.post('/notifications/read', { all: true }); loadUnread() } catch {}
 }
 function fmtNotifTime(s0: string) { return s0 ? fmtDateTime(s0, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '' }
+const authStore = useAuthStore()
+// T15 修复（TDZ 事故：watch 的 getter 立即执行，引用后置声明的 authStore 必炸
+// “Cannot access before initialization”，tsc 不抓箭头体内这种引用）：watch 必须在
+// 被引用声明之后
 watch(() => router.currentRoute.value.fullPath, loadUnread)   // 切页即拉平
 watch(() => authStore.isLoggedIn, (v) => { if (v) loadUnread(); else { unreadCount.value = 0; notifList.value = [] } })
-const authStore = useAuthStore()
 const role = ref<'user' | 'admin'>(authStore.isAdmin ? 'admin' : 'user')
 // 10-23 修复：fetchMe 是异步的（onMounted 才拉），上面求值时 user 常为 null →
 // admin 登录后侧栏停用户视图、须手点一次"管理员后台"才同步。身份到位后自动对齐。

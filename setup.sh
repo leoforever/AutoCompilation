@@ -191,28 +191,42 @@ _local_ipv4s() {
 # ① 仓库若在 /root 下（权限 700）nginx worker 读不进去，/srv 免疫；
 # ② 仓库目录搬迁/改名不影响 serving（rsync 每次同步）。
 install_nginx_conf() {
-    local conf_src="$PROJECT_DIR/deploy/compile-platform.nginx.conf"
-    [ -f "$conf_src" ] || { warn "缺 $conf_src，跳过 nginx 配置（prod 将回退 vite preview）"; return 0; }
+    # HTTPS 方案（2026-10-29 →docs/https-8443-plan.md 修订版）：双模板 servers+locations，
+    # 3000(HTTP 过渡)/8443(HTTPS)/8080(→301) 三 server；旧单文件 compile-platform.conf 退役
+    local srv_src="$PROJECT_DIR/deploy/compile-platform.servers.conf"
+    local loc_src="$PROJECT_DIR/deploy/compile-platform.locations.conf"
+    if [ ! -f "$srv_src" ] || [ ! -f "$loc_src" ]; then
+        warn "缺 deploy/ nginx 模板，跳过配置（prod 将回退 vite preview）"; return 0
+    fi
     if ! command -v nginx >/dev/null 2>&1; then
         warn "nginx 未安装——prod 将回退 vite preview。建议: sudo dnf install -y nginx"
         return 0
     fi
-    sudo cp "$conf_src" /etc/nginx/compile-platform.conf
-    # 主 conf include 注入（幂等：标记在则跳过）
-    # 判据直接用 include 行本身（比标记注释更不易错位；现场注入过缺标记的教训）
-    if ! sudo grep -q "include /etc/nginx/compile-platform.conf" /etc/nginx/nginx.conf; then
-        # 只注入单行——openEuler 该机 conf.d/openclaw-https.conf 与主 conf 内联的
-        # 443 server 内容重复，通配 include conf.d 会 duplicate server 炸 nginx -t
-        sudo sed -i '0,/http {/s//http {\n    # compile-platform-managed\n    include \/etc\/nginx\/compile-platform.conf;/' /etc/nginx/nginx.conf
-        info "已注入主 conf include（原文件备份 /etc/nginx/nginx.conf.compile-platform.bak）"
+    sudo cp "$srv_src" /etc/nginx/compile-platform-servers.conf
+    sudo cp "$loc_src" /etc/nginx/compile-platform-locations.conf
+    # 证书两段式（CA 存在即复用=客户端信任不失效；叶子按当前 IP 每次重签，SAN 含 127.0.0.1
+    # ——首切实测教训：缺 IP:127.0.0.1 时本机严格校验失败）
+    bash "$PROJECT_DIR/deploy/gen-certs.sh" || warn "证书生成失败——8443 块将过不了 nginx -t"
+
+    # 主 conf include：存量旧行迁移 / 全新注入单行（判据都用 include 行本身——比标记
+    # 注释不易错位；只注入单行，openEuler 主 conf 不通配 conf.d：openclaw-https.conf
+    # 与内联 443 server 重复，通配会 duplicate listen 炸 nginx -t）
+    sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.compile-platform.bak
+    if sudo grep -q "include /etc/nginx/compile-platform\.conf;" /etc/nginx/nginx.conf; then
+        sudo sed -i 's|include /etc/nginx/compile-platform\.conf;|include /etc/nginx/compile-platform-servers.conf;|' /etc/nginx/nginx.conf
+        info "主 conf include 已迁移 → compile-platform-servers.conf"
+    elif ! sudo grep -q "include /etc/nginx/compile-platform-servers.conf" /etc/nginx/nginx.conf; then
+        sudo sed -i '0,/http {/s//http {\n    # compile-platform-managed\n    include \/etc\/nginx\/compile-platform-servers.conf;/' /etc/nginx/nginx.conf
+        info "已注入主 conf include（servers 版）"
     fi
+
     if ! sudo nginx -t >/dev/null 2>&1; then
         sudo nginx -t 2>&1 | tail -3
-        error "nginx -t 失败——配置已动过，回滚：sudo cp /etc/nginx/nginx.conf.compile-platform.bak /etc/nginx/nginx.conf && sudo nginx -s reload"
+        error "nginx -t 失败——回滚：sudo cp /etc/nginx/nginx.conf.compile-platform.bak /etc/nginx/nginx.conf && sudo nginx -s reload"
     fi
     sudo mkdir -p /srv/compile-platform
     sudo systemctl enable nginx >/dev/null 2>&1 || true
-    info "nginx 前端配置就绪：/etc/nginx/compile-platform.conf（listen $FRONTEND_PORT，root /srv/compile-platform/dist）"
+    info "nginx 前端就绪：https://<ip>:8443（CA 分发：/platform-ca.crt）；$FRONTEND_PORT 为 HTTP 过渡期"
 }
 
 # ========== 安装（一次性） ==========
@@ -638,6 +652,7 @@ do_start() {
         else
             setsid nohup "$PYBIN" -m uvicorn app.main:app \
                 --host 0.0.0.0 --port "$BACKEND_PORT" \
+                --proxy-headers --forwarded-allow-ips='127.0.0.1' \
                 >> "$LOG_DIR/backend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：同上
         fi
         disown || true
@@ -684,7 +699,7 @@ do_start() {
             if [ -n "$(find src index.html vite.config.ts -newer dist/index.html 2>/dev/null | head -1)" ]; then
                 warn "dist 比 src/index.html/vite.config 旧——展示的是旧版界面；更新请: cd frontend && npx vite build"
             fi
-            if [ -f "/etc/nginx/compile-platform.conf" ] && command -v nginx >/dev/null 2>&1; then
+            if [ -f "/etc/nginx/compile-platform-servers.conf" ] && command -v nginx >/dev/null 2>&1; then
                 # nginx 生产托管：build 检查在上（dist 可能刚重建）→ rsync 发布 → reload
                 info "启动前端（prod：nginx 静态托管 + /api /ws 反代）..."
                 sudo mkdir -p /srv/compile-platform
@@ -978,7 +993,7 @@ active_work_gate() {
 # ========== 停止 ==========
 do_stop() {
     active_work_gate   # A2：先闸后杀
-    if systemctl is-active nginx >/dev/null 2>&1 && [ -f /etc/nginx/compile-platform.conf ]; then
+    if systemctl is-active nginx >/dev/null 2>&1 && [ -f /etc/nginx/compile-platform-servers.conf ]; then
         info "停止 前端（nginx systemctl）"
         sudo systemctl stop nginx
     else
