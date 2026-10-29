@@ -226,7 +226,7 @@ install_nginx_conf() {
     fi
     sudo mkdir -p /srv/compile-platform
     sudo systemctl enable nginx >/dev/null 2>&1 || true
-    info "nginx 前端就绪：https://<ip>:8443（CA 分发：/platform-ca.crt）；$FRONTEND_PORT 为 HTTP 过渡期"
+    info "nginx 前端就绪：正式入口 https://<ip>:8443；$FRONTEND_PORT 已收口 301→https（仅 CA 分发留明文）"
 }
 
 # ========== 安装（一次性） ==========
@@ -743,7 +743,11 @@ do_start() {
     if [ -z "$main_ip" ]; then
         main_ip="localhost"
     fi
-    info "  前端: http://$main_ip:$FRONTEND_PORT/"
+    if [ -f "/etc/nginx/compile-platform-servers.conf" ]; then
+        info "  前端: https://$main_ip:8443/   （$FRONTEND_PORT 已 301 收口）"
+    else
+        info "  前端: http://$main_ip:$FRONTEND_PORT/"
+    fi
     info "  API:  http://$main_ip:$BACKEND_PORT/docs"
     info "  默认账号: admin（密码为 init 时 ADMIN_INIT_PASSWORD 传入值，勿用默认弱口令）"
     info "  提示：其他网卡 IP 可手动拼接 http://<ip>:$FRONTEND_PORT/"
@@ -1035,7 +1039,7 @@ do_status() {
     fi
     echo ""
     echo "=== 监听端口 ==="
-    ss -tlnp 2>/dev/null | grep -E ":($BACKEND_PORT|$FRONTEND_PORT|5432)\b" | awk '{printf "  %-30s %s\n", $4, $6}'
+    ss -tlnp 2>/dev/null | grep -E ":($BACKEND_PORT|$FRONTEND_PORT|8443|5432)\b" | awk '{printf "  %-30s %s\n", $4, $6}'
 }
 
 # ========== 主入口 ==========
