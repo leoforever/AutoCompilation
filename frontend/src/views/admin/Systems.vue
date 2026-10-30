@@ -17,7 +17,7 @@
       </div>
 
       <el-table :data="filteredSystems" stripe style="width: 100%" v-loading="loading">
-        <el-table-column prop="system_id" label="ID" width="70" />
+        <el-table-column type="index" label="#" width="56" />
         <el-table-column prop="name" label="系统名称" min-width="200" />
         <el-table-column label="编译镜像" min-width="280">
           <template #default="{ row }">

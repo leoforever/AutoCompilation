@@ -26,7 +26,7 @@
     <div class="card">
       <h3>📝 我的提交记录</h3>
       <el-table :data="experiences" stripe style="width: 100%">
-        <el-table-column prop="experience_id" label="ID" width="80" />
+        <el-table-column type="index" label="#" width="56" />
         <el-table-column prop="skill_name" label="软件" />
         <el-table-column prop="system_name" label="系统" width="140" />
         <el-table-column label="类型" width="80">

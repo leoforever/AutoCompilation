@@ -98,7 +98,7 @@
         <!-- 1. 任务详情（admin 复现需要） -->
         <h4>📋 任务详情（复现用）</h4>
         <el-descriptions v-if="current.task" :column="2" border size="small">
-          <el-descriptions-item label="任务ID">{{ current.task.task_str_id }}（db_id={{ current.task.db_id }}）</el-descriptions-item>
+          <el-descriptions-item label="任务ID">{{ current.task.task_str_id }}</el-descriptions-item>
           <el-descriptions-item label="软件">{{ current.task.software_name }}</el-descriptions-item>
           <el-descriptions-item label="系统">{{ current.task.system_name || `id=${current.task.system_id}` }}</el-descriptions-item>
           <el-descriptions-item label="提交时间">{{ formatDate(current.task.created_at) }} · {{ current.task.duration_seconds }}s</el-descriptions-item>

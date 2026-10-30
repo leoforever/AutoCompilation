@@ -52,7 +52,7 @@
 
       <!-- 列表 -->
       <el-table :data="skills" stripe style="width: 100%" v-loading="loading">
-        <el-table-column prop="skill_id" label="ID" width="70" />
+        <el-table-column type="index" label="#" width="56" />
         <el-table-column label="名称 / 描述" min-width="220">
           <template #default="{ row }">
             <div class="name-cell">
