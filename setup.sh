@@ -40,8 +40,8 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # A1 修（2026-10-27）：env 键值统一"写带引号、测带引号"同口径 helper。
-# 旧 bug：sed 写成 export KEY=*** *未再包引号），检测却要求
-#   ^export KEY="[^"]+"$ —— 永检不到 → 每次 install/init 重复生成覆写：
+# 旧 bug（A1 前，2026-10-27）：sed 写入值未再包引号，检测正则却要求带引号——
+#   永检不到 → 每次 install/init 重复生成覆写：
 #   DB_PASSWORD 与库侧脱钩（下次起后端连不上 DB）、JWT 每次换钥（全员 token
 #   静默作废）。根因=写/测口径漂移，从此写测必须同源。
 env_set_quoted() {  # FILE KEY VALUE
@@ -780,18 +780,16 @@ do_uninstall() {
     db_pass=$(awk '/postgresql:/{f=1;next} f&&/password:/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null)
     db_host="${db_host:-localhost}"; db_port="${db_port:-5432}"
     db_user="${db_user:-compile_user}"; db_name="${DB_NAME:-${db_name:-compile_platform}}"
-    # T-9：config.yaml 已无 password 行——env DB_PASS > .env.compile DB_PASSWORD > 报错
-    [ -z "$db_pass" ] && [ -f "$ENV_FILE" ] && db_pass="$(source "$ENV_FILE" 2>/dev/null && echo "$DB_PASSWORD")"
-    db_pass="${DB_PASS:-$db_pass}"
-    # B-8d 修：口令链路显式化——config/env 都取不到 DB_PASSWORD 时直接报错指路，
-    # 不再让后面 psql 认证失败被 2>/dev/null + || warn 吞成"无声退出"
-    if [ -z "${db_pass:-}" ] && [ -f "$ENV_FILE" ]; then
-        db_pass="$(grep -oP '^export DB_PASSWORD="\K[^"]+' "$ENV_FILE" 2>/dev/null)"
-    fi
-    [ -n "${db_pass:-}" ] || error "拿不到 DB_PASSWORD（config/env 均无）——uninstall 中止；影子测试请显式 DB_PASS=xxx 传入"
+    # T-9：config.yaml 已无 password 行。取口令显式优先级（2026-10-30 影子演练实锤：
+    # 旧 "source ENV_FILE && echo $DB_PASSWORD" 读回的值经二次展开被改写（口令含
+    # $/转义字符时），非空但错——B-8d 的 grep 兜底因"已非空"永不触发，pg_dump 拿
+    # 错值认证失败=半截卸载的助因之一。grep -oP 读原文最稳，source 路径整条废除）
+    db_pass="${DB_PASS:-}"
+    [ -n "$db_pass" ] || [ ! -f "$ENV_FILE" ] || db_pass="$(grep -oP '^export DB_PASSWORD="\K[^"]+' "$ENV_FILE" 2>/dev/null)"
+    [ -n "$db_pass" ] || error "拿不到 DB_PASSWORD（env DB_PASS/$ENV_FILE 均无）——uninstall 中止"
     # 统一走 -h（TCP）+ 密码：pg_hba 把 local 也设成了 md5，sudo -u postgres 裸 socket 会 fe_sendauth
     local PSQLU="psql -h $db_host -p $db_port -U $db_user"
-    export PGPASSWORD="***"
+    export PGPASSWORD="$db_pass"
 
     # 路径（UNINSTALL_* 前缀覆盖，影子测试指向 /tmp 假目录；
     # 注意不能用 LOG_DIR 裸名——setup.sh 顶部无条件赋值会覆盖外部 env，撞车教训）
@@ -846,18 +844,31 @@ do_uninstall() {
     fi
 
     # 2) 备份（先于一切删除；--purge 同样强制）
+    # B-2（2026-10-30，10-27 半截卸载事故驱动）：pg_dump 失败原本仅 warn 就继续
+    # 删磁盘 → "库记录活着、磁盘全灭"（18 个任务目录就是这么没的）。现在备份不成
+    # 即中止；确有理由接受无备份删除须显式 ALLOW_DISK_FALLBACK=1——--yes 不豁免
+    # （--yes=确认"删"，不等于接受"删了没法还原"，两种拍板语义分开）
     local backup_dir="$HOME/compile-platform-backup-$(date +%Y%m%d-%H%M%S)"
+    local DB_DUMP_OK=0
     info "[2/6] 备份 → $backup_dir"
     mkdir -p "$backup_dir"
     if command -v pg_dump >/dev/null 2>&1; then
         if pg_dump -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" > "$backup_dir/db.sql" 2>/dev/null && [ -s "$backup_dir/db.sql" ]; then
             info "  ✅ db 备份 $(du -sh "$backup_dir/db.sql" | cut -f1)"
+            DB_DUMP_OK=1
         else
             rm -f "$backup_dir/db.sql"
-            warn "  pg_dump 失败（库可能不存在）——跳过"
+            warn "  ❌ pg_dump 失败——DB 备份拿不到"
         fi
     else
-        warn "  无 pg_dump，跳过 DB 备份"
+        warn "  ❌ 无 pg_dump——DB 备份拿不到"
+    fi
+    if [ "$DB_DUMP_OK" != "1" ] && [ "${ALLOW_DISK_FALLBACK:-0}" != "1" ]; then
+        error "DB 备份失败即中止（防半截卸载：磁盘删了库留着一堆 410 僵尸）。\
+要接受无备份删除请显式: ALLOW_DISK_FALLBACK=1 bash setup.sh uninstall（自担风险）"
+    fi
+    if [ "$DB_DUMP_OK" != "1" ]; then
+        warn "  ⚠️ ALLOW_DISK_FALLBACK=1：接受无 DB 备份继续，skills 备份照常"
     fi
     if [ -d "$skills_dir" ]; then
         tar czf "$backup_dir/skills.tar.gz" -C "$PROJECT_DIR" skills && info "  ✅ skills/ 已 tar（skills/ 不在 git，唯一副本）"
@@ -899,7 +910,7 @@ do_uninstall() {
     if $PSQLU -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1; then
         info "  ✅ 已 DROP（重装由 install/init 重建）"
     else
-        warn "  DROP 失败（PG 未运行/库本不存在）——检查 $backup_dir/db.sql 是否在"
+        error "  ❌ DROP DATABASE 未完成（库 $db_name 可能仍在=孤儿库，PG 未运行/权限不足/被连接均可致此）——备份在 $backup_dir/db.sql；卸载后校验见下"
     fi
 
     # 5) 运行数据目录（守门：仓库根直属子目录 或 /tmp 影子目录，其余拒绝）
@@ -928,6 +939,11 @@ do_uninstall() {
         info "[6/6] 非 --purge，无追加清理"
     fi
 
+    # B-3（2026-10-30）：卸载后校验——库没删干净必须响亮（10-27 半截卸载的镜像面：
+    # 磁盘灭库存，DB 一堆 410 僵尸靠人肉发现）
+    if $PSQLU -d postgres -t -A -c "SELECT 1 FROM pg_database WHERE datname='$db_name';" 2>/dev/null | grep -q 1; then
+        error "  ❌ 卸载后校验失败：数据库 $db_name 仍存在（孤儿库）——需 PG 管理员手工: sudo -u postgres psql -c \"DROP DATABASE IF EXISTS $db_name;\""
+    fi
     info "uninstall 完成。备份在 $backup_dir（含 db.sql / skills.tar.gz）"
     info "从头部署：bash setup.sh install"
 }
