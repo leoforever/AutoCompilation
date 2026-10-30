@@ -479,6 +479,16 @@ async def download_artifacts_bundle(
     task_dir = artifacts_root / task_id
     bundle_path = task_dir / "artifacts.tar.gz"
 
+    if not task_dir.is_dir():
+        # A3（2026-10-30）：目录整体不存在=产物现场已灭（如 10-27 半截 uninstall 磁盘清空、
+        # 10-27 批量清理），与"有目录未打包"（下方兜底/404）分口径——410 Gone 语义诚实：
+        # 资源曾存在且不会回来。日志不受此影响（DB log_output 兜底仍在任务页可读）。
+        raise HTTPException(
+            status_code=410,
+            detail=f"任务 {task_id} 的产物目录已不存在（历史清理所致），无法下载；"
+                   "编译日志仍可在任务页查看",
+        )
+
     if not bundle_path.exists():
         # 兜底：实时打包产物树（arcname 与预包对齐；打完留在正式路径，下次秒回）
         tree = task_dir / "artifacts"

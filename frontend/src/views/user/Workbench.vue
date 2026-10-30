@@ -696,8 +696,13 @@ function downloadArtifact() {
   fetch(`/api/compile/tasks/${taskId}/artifacts/download`, {
     headers: token ? { 'Authorization': `Bearer ${token}` } : {},
   })
-    .then(r => {
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    .then(async r => {
+      if (!r.ok) {
+        // A3：后端人话（410 历史清理/404 无产物）透传，别只剩 "HTTP 410" 天书
+        let msg = `HTTP ${r.status}`
+        try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 错体保留状态码 */ }
+        throw new Error(msg)
+      }
       return r.blob()
     })
     .then(blob => {

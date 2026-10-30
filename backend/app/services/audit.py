@@ -18,6 +18,9 @@ _CRED_RE = re.compile(
 )
 # 裸词兜底：出现这些字面量整段替换（防 "旧密码=abc" 中文格式漏网）
 _CRED_LOOSE = re.compile(r'(?i)(旧密码|新密码|口令|密码)\s*[=:：]?\s*\S+')
+# URL 内嵌凭据：scheme://user:***@host —— userinfo 口令段糊掉（T16 问答注入面实抓：
+# 编译日志常见 clone URL 带 token；键值正则救不了这种形态）
+_URL_USERINFO = re.compile(r'://([^/\s:@]+):([^/\s@]+)@')
 
 MAX_DETAILS = 2048
 
@@ -25,6 +28,7 @@ MAX_DETAILS = 2048
 def sanitize_details(text: str) -> str:
     t = _CRED_RE.sub(r'\1\2[REDACTED]\4', str(text))
     t = _CRED_LOOSE.sub(r'\1=[REDACTED]', t)
+    t = _URL_USERINFO.sub(r'://\1:[REDACTED]@', t)
     return t[:MAX_DETAILS]
 
 
