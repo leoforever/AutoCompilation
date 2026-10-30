@@ -55,3 +55,9 @@ docker_exec:
 
 upload:
   max_size: 2147483648        # 上传大小上限（2GB）
+
+qa:                           # T16 问答台（一次调用+后台 job+SSE，非 agent——设计档 qa-console-design）
+  enabled: true               # 总开关（端点 503 人话；数据不出内网要求时一键关）
+  max_per_day: 30             # 每用户日限额，账本=当日 qa_ask 审计行数（重启不清零）
+  history_rounds: 5           # 会话窗口轮数（超从最老丢，保近弃远）
+  ttl_minutes: 30             # 会话空闲过期（分钟）

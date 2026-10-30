@@ -77,6 +77,12 @@ const router = createRouter({
       meta: { requiresAuth: true, role: 'admin' }
     },
     {
+      path: '/admin/qa',
+      name: 'qa-console',
+      component: () => import('@/views/admin/QaConsole.vue'),
+      meta: { requiresAuth: true, role: 'admin' }
+    },
+    {
       path: '/admin/audit-logs',
       name: 'audit-logs',
       component: () => import('@/views/admin/AuditLogs.vue'),
@@ -88,12 +94,7 @@ const router = createRouter({
       component: () => import('@/views/admin/Users.vue'),
       meta: { requiresAuth: true, role: 'admin' }
     },
-    {
-      path: '/admin/chat/:ticketId',
-      name: 'chat-admin',
-      component: () => import('@/views/admin/ChatAdmin.vue'),
-      meta: { requiresAuth: true, role: 'admin' }
-    },
+
   ]
 })
 

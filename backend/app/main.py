@@ -218,9 +218,9 @@ app.add_middleware(
 )
 
 # 导入路由（延迟导入避免循环依赖）
-from app.routes import auth, compile, tickets, experience, admin, notifications, ws
+from app.routes import auth, compile, tickets, experience, admin, notifications, qa, ws
 from app.models import init_db
-from app.dependencies import require_admin
+from app.dependencies import require_admin, require_qa_owner
 
 # 初始化数据库
 init_db()
@@ -230,6 +230,7 @@ app.include_router(compile.router, prefix="/api/compile", tags=["编译任务"])
 app.include_router(tickets.router, prefix="/api/tickets", tags=["工单管理"])
 app.include_router(experience.router, prefix="/api/experience", tags=["经验管理"])
 app.include_router(notifications.router, prefix="/api", tags=["通知"])
+app.include_router(qa.router, prefix="/api", tags=["问答台"], dependencies=[Depends(require_qa_owner)])
 # 管理员路由组统一角色守卫（端点级 get_current_user 之上再加一道，漏写的也兜住）
 app.include_router(admin.router, prefix="/api/admin", tags=["管理员接口"],
                    dependencies=[Depends(require_admin)])

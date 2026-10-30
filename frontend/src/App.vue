@@ -144,8 +144,9 @@ const menuItems = computed(() => {
       { id: 'systems-admin', ico: '🖥️', label: '目标系统管理' },
       { id: 'users', ico: '👥', label: '用户权限管理' },
       { id: 'audit-logs', ico: '📋', label: '操作日志审计' },
-      { id: 'chat-admin', ico: '💬', label: '对话式答疑' },
-    ]
+      { id: 'qa-console', ico: '💬', label: '问答台' },
+      // 问答台试用期（2026-10-30）：仅预置 admin 可见；放开=删此行 filter
+    ].filter((i) => i.id !== 'qa-console' || authStore.user?.username === 'admin')
   }
 })
 
