@@ -1,8 +1,7 @@
 ---
 name: nodejs-toolchain
 type: layer1-infra
-description: 龙芯平台 Node.js 工具链下载地址、版本选择、镜像源。
-   安装 Node.js、npm/yarn 配置、Node 编译型项目（Electron、Next.js 等）时读这条。
+description: 龙芯平台 Node.js 工具链下载地址、版本选择、npm 源单一权威策略与原生件清点。   安装 Node.js、npm/yarn 配置、Node 编译型项目（Electron、Next.js 等）时读这条。
 allowed-tools: [execute, read_file]
 ---
 
@@ -17,10 +16,16 @@ allowed-tools: [execute, read_file]
 - 推荐 LTS 系列（v20.x / v22.x）
 - 不要用 EOL 版本（v18 以下多数已不再维护）
 
-## 国内镜像
-- 主npmmirror loongarch架构专用: https://registry.loongnix.cn:5873
-- 备npmmirror: https://registry.npmmirror.com
-- 配置方法: npm config set registry https://registry.loongnix.cn:5873
+## npm 源（单一权威，强制）
+容器默认已配龙芯专源：https://registry.loongnix.cn:5873
+- 专源是 npmmirror 全量代理：普通包（纯 JS）同样可达；loong64 原生件（*-linux-loong64-gnu）独此一家
+- 仅 HTTPS（5873 端口），HTTP 不通
+- **不要用 npm/pnpm config set registry 改全局源**——改到公共源后，loong64 独门件必 404，
+  会误诊成"上游没有 loong64 支持"（2026-10 dsh 案实锤路径）
+异常处置（仅当专源本身不可达或明确缺该版本）：
+- 单点拉取优先：curl -sk 专源 tgz 直链装指定包，不动全局配置
+- 确需公共源时：`npm --registry https://registry.npmmirror.com install <包>` 单次传参，禁 config set
+- 专源查不到 *-linux-loong64-gnu 件 = 上游真没发布，走源码编译/找社区件分支，不是再换个源试
 
 ## 安装方式
 ```
@@ -34,6 +39,18 @@ ln -sf /usr/local/bin/npx /usr/bin/npx
 ## 已编译原生模块
 - 很多 npm 包含 native binding（如 sqlite3、bcrypt）
 - 用 prebuilt 时认准 loong64 标签；没 prebuilt 需本地 node-gyp 重编
+
+## 安装 Node 项目后必做原生件清点（防延迟爆炸）
+npm 按包内 os/cpu 元数据在 loong64 上**静默跳过**平台件（optionalDependencies 只留一行
+Unsupported platform 警告），装程"成功"、运行期才炸 Cannot find module ...loong64：
+1. grep 安装日志 Unsupported platform / EBADPLATFORM，列出被跳过的平台件
+2. 对每个被跳过的件做 require/启动冒烟——别信"装完了"
+3. 缺失件按名去专源找 loong64 变体（@rolldown/binding-linux-loong64-gnu 实测专源 200、
+   npmmirror 404）：有 → tgz 拉下铺进 node_modules 对应位置；无 → 试源码编译
+   （需 g++/make/python3，node-gyp headers 拿不到时回退 unofficial-builds 直连）；
+   再无非标"该平台件缺"
+4. Node 类产物验收**必须含一次真实启动**（profile boot / 服务起+接口断言）；
+   只 dump 版本号或"包装上了"不构成验收（dsh 案：22 项 PASS 未盖 boot，交付即坏）
 
 ## 原生模块 / PTY·交互类库的验证（必读）
 验证必须**非交互、能自然退出**，否则任务挂死：
@@ -54,8 +71,9 @@ ln -sf /usr/local/bin/npx /usr/bin/npx
 
 ## 注意事项
 - Electron / node-gyp 项目需要 C++ 工具链（见 toolchain-paths）
-- yarn / pnpm 同样走 npmmirror
+- yarn / pnpm 同样以上述专源为准（pnpm 用 `pnpm config set registry` 指向专源，同样禁改公共源为全局）
 
 ## 不要做
 - 不要直接 apt/dnf install nodejs（版本通常严重过时）
 - 不要混用 nvm 和系统 node（容易污染 PATH）
+- 不要把 npm/pnpm/yarn 的全局 registry 改成公共源（应急走 --registry 单次传参）
