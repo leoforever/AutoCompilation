@@ -225,7 +225,7 @@ async def list_my_tickets(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    q = db.query(Ticket).filter(Ticket.user_id == current_user.user_id)
+    q = db.query(Ticket).filter(Ticket.user_id == current_user.user_id, Ticket.deleted_at.is_(None))
     if status:
         q = q.filter(Ticket.status == TicketStatus(status))
     tickets = q.order_by(Ticket.created_at.desc()).all()
@@ -245,7 +245,7 @@ async def get_ticket(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.user_id != current_user.user_id and current_user.role != "admin":
@@ -264,7 +264,7 @@ async def mark_ticket_read(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.user_id != current_user.user_id and current_user.role != "admin":
@@ -291,7 +291,7 @@ async def add_ticket_message(
     """用户/admin 追加消息。role 字段按当前用户角色写"""
     if not content or not content.strip():
         raise HTTPException(status_code=400, detail="消息内容不能为空")
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.user_id != current_user.user_id and current_user.role != "admin":
@@ -337,7 +337,7 @@ async def close_my_ticket(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.user_id != current_user.user_id:

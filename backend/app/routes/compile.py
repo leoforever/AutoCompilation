@@ -329,7 +329,7 @@ async def list_compile_tasks(
     - search: 搜索软件名或任务 ID
     - 权限：非 admin 只能看自己名下的任务；admin 看全部
     """
-    query = db.query(CompileTask)
+    query = db.query(CompileTask).filter(CompileTask.deleted_at.is_(None))  # 软删不可见（2026-10-30 删除功能）
 
     # 用户隔离：非 admin 强制 user_id 过滤
     if current_user.role != "admin":
@@ -371,7 +371,7 @@ async def get_compile_task(
     current_user: User = Depends(get_current_user),
 ):
     """获取编译任务详情（非 admin 只能看自己名下）"""
-    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     # 权限校验：非 admin 不能看别人的任务
@@ -393,11 +393,11 @@ async def get_compile_log(
     current_user: User = Depends(get_current_user),
 ):
     """获取编译日志 — 优先 build.log 文件全文（实时追加、含全部行），无文件回退 DB"""
-    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not task:
         # 兼容：用数字主键 id 查（工单详情里 task_id 是 db.id 而非字符串）
         try:
-            task = db.query(CompileTask).filter(CompileTask.id == int(task_id)).first()
+            task = db.query(CompileTask).filter(CompileTask.id == int(task_id), CompileTask.deleted_at.is_(None)).first()
         except (ValueError, TypeError):
             task = None
     if not task:
@@ -431,7 +431,7 @@ async def download_compile_log(
     前端 onMounted 恢复路径用这个端点拉历史日志
     """
     from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
-    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     # 权限校验
@@ -467,7 +467,7 @@ async def download_artifacts_bundle(
     """
     from app.config import artifacts_dir as _artifacts_dir  # Q1b：公共权威，不再反向 import 引擎私有
 
-    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     if current_user.role != "admin" and task.user_id != current_user.user_id:
@@ -527,7 +527,7 @@ async def cancel_compile_task(
     - worker 退场：依赖 stage5 每 chunk 查 DB 状态感知（_periodic_persist 机制），
       下个 chunk 看到 cancelled 旗就 return state。最坏 1-2 分钟后真正退
     """
-    task = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    task = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     # 权限
@@ -591,7 +591,7 @@ async def retry_compile_task(
     - 状态校验：仅终态（success / failed / cancelled）可重试
     - 权限：非 admin 必须是任务拥有者
     """
-    src = db.query(CompileTask).filter(CompileTask.task_id == task_id).first()
+    src = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not src:
         raise HTTPException(status_code=404, detail="任务不存在")
     # 权限

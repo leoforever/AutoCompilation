@@ -131,7 +131,7 @@ def _retrieve_tickets(db, question: str, budget: int):
     from app.models import Ticket, TicketMessage
     words = [w for w in re.split(r'[^\w\u4e00-\u9fff]+', question.lower()) if len(w) >= 2]
     scored = []
-    for tk in db.query(Ticket).order_by(Ticket.ticket_id.desc()).limit(200).all():
+    for tk in db.query(Ticket).filter(Ticket.deleted_at.is_(None)).order_by(Ticket.ticket_id.desc()).limit(200).all():
         hay = f"{tk.title} {tk.description or ''}".lower()
         score = sum(hay.count(w) for w in words)
         if score > 0:
@@ -157,7 +157,7 @@ def _task_context(db, task_db_id: int, art_dir, budget, question: str = ""):
     """挂任务：build.log 尾段 + BUILD_NOTES.md（成功归因同样高频）"""
     from app.models import CompileTask
     chunks = []
-    t = db.query(CompileTask).filter(CompileTask.id == task_db_id).first()
+    t = db.query(CompileTask).filter(CompileTask.id == task_db_id, CompileTask.deleted_at.is_(None)).first()
     if not t:
         return chunks, None
     meta = {"task_id": t.task_id, "id": t.id, "software_name": t.software_name,

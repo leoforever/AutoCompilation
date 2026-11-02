@@ -18,7 +18,7 @@ from app.schemas import (
     UserPasswordReset, UserAdminCreate, UserAdminUpdate,
     StatsOverview, ApiResponse
 )
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_preset_admin
 from app.services.audit import log_audit
 from app.services.notify import notify
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
@@ -50,9 +50,9 @@ async def get_stats_overview(db: Session = Depends(get_db)):
     # created_at 是 naive datetime（utcnow 默认），与本地表一致直接用 Python 边界过滤
 
     def _task_stats(lo, hi):
-        total = db.query(CompileTask).filter(CompileTask.created_at >= lo, CompileTask.created_at < hi).count()
+        total = db.query(CompileTask).filter(CompileTask.created_at >= lo, CompileTask.created_at < hi, CompileTask.deleted_at.is_(None)).count()
         succ = db.query(CompileTask).filter(CompileTask.created_at >= lo, CompileTask.created_at < hi,
-                                            CompileTask.status == "success").count()
+                                            CompileTask.status == "success", CompileTask.deleted_at.is_(None)).count()
         return total, succ
 
     def _rate(total, succ):
@@ -62,16 +62,16 @@ async def get_stats_overview(db: Session = Depends(get_db)):
     p_total, p_succ = _task_stats(prev_month_start, month_start)
     m_rate, p_rate = _rate(m_total, m_succ), _rate(p_total, p_succ)
 
-    total_tasks = db.query(CompileTask).count()
-    week_new_tasks = db.query(CompileTask).filter(CompileTask.created_at >= week_start).count()
+    total_tasks = db.query(CompileTask).filter(CompileTask.deleted_at.is_(None)).count()
+    week_new_tasks = db.query(CompileTask).filter(CompileTask.created_at >= week_start, CompileTask.deleted_at.is_(None)).count()
 
     # ---- 工单 ----
-    t_counts = {str(k): int(v) for k, v in db.query(Ticket.status, _f.count(Ticket.ticket_id)).group_by(Ticket.status).all()}
+    t_counts = {str(k): int(v) for k, v in db.query(Ticket.status, _f.count(Ticket.ticket_id)).filter(Ticket.deleted_at.is_(None)).group_by(Ticket.status).all()}
     t_total = sum(t_counts.values())
     t_solved = t_counts.get("resolved", 0) + t_counts.get("closed", 0)
     # 平均解决时长：resolved_at 有值的工单（秒→小时，1 位小数）
     avg_solve_h = db.query(_f.avg(_f.extract("epoch", Ticket.resolved_at) - _f.extract("epoch", Ticket.created_at))).filter(
-        Ticket.resolved_at.isnot(None)).scalar()
+        Ticket.resolved_at.isnot(None), Ticket.deleted_at.is_(None)).scalar()
     # PG avg 返回 Decimal → 必须转 float，否则 JSON 序列化成字符串 "19.6"
     avg_solve_hours = round(float(avg_solve_h) / 3600, 1) if avg_solve_h else None
 
@@ -93,7 +93,7 @@ async def get_stats_overview(db: Session = Depends(get_db)):
         _f.count().label("total"),
         _f.count().filter(CompileTask.status == "success").label("succ"),
         _f.count().filter(CompileTask.status == "failed").label("fail"),
-    ).filter(CompileTask.created_at >= (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    ).filter(CompileTask.created_at >= (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0), CompileTask.deleted_at.is_(None)
      ).group_by("d").all()
     by_day = {r.d.strftime("%m-%d"): r for r in trend_rows}
     trend = []
@@ -171,7 +171,7 @@ async def list_tickets(
 ):
     """获取工单列表（管理员，含软删用户原名 + 软件名/工单号/描述/原名 多字段搜索）"""
     from sqlalchemy import func as _f, String as _S
-    query = db.query(Ticket)
+    query = db.query(Ticket).filter(Ticket.deleted_at.is_(None))  # 软删不可见
 
     if status:
         query = query.filter(Ticket.status == TicketStatus(status))
@@ -227,7 +227,7 @@ async def send_ticket_message(
     current_user: User = Depends(get_current_user),
 ):
     """管理员回复工单（接 get_current_user 而非硬编码 admin_id=1）"""
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.status == TicketStatus.CLOSED:
@@ -286,7 +286,7 @@ async def resolve_ticket(
     if not resolution or not resolution.strip():
         raise HTTPException(status_code=400, detail="解决说明 resolution 必填")
 
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.status == TicketStatus.RESOLVED:
@@ -305,7 +305,7 @@ async def resolve_ticket(
     from app.services.ticket_agent import MANAGER
     # 修复 DetachedInstanceError：上方 db.expunge_all()（或 commit 后 expire）会让
     # 老 ticket 对象访问关系属性爆炸 → 重新取一份绑定当前 session 的
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     sess = MANAGER.get(ticket_id)
     if sess is not None and ticket:
         try:
@@ -423,7 +423,7 @@ async def admin_change_ticket_status(
         target = TicketStatus(new_status)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"非法状态: {new_status}（仅支持 pending/processing/resolved/closed）")
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.status == TicketStatus.CLOSED:
@@ -490,7 +490,7 @@ async def admin_get_ticket(
     db: Session = Depends(get_db),
 ):
     """admin 视角工单详情（含消息流、task 完整信息、resolution、agent session 状态）"""
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     from app.models import TicketMessage, TargetSystem
@@ -1293,7 +1293,7 @@ async def accept_ticket_and_start_agent(
 
     接单时一次 Skills 注入：session 创建时 skills 路径一次性加载到 agent。
     """
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.status == "closed":
@@ -1596,7 +1596,7 @@ async def post_agent_message(
     if not sess:
         print(f"{_marker} !!! no session, abort 400", flush=True)
         # A 方案：顺手触发自动恢复（内存没 session 但 DB 有现场 → 后台重建），前端提示稍后再发
-        ticket_now = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+        ticket_now = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
         if ticket_now and str(getattr(ticket_now.status, "value", ticket_now.status)) == "processing":
             import asyncio
             async def _kick_restore():
@@ -2303,7 +2303,7 @@ async def retry_ticket_agent(
     3. 异步重启 _create_session
     """
     from app.services.ticket_agent import MANAGER
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if ticket.status != "processing":
@@ -2370,7 +2370,7 @@ async def preview_skill_draft(
 ):
     """预览工单经验草稿（不写 DB）—— 同步版：LLM 要 1-4 分钟，前端一般走 /preview-job 异步轮询"""
     from app.services.skill_draft import build_skill_draft_preview
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if not ticket.resolution:
@@ -2394,7 +2394,7 @@ async def start_preview_job(
     """
     from app.services.skill_draft import start_preview_job
     from app.models import SessionLocal
-    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id, Ticket.deleted_at.is_(None)).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="工单不存在")
     if not ticket.resolution:
@@ -2476,3 +2476,99 @@ async def list_audit_logs(
         "ip_address": a.ip_address,
     } for a, uname in rows]
     return ApiResponse(data={"total": total, "items": items})
+
+
+# ============== 删除（软删+可选 purge，预置 admin 专属；2026-10-30）==============
+
+@router.delete("/tasks/{task_db_id}", response_model=ApiResponse)
+async def delete_compile_task(
+    task_db_id: int,
+    request: Request,
+    purge: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),
+):
+    """软删编译任务（连带 R 系合成记录）；purge=再清磁盘产物与编译容器。
+    DB 行恒保留（外键零破坏+历史统计）；submitted/compiling 拒绝（在途闸门）。"""
+    from app.services.softdelete import task_guard, soft_delete_task
+    from app.models import CompileTask
+    task = db.query(CompileTask).filter(CompileTask.id == task_db_id).first()
+    deny = task_guard(task)
+    if deny:
+        raise HTTPException(status_code=404 if task is None or task.deleted_at else 400, detail=deny)
+    linked = soft_delete_task(db, task)
+    r_tasks = [t for t in linked if isinstance(t, CompileTask)]
+    l_tickets = [t for t in linked if isinstance(t, Ticket)]
+    purged = []
+    if purge:
+        purged = _purge_task_artifacts([task] + r_tasks)
+    log_audit(db, user_id=current_user.user_id, action="task_deleted", target_type="compile_task",
+              target_id=task.id, target_key=task.task_id, request=request,
+              details=f"purge={purge}, cascade_R={len(r_tasks)}, cascade_tickets={len(l_tickets)}, purged={purged}")
+    db.commit()
+    return ApiResponse(data={"task_id": task.task_id, "cascade_r": [t.task_id for t in r_tasks],
+                             "cascade_tickets": [t.ticket_id for t in l_tickets],
+                             "purged": purged})
+
+
+@router.delete("/tickets/{ticket_id}", response_model=ApiResponse)
+async def delete_ticket(
+    ticket_id: int,
+    request: Request,
+    purge: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),
+):
+    """软删工单；级联软删其任务+R 系（工单离开任务无意义，反向不成立）。
+    processing 拒绝（agent 正在干活）。purge=清产物目录+工单 agent 容器。"""
+    from app.services.softdelete import ticket_guard, soft_delete_ticket
+    from app.models import Ticket
+    ticket = db.query(Ticket).filter(Ticket.ticket_id == ticket_id).first()
+    deny = ticket_guard(ticket)
+    if deny:
+        raise HTTPException(status_code=404 if ticket is None or ticket.deleted_at else 400, detail=deny)
+    linked_tasks = soft_delete_ticket(db, ticket)
+    purged = []
+    if purge:
+        main_task = db.query(CompileTask).filter(CompileTask.id == ticket.task_id).first()
+        if main_task is not None:
+            purged = _purge_task_artifacts([main_task] + linked_tasks, ticket_id=ticket_id)
+    log_audit(db, user_id=current_user.user_id, action="ticket_deleted", target_type="ticket",
+              target_id=ticket.ticket_id, target_key=f"#{ticket_id}", request=request,
+              details=f"purge={purge}, cascade_tasks={len(linked_tasks) + 1}, purged={purged}")
+    db.commit()
+    return ApiResponse(data={"ticket_id": ticket_id, "cascade_tasks": len(linked_tasks) + 1,
+                             "purged": purged})
+
+
+def _purge_task_artifacts(tasks, ticket_id: int = None) -> list:
+    """磁盘产物目录 + 容器清理（只碰 Exited/构建期 label；DB 行恒留）。
+    task_id 已过 ^T- 形态（库内生成），rmtree 路径恒在 artifacts_root 下。"""
+    import shutil, subprocess
+    from app.config import artifacts_dir
+    root = artifacts_dir()
+    purged = []
+    for t in tasks:
+        d = root / t.task_id
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            purged.append(f"dir:{t.task_id}")
+        # 编译容器（label=task_id）
+        try:
+            ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=task_id={t.task_id}"],
+                                 capture_output=True, text=True, timeout=20).stdout.split()
+            if ids:
+                subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=30)
+                purged.append(f"containers:{t.task_id}×{len(ids)}")
+        except Exception as e:
+            logger.warning("[purge] docker 清理跳过 %s: %s", t.task_id, e)
+    if ticket_id is not None:
+        try:
+            ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=compile.ticket={ticket_id}"],
+                                 capture_output=True, text=True, timeout=20).stdout.split()
+            if ids:
+                subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=30)
+                purged.append(f"ticket_containers:#{ticket_id}×{len(ids)}")
+        except Exception as e:
+            logger.warning("[purge] 工单容器清理跳过 #%s: %s", ticket_id, e)
+    return purged

@@ -50,7 +50,7 @@
             {{ formatDate(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="280">
+        <el-table-column label="操作" width="340">
           <template #default="{ row }">
             <el-button size="small" @click="viewLog(row)">日志</el-button>
             <el-button v-if="row.status === 'success'" size="small" @click="downloadArtifact(row)">下载</el-button>
@@ -69,6 +69,10 @@
               @click="onGenerateDraft(row)">✨ 沉淀经验</el-button>
             <el-button v-if="row.status === 'submitted' || row.status === 'compiling'" size="small" type="warning" @click="cancelTask(row)">取消</el-button>
             <el-button v-if="row.status === 'success' || row.status === 'failed' || row.status === 'cancelled'" size="small" type="primary" @click="retryTask(row)">重试</el-button>
+            <el-button v-if="isPresetAdmin" size="small" type="danger" plain
+              :disabled="row.status === 'submitted' || row.status === 'compiling'"
+              :title="(row.status === 'submitted' || row.status === 'compiling') ? '在途任务不可删除' : ''"
+              @click="openDeleteTask(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -154,14 +158,26 @@
       </template>
     </el-dialog>
   </div>
+    <el-dialog v-model="delDlg" title="删除编译任务" width="440px">
+      <div v-if="delTarget">
+        <p>任务 <b>{{ delTarget.task_id }}</b>（{{ delTarget.software_name }}，{{ delTarget.status }}）</p>
+        <p style="color:var(--el-text-color-secondary);font-size:13px">软删除：列表与统计不再可见，历史记录与关联工单保留；同 stem 的合成记录（-R1/-R2）连带删除。</p>
+        <el-checkbox v-model="delPurge">同时清除磁盘产物目录与编译容器（不可恢复）</el-checkbox>
+      </div>
+      <template #footer>
+        <el-button @click="delDlg = false">取消</el-button>
+        <el-button type="danger" :loading="deleting" @click="doDeleteTask">确认删除</el-button>
+      </template>
+    </el-dialog>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
 import api from '@/utils/request'
 import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useAuthStore } from '@/stores/auth'
 
 const tasks = ref<any[]>([])
 const filterStatus = ref('')
@@ -612,6 +628,25 @@ async function onSubmitDraft() {
 }
 
 const route = useRoute()
+const auth = useAuthStore()
+const isPresetAdmin = computed(() => auth.user?.username === 'admin')
+const delDlg = ref(false)
+const delPurge = ref(false)
+const deleting = ref(false)
+const delTarget = ref<any>(null)
+function openDeleteTask(row: any) { delTarget.value = row; delPurge.value = false; delDlg.value = true }
+async function doDeleteTask() {
+  deleting.value = true
+  try {
+    const r: any = await api.delete(`/admin/tasks/${delTarget.value.id}${delPurge.value ? '?purge=true' : ''}`)
+    const d = r?.data || {}
+    ElMessage.success(`已删除 ${d.task_id || ''}${(d.cascade_r || []).length ? `（连带 ${d.cascade_r.length} 条合成记录）` : ''}${(d.cascade_tickets || []).length ? `、工单 ${d.cascade_tickets.map((x: number) => '#' + x).join(' ')}` : ''}${(d.purged || []).length ? `，清除 ${d.purged.length} 项磁盘/容器` : ''}`)
+    delDlg.value = false
+    loadTasks()
+  } catch (e: any) {
+    ElMessage.error(e?.message || '删除失败')
+  } finally { deleting.value = false }
+}
 onMounted(async () => {
   await loadTasks()
   loadExistingTickets()

@@ -173,6 +173,8 @@ class CompileTask(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
+    # 软删（admin 删除功能 2026-10-30）：行保留、外键零破坏；purge 才清磁盘/容器
+    deleted_at = Column(DateTime)
     duration_seconds = Column(Integer)
 
     # 关系
@@ -195,7 +197,8 @@ class Ticket(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     resolved_at = Column(DateTime)
-    resolution = Column(Text)  # 管理员填的解决方案（必填，admin 标记已解决时写）
+    resolution = Column(Text)
+    deleted_at = Column(DateTime)  # 软删，同 CompileTask  # 管理员填的解决方案（必填，admin 标记已解决时写）
 
     # 关系
     task = relationship("CompileTask", back_populates="ticket")
@@ -365,6 +368,12 @@ def _safe_drop_column(table_name: str, column_name: str):
     logger.info("Dropped column %s.%s", table_name, column_name)
 
 
+def ensure_softdelete_columns():
+    """软删两列幂等 DDL（_safe_add_column 同族；存量行 NULL=未删，无需回填）"""
+    _safe_add_column("compile_tasks", "deleted_at", "TIMESTAMP")
+    _safe_add_column("tickets", "deleted_at", "TIMESTAMP")
+
+
 def _relax_auditlog_user_notnull():
     """T10：存量 audit_logs.user_id 解 NOT NULL（超出 _safe_add_column 能力的已有列约束变更，
     显式幂等 SQL；PG 对已 nullable 是 no-op）"""
@@ -417,6 +426,7 @@ def init_db():
     _safe_add_column("ticket_messages", "kind", "VARCHAR(12) NOT NULL DEFAULT 'chat'")
     # T10 操作审计（2026-10-27）：存量库幂等三段——新库由 create_all 成型，这里全 no-op
     _safe_add_column("audit_logs", "target_key", "VARCHAR(100)")
+    ensure_softdelete_columns()
     _relax_auditlog_user_notnull()
     _ensure_audit_indexes()
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）

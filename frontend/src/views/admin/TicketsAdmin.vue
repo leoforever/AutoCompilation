@@ -50,6 +50,9 @@
             <el-button size="small" @click="openDetail(row)">查看</el-button>
             <el-button v-if="row.status === 'pending'" size="small" type="primary" @click="quickStatus(row, 'processing')">接单</el-button>
             <el-button v-else-if="row.status === 'processing'" size="small" type="success" @click="openResolveDialog(row)">标记解决</el-button>
+            <el-button v-if="isPresetAdmin" size="small" type="danger" plain
+              :disabled="row.status === 'processing'" :title="row.status === 'processing' ? '处理中的工单不可删除' : ''"
+              @click="openDeleteTicket(row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -346,6 +349,17 @@
       </template>
     </el-dialog>
   </div>
+    <el-dialog v-model="delDlg" title="删除工单" width="460px">
+      <div v-if="delTarget">
+        <p>工单 <b>#{{ delTarget.ticket_id }}</b>（{{ delTarget.title }}）</p>
+        <p style="color:var(--el-text-color-secondary);font-size:13px">软删除：列表不再可见；<b>其关联编译任务与合成记录一并删除</b>（对话消息保留在库内，随工单隐藏）。</p>
+        <el-checkbox v-model="delPurge">同时清除磁盘产物目录与编译/agent 容器（不可恢复）</el-checkbox>
+      </div>
+      <template #footer>
+        <el-button @click="delDlg = false">取消</el-button>
+        <el-button type="danger" :loading="deleting" @click="doDeleteTicket">确认删除</el-button>
+      </template>
+    </el-dialog>
 </template>
 
 <script setup lang="ts">
@@ -353,6 +367,7 @@ import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/utils/request'
+import { useAuthStore } from '@/stores/auth'
 import { fmtDateTime } from '@/utils/datetime'
 
 const tickets = ref<any[]>([])
@@ -404,6 +419,25 @@ const resolveForm = reactive({ resolution: '', autoSkill: true })
 
 function statusType(status: string) { return { pending: 'warning', processing: 'primary', resolved: 'success', closed: 'info' }[status] || 'info' }
 function statusText(status: string) { return { pending: '待处理', processing: '处理中', resolved: '已解决', closed: '已关闭' }[status] || status }
+const isPresetAdmin = computed(() => (auth.user as any)?.username === 'admin')
+const delDlg = ref(false)
+const delPurge = ref(false)
+const deleting = ref(false)
+const delTarget = ref<any>(null)
+function openDeleteTicket(row: any) { delTarget.value = row; delPurge.value = false; delDlg.value = true }
+async function doDeleteTicket() {
+  deleting.value = true
+  try {
+    const r: any = await api.delete(`/admin/tickets/${delTarget.value.ticket_id}${delPurge.value ? '?purge=true' : ''}`)
+    const d = r?.data || {}
+    ElMessage.success(`工单 #${d.ticket_id ?? ''} 已删除${d.cascade_tasks ? `（连带 ${d.cascade_tasks} 条任务记录）` : ''}${(d.purged || []).length ? `，清除 ${d.purged.length} 项磁盘/容器` : ''}`)
+    delDlg.value = false
+    loadTickets()
+  } catch (e: any) {
+    ElMessage.error(e?.message || '删除失败')
+  } finally { deleting.value = false }
+}
+
 function roleTag(role: string) { return { user: '', admin: 'success', agent: 'warning', tool: 'info', system: '' }[role] || '' }
 function roleLabel(role: string) { return { user: '用户', admin: '管理员', agent: 'Agent', tool: '工具', system: '系统' }[role] || role }
 function formatDate(s: string) { return fmtDateTime(s) }  // 10-23: naive UTC 补 Z 解析（时区三踩收口）
@@ -439,6 +473,7 @@ async function loadCounts() {
   }
 }
 
+const auth = useAuthStore()
 async function loadTickets() {
   loading.value = true
   try {

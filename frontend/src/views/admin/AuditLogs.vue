@@ -89,6 +89,7 @@ const ACTION_LABELS: Record<string, string> = {
   experience_submit: '提交经验', experience_approve: '经验通过', experience_reject: '经验驳回',
   draft_generated: '生成草稿', admin_password_reset: '管理员重置密码',
   qa_ask: '问答提问', qa_save_draft: '问答存草稿',
+  task_deleted: '删除任务', ticket_deleted: '删除工单',
   user_created: '建用户', user_updated: '改用户', user_deleted: '注销用户', user_restored: '恢复用户',
   skill_created: '建Skill', skill_updated: '改Skill', skill_deleted: '删Skill', skill_reconcile: 'Skill对账',
   system_created: '建系统', system_updated: '改系统', system_deleted: '删系统',

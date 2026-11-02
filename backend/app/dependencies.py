@@ -48,6 +48,14 @@ def require_qa_owner(current_user: User = Depends(get_current_user)) -> User:
     return current_user
 
 
+def require_preset_admin(current_user: User = Depends(get_current_user)) -> User:
+    """预置 admin 账号专属闸（删除类高危操作 2026-10-30 拍板：先只给 admin 本人，
+    多管理员公平等验证成熟后换 require_admin，一行）。"""
+    if current_user.username != "admin":
+        raise HTTPException(status_code=403, detail="该操作暂未开放")
+    return current_user
+
+
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
     """要求管理员权限"""
     if current_user.role != "admin":
