@@ -128,4 +128,30 @@ router.beforeEach((to, _from, next) => {
   next()
 })
 
+// ── 发版后旧页面点导航 → 动态 chunk 404（rsync --delete 清掉旧 hash 文件）──
+// 标准解法：vite 官方 preloadError 事件 + router.onError 兜底，双路都触发"带守卫的
+// 一次整页刷新"（拿新 index.html=新 chunk 清单）；sessionStorage 防无限刷新循环。
+// 2026-11-02 用户报"经验库等页面无法访问 Tickets-*.js 404"事故驱动。
+const RELOAD_KEY = "chunk-reload-at"
+function reloadOnceOnStaleChunk() {
+  const now = Date.now()
+  const last = Number(sessionStorage.getItem(RELOAD_KEY) || 0)
+  // 10 秒内已刷过一次仍失败=不是发版错位（真断网/资源缺失），停止刷新防死循环
+  if (now - last < 10000) return false
+  sessionStorage.setItem(RELOAD_KEY, String(now))
+  location.reload()
+  return true
+}
+window.addEventListener("vite:preloadError", (e) => {
+  if (reloadOnceOnStaleChunk()) e.preventDefault()
+})
+
+router.onError((err) => {
+  // vue-router 懒加载组件 import 失败 = TypeError: Failed to fetch dynamically imported module
+  const msg = String((err as Error)?.message || err)
+  if (msg.includes("dynamically imported module") || msg.includes("Loading chunk") || msg.includes("Failed to fetch")) {
+    reloadOnceOnStaleChunk()
+  }
+})
+
 export default router
