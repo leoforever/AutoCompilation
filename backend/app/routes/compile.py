@@ -439,12 +439,10 @@ async def download_compile_log(
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
     log_file = _artifacts_dir() / task_id / "build.log"
+    # 读型交付不记审计（设计原则"写必录、读不录"；11-02 用户拍板废除下载留痕——
+    # 高频运维动作淹安全事件；DB 兜底分支 source 字段响应体保留，与审计无关）
     if not log_file.exists():
         return {"task_id": task_id, "log": task.log_output or "", "source": "db"}
-    log_audit(db, user_id=current_user.user_id, action="log_downloaded", target_type="compile_task",
-              target_id=task.id, target_key=task_id, request=request,
-              details=f"size={log_file.stat().st_size}")
-    db.commit()
     return FileResponse(
         path=str(log_file),
         media_type="text/plain",
@@ -501,10 +499,7 @@ async def download_artifacts_bundle(
         with tarfile.open(bundle_path, "w:gz") as tar:
             tar.add(tree, arcname=tree.name)
 
-    log_audit(db, user_id=current_user.user_id, action="artifact_downloaded", target_type="compile_task",
-              target_id=task.id, target_key=task_id, request=request,
-              details=f"bundle_size={bundle_path.stat().st_size}")
-    db.commit()
+    # 读型交付不记审计（同上，11-02 拍板废除下载留痕）
     return FileResponse(
         path=str(bundle_path),
         media_type="application/gzip",
