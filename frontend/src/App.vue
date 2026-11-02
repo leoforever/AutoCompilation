@@ -71,6 +71,26 @@
         <router-view />
       </el-main>
     </el-container>
+    <el-dialog v-model="pcDlg" title="个人中心" width="380px">
+      <div style="margin-bottom:14px;color:var(--el-text-color-secondary);font-size:13px">
+        当前账号：<b>{{ authStore.user?.username }}</b>（{{ authStore.user?.role === 'admin' ? '管理员' : '普通用户' }}）
+      </div>
+      <el-form :model="pcForm" label-width="80px" @submit.prevent="doChangePwd">
+        <el-form-item label="原密码">
+          <el-input v-model="pcForm.old" type="password" show-password autocomplete="current-password" />
+        </el-form-item>
+        <el-form-item label="新密码">
+          <el-input v-model="pcForm.new" type="password" show-password autocomplete="new-password" placeholder="至少 6 位" />
+        </el-form-item>
+        <el-form-item label="确认新密码">
+          <el-input v-model="pcForm.confirm" type="password" show-password autocomplete="new-password" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pcDlg = false">取消</el-button>
+        <el-button type="primary" :loading="pcBusy" @click="doChangePwd">修改密码</el-button>
+      </template>
+    </el-dialog>
   </el-container>
   
   <!-- 未登录时显示登录页 -->
@@ -78,7 +98,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted , watch } from 'vue'
+import { ref, reactive, computed, onMounted , watch } from 'vue'
 import { emojiSrc } from '@/utils/emoji'
 import { useRouter } from 'vue-router'
 import api from '@/utils/request'
@@ -88,6 +108,22 @@ import { useAuthStore } from '@/stores/auth'
 import { ElMessage } from 'element-plus'
 
 const router = useRouter()
+const pcDlg = ref(false)
+const pcBusy = ref(false)
+const pcForm = reactive({ old: '', new: '', confirm: '' })
+async function doChangePwd() {
+  if (!pcForm.old || !pcForm.new) { ElMessage.warning('请填写原密码与新密码'); return }
+  if (pcForm.new.length < 6) { ElMessage.warning('新密码至少 6 位'); return }
+  if (pcForm.new !== pcForm.confirm) { ElMessage.warning('两次新密码不一致'); return }
+  pcBusy.value = true
+  try {
+    await api.post('/auth/change-password', { old_password: pcForm.old, new_password: pcForm.new })
+    ElMessage.success('密码已修改，下次登录用新密码')
+    pcDlg.value = false
+  } catch (e: any) {
+    ElMessage.error(e?.message || '修改失败')
+  } finally { pcBusy.value = false }
+}
 
 // ── T12 消息提醒（一期纯拉取：route change 刷新 unread；无 WS）──
 const unreadCount = ref(0)
@@ -168,7 +204,8 @@ function handleCommand(command: string) {
     ElMessage.success('已退出登录')
     router.push('/login')
   } else if (command === 'profile') {
-    ElMessage.info('个人中心功能开发中')
+    pcForm.old = ''; pcForm.new = ''; pcForm.confirm = ''
+    pcDlg.value = true
   }
 }
 
