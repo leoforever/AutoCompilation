@@ -2496,18 +2496,15 @@ async def delete_compile_task(
     deny = task_guard(task)
     if deny:
         raise HTTPException(status_code=404 if task is None or task.deleted_at else 400, detail=deny)
-    linked = soft_delete_task(db, task)
-    r_tasks = [t for t in linked if isinstance(t, CompileTask)]
-    l_tickets = [t for t in linked if isinstance(t, Ticket)]
+    linked = soft_delete_task(db, task)          # 恒为 CompileTask（R 系）
     purged = []
     if purge:
-        purged = _purge_task_artifacts([task] + r_tasks)
+        purged = _purge_task_artifacts([task] + linked)
     log_audit(db, user_id=current_user.user_id, action="task_deleted", target_type="compile_task",
               target_id=task.id, target_key=task.task_id, request=request,
-              details=f"purge={purge}, cascade_R={len(r_tasks)}, cascade_tickets={len(l_tickets)}, purged={purged}")
+              details=f"purge={purge}, cascade_R={len(linked)}, purged={purged}")
     db.commit()
-    return ApiResponse(data={"task_id": task.task_id, "cascade_r": [t.task_id for t in r_tasks],
-                             "cascade_tickets": [t.ticket_id for t in l_tickets],
+    return ApiResponse(data={"task_id": task.task_id, "cascade_r": [t.task_id for t in linked],
                              "purged": purged})
 
 
@@ -2530,9 +2527,12 @@ async def delete_ticket(
     linked_tasks = soft_delete_ticket(db, ticket)
     purged = []
     if purge:
+        # 11-02 工单删除 purge 500 教训（symmetric 级联曾把 Ticket 混进此清单）：
+        # isinstance 过滤=调用侧保险，helper 内 assert=类型不变式，双道防再犯
         main_task = db.query(CompileTask).filter(CompileTask.id == ticket.task_id).first()
-        if main_task is not None:
-            purged = _purge_task_artifacts([main_task] + linked_tasks, ticket_id=ticket_id)
+        purge_set = ([main_task] if main_task is not None else []) + \
+            [t for t in linked_tasks if isinstance(t, CompileTask)]
+        purged = _purge_task_artifacts(purge_set, ticket_id=ticket_id)
     log_audit(db, user_id=current_user.user_id, action="ticket_deleted", target_type="ticket",
               target_id=ticket.ticket_id, target_key=f"#{ticket_id}", request=request,
               details=f"purge={purge}, cascade_tasks={len(linked_tasks) + 1}, purged={purged}")
@@ -2546,6 +2546,8 @@ def _purge_task_artifacts(tasks, ticket_id: int = None) -> list:
     task_id 已过 ^T- 形态（库内生成），rmtree 路径恒在 artifacts_root 下。"""
     import shutil, subprocess
     from app.config import artifacts_dir
+    from app.models import CompileTask as _CT
+    assert all(isinstance(t, _CT) for t in tasks), "purge 清单必须全为 CompileTask"
     root = artifacts_dir()
     purged = []
     for t in tasks:

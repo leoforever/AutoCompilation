@@ -65,20 +65,14 @@ def r_siblings(db: Session, task):
 
 
 def soft_delete_task(db: Session, task) -> list:
-    """任务软删 + 连带：①同 stem R 系；②其上的工单（工单离开任务无意义——
-    admin 抹掉一条编译线=任务/合成记录/工单对称级联，10-27"引用方先行"教训的
-    产品化；对话消息行保留库内随父隐藏，审计不动）。调用方 commit。
-    返回连带清单 [R 任务..., Ticket...]（工单元素为 Ticket 实例）。"""
+    """任务软删 + 连带同 stem R 系（10-27 孤儿 R 教训）。调用方 commit。
+    不连带其上工单——拍板口径（11-02 回退我私自加的"对称级联"）：
+    删任务后工单引用保留，详情显示"任务已删除"态；级联方向只有 ticket→task。
+    （曾按对称方案上线即引发 500：ticket→task→sibling-tickets 传递闭包把
+    Ticket 混进 purge 清单；且"删一张工单连坐同任务其他工单"非用户意图。）"""
     siblings = r_siblings(db, task)
     touched = _soft_delete_tasks(db, [task] + siblings)
-    now = datetime.utcnow()
-    linked_tickets = []
-    for tk in db.query(Ticket).filter(Ticket.task_id == task.id,
-                                      Ticket.deleted_at.is_(None)).all():
-        if tk.status not in TICKET_LIVE:      # processing 工单不连带（agent 还在用）
-            tk.deleted_at = now
-            linked_tickets.append(tk)
-    return [t for t in touched if t is not task] + linked_tickets
+    return [t for t in touched if t is not task]
 
 
 def soft_delete_ticket(db: Session, ticket) -> list:

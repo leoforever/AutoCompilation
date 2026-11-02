@@ -161,7 +161,7 @@
     <el-dialog v-model="delDlg" title="删除编译任务" width="440px">
       <div v-if="delTarget">
         <p>任务 <b>{{ delTarget.task_id }}</b>（{{ delTarget.software_name }}，{{ delTarget.status }}）</p>
-        <p style="color:var(--el-text-color-secondary);font-size:13px">软删除：列表与统计不再可见，历史记录与关联工单保留；同 stem 的合成记录（-R1/-R2）连带删除。</p>
+        <p style="color:var(--el-text-color-secondary);font-size:13px">软删除：列表与统计不再可见；同 stem 合成记录（-R1/-R2）连带删除；由其上报的工单保留（任务栏显示已删除）。</p>
         <el-checkbox v-model="delPurge">同时清除磁盘产物目录与编译容器（不可恢复）</el-checkbox>
       </div>
       <template #footer>
@@ -640,7 +640,7 @@ async function doDeleteTask() {
   try {
     const r: any = await api.delete(`/admin/tasks/${delTarget.value.id}${delPurge.value ? '?purge=true' : ''}`)
     const d = r?.data || {}
-    ElMessage.success(`已删除 ${d.task_id || ''}${(d.cascade_r || []).length ? `（连带 ${d.cascade_r.length} 条合成记录）` : ''}${(d.cascade_tickets || []).length ? `、工单 ${d.cascade_tickets.map((x: number) => '#' + x).join(' ')}` : ''}${(d.purged || []).length ? `，清除 ${d.purged.length} 项磁盘/容器` : ''}`)
+    ElMessage.success(`已删除 ${d.task_id || ''}${(d.cascade_r || []).length ? `（连带 ${d.cascade_r.length} 条合成记录）` : ''}${(d.purged || []).length ? `，清除 ${d.purged.length} 项磁盘/容器` : ''}`)
     delDlg.value = false
     loadTasks()
   } catch (e: any) {
