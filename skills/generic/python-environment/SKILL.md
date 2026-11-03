@@ -8,6 +8,6 @@ allowed-tools: [execute, read_file]
 # Python 环境（龙芯 LoongArch）
 
 ## pip 源（按优先级）
-- 主: https://lcr.loongnix.cn
+- 主: https://lpypi.loongnix.cn/loongson/pypi
 - 备: https://mirrors.aliyun.com/pypi/simple
 - 备: https://pypi.tuna.tsinghua.edu.cn/simple
