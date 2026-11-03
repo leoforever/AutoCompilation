@@ -322,7 +322,10 @@ def start_qa_job(db_factory, user_id: int, question: str, task_db_id: "int|None"
                 pl = paste_text.strip()[-b["paste"]:]
                 numbered = "\n".join(f"L{i+1}: {ln}" for i, ln in enumerate(pl.splitlines()))
                 chunks.append(f"### 资料 LOG:paste（用户粘贴 {pl.count(chr(10))} 行，已编号）\n{numbered}")
-            chunks += _retrieve_tickets(s, question, b["tickets"])
+            # 工单源同守互斥（11-03 修复①）：挂任务=只吃该任务现场（LOG/NOTES/paste）；
+            # 旧实现工单无条件 top2 掺入，问 node-pty 时 ollama/lsx 工单聊天线也在场串味
+            if meta is None:
+                chunks += _retrieve_tickets(s, question, b["tickets"])
             hist = _get_history(user_id)
             hist_txt = "\n".join(f"问: {h['q']}\n答: {h['a'][:400]}" for h in hist)
             canary = uuid.uuid4().hex[:12]
@@ -334,7 +337,10 @@ def start_qa_job(db_factory, user_id: int, question: str, task_db_id: "int|None"
                 + f"\n\n【问题】\n{sanitize_details(question)[:2000]}"
             )
             from app.services.experience_generator import _call_llm
-            raw = _call_llm(system, user_prompt, temperature=0.2, max_tokens=4096)
+            # max_tokens 8192：思考模型 reasoning + JSON 引文原文同吃输出预算，
+            # 4096 在素材多时截断（11-03 E4 实测 LengthFinishReasonError）
+            raw = _call_llm(system, user_prompt, temperature=0.2, max_tokens=8192,
+                            call_site="qa.ask", response_json=True)  # JSON mode（④）
             parsed = _parse_out(raw)
             valid, invalid = validate_citations(parsed.get("citations"), chunks)
             leak = canary in raw

@@ -49,9 +49,14 @@ async def qa_ask(body: QaAsk, request: Request, db: Session = Depends(get_db),
     if job and job["status"] == "running":
         return ApiResponse(data={"job": "running", "started_at": job["started_at"]})
     if body.task_db_id:
-        t = db.query(CompileTask).filter(CompileTask.id == body.task_db_id).first()
+        # 软删任务一并 404（11-03 修复②）：旧检查漏 deleted_at——已删任务能过
+        # 存在性关、却在 _task_context 的软删过滤处拿不到 meta → 静默降级成
+        # "未挂任务"走 skill 检索 = 答非所问且不告知。宁可 404 明说，不做静默兜底
+        t = db.query(CompileTask).filter(
+            CompileTask.id == body.task_db_id,
+            CompileTask.deleted_at.is_(None)).first()
         if not t:
-            raise HTTPException(status_code=404, detail="挂载任务不存在")
+            raise HTTPException(status_code=404, detail="挂载任务不存在或已删除")
     # 审计先行：提问即计数（配额账本以 qa_ask 行数为准，失败也消耗——防重试刷）
     log_audit(db, user_id=current_user.user_id, action="qa_ask",
               target_type="qa", target_key=str(body.task_db_id or ""),

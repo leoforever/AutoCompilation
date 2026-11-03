@@ -122,7 +122,8 @@ async function init() {
   await fetchTasks('')
   const s: any = await api.get('/compile/options/systems')
   systems.value = (s?.data && (s.data.data || s.data)) || s?.systems || []
-  if (taskOptions.value.length) taskDbId.value = taskOptions.value[0].id
+  // 不自动预选（11-03 修复③）：旧版默认挂第一条任务——用户没选也会吃"挂任务"
+  // 互斥语义（只喂那条的素材），体感"问什么都扯这条任务"。不选=不挂载=通用检索
   const st: any = await api.get('/admin/qa/status')
   if (st?.data?.status === 'running') {            // 刷新前在途 job：接管继续等
     const m = reactive<QaMsg>({ q: '（刷新前的问题）', pending: true, answer: '', citations: [], general_notes: '', error: '' })
