@@ -156,6 +156,11 @@ class CompileTaskResponse(BaseModel):
     depend_tree: Optional[dict]
     artifact_path: Optional[str]
     bundle_size: Optional[int] = None  # artifacts.tar.gz 真实字节数=下载传输量（非 ORM 列，路由注入）
+    # 阶段5 子阶段（2026-11-02）：编译/验证分段 + 未验证产物标记
+    compiled_ok: bool = False
+    verified_ok: bool = False
+    artifact_partial: bool = False
+    phase_state: Optional[str]
     error_message: Optional[str]
     created_at: datetime
     started_at: Optional[datetime]

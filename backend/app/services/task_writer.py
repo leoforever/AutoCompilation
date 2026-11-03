@@ -106,6 +106,16 @@ def write_terminal(db, task, state: dict) -> None:
             task.matched_skills = json.dumps(_ms, ensure_ascii=False)
         artifacts = state.get("artifacts", [])
         task.artifact_path = json.dumps(artifacts, ensure_ascii=False) if artifacts else (task.artifact_path or None)
+        # 阶段5 子阶段（2026-11-02）：核心终态必须落（块1=DB 权威），否则"编译成功但验证失败"
+        # 的产物保留信息只在内存里，重启即丢——与"DB=权威"铁律冲突
+        task.compiled_ok = bool(state.get("compiled_ok"))
+        task.verified_ok = bool(state.get("verified_ok"))
+        task.artifact_partial = bool(state.get("artifact_partial"))
+        try:
+            from app.services.compile_engine import _phase_snapshot
+            task.phase_state = json.dumps(_phase_snapshot(state), ensure_ascii=False)
+        except Exception:
+            task.phase_state = task.phase_state or None
         now = datetime.utcnow()
         if task.started_at is None:
             task.started_at = now

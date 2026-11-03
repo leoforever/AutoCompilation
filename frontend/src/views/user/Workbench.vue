@@ -122,6 +122,14 @@
         <span v-if="compileResult?.task_id" class="muted" style="margin-left:8px">task_id: {{ compileResult.task_id }}</span>
       </h3>
 
+      <!-- 阶段进度（七段；编译/验证两段来自 2026-11-02 子阶段判定） -->
+      <div class="steps" v-if="stageSteps.some(s => s.cls)">
+        <div v-for="s in stageSteps" :key="s.key" :class="['step', s.cls]">
+          <div class="bub">{{ s.mark }}</div>
+          <div class="t">{{ s.label }}</div>
+        </div>
+      </div>
+
       <!-- 日志终端 -->
       <div class="term" ref="logTerminal">
         <div v-if="!logLines.length && compiling" class="empty">
@@ -669,7 +677,34 @@ function extractSkillsFromText(text: string, _wsNames?: string[]) {
   }
 }
 
+// ── 阶段进度推导（2026-11-02）────────────────────────────────
+// 1-4/6 由 log 行前缀（[阶段N]）推导；5-编译/5-验证 由后端标记行
+// （[阶段5-编译] ✓ / [阶段5-验证] ✓|✗）推导——后端已在 log 里打标，前端只解析。
+const phaseMarks = reactive({ compile: '', verify: '' })
+
+function _scanPhaseMarks(text: string) {
+  if (!text) return
+  if (text.includes('[阶段5-编译]')) phaseMarks.compile = text.includes('✓') ? 'done' : (text.includes('✗') ? 'failed' : 'running')
+  if (text.includes('[阶段5-验证]')) phaseMarks.verify = text.includes('✓') ? 'done' : (text.includes('✗') ? 'failed' : 'running')
+}
+
+const stageSteps = computed(() => {
+  const txt = logLines.value.map(l => l.text).join('\n')
+  const has = (tag: string) => txt.includes(tag)
+  const steps: { key: string; label: string; cls: string; mark: string }[] = [
+    { key: '1', label: '初始化', cls: has('[阶段1]') ? 'done' : '', mark: has('[阶段1]') ? '✓' : '' },
+    { key: '2', label: '环境匹配', cls: has('[阶段2]') ? 'done' : '', mark: has('[阶段2]') ? '✓' : '' },
+    { key: '3', label: '容器', cls: has('[阶段3]') ? 'done' : '', mark: has('[阶段3]') ? '✓' : '' },
+    { key: '4', label: '源码', cls: has('[阶段4') ? 'done' : '', mark: has('[阶段4') ? '✓' : '' },
+    { key: '5c', label: '编译', cls: phaseMarks.compile === 'done' ? 'done' : (phaseMarks.compile === 'failed' ? 'fail' : (has('[阶段5]') ? 'doing' : '')), mark: phaseMarks.compile === 'done' ? '✓' : (phaseMarks.compile === 'failed' ? '✗' : '') },
+    { key: '5v', label: '验证', cls: phaseMarks.verify === 'done' ? 'done' : (phaseMarks.verify === 'failed' ? 'fail' : ''), mark: phaseMarks.verify === 'done' ? '✓' : (phaseMarks.verify === 'failed' ? '✗' : '') },
+    { key: '6', label: '归档', cls: has('[阶段6] 产物归档') ? 'done' : (has('[阶段6]') ? 'doing' : ''), mark: has('[阶段6] 产物归档') ? '✓' : '' },
+  ]
+  return steps
+})
+
 function appendLog(type: string, text: string) {
+  _scanPhaseMarks(text)
   logLines.value.push({ text, type })
   nextTick(() => {
     const el = document.querySelector('.term')
@@ -944,6 +979,8 @@ onUnmounted(() => {
 .step:first-child::before { display: none }
 .step .bub { position: relative; z-index: 1; width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 2px solid var(--border); margin: 0 auto 6px; display: flex; align-items: center; justify-content: center; font-size: 10px }
 .step.done .bub { background: var(--success); border-color: var(--success); color: #fff }
+.step.fail .bub { background: var(--danger); border-color: var(--danger); color: #fff }
+.step.fail .t { color: var(--danger); font-weight: 500 }
 .step.doing .bub { background: var(--primary); border-color: var(--primary); color: #fff; box-shadow: 0 0 0 4px var(--primary-light) }
 .step .t { font-size: 11.5px; color: var(--text3) }
 .step.done .t, .step.doing .t { color: var(--text); font-weight: 500 }

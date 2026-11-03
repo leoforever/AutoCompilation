@@ -27,9 +27,14 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="150">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+            <!-- 编译成功但验证未过/中断（2026-11-02）：产物已保留可下载，如实标注 -->
+            <el-tag v-if="row.artifact_partial" type="warning" size="small" style="margin-left:4px"
+              title="编译已完成，但验证未通过或被中断；产物已保留，仅供排查，可能不可用">
+              编译成功·验证未过
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="duration_seconds" label="耗时" width="80">
@@ -54,6 +59,9 @@
           <template #default="{ row }">
             <el-button size="small" @click="viewLog(row)">日志</el-button>
             <el-button v-if="row.status === 'success'" size="small" @click="downloadArtifact(row)">下载</el-button>
+            <el-button v-if="row.artifact_partial" size="small" type="warning"
+              title="编译已完成但验证未通过/中断；产物已保留，仅供排查，可能不可用"
+              @click="downloadArtifact(row)">下载（未验证产物）</el-button>
             <el-button
               v-if="row.status === 'failed'"
               size="small"

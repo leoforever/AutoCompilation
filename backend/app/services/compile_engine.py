@@ -623,6 +623,18 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 请执行完整的编译流程：先用 read_file 读 Skills 清单中匹配的 SKILL.md，再按攻略执行。
 完成后输出编译结果摘要（中文，包含"编译成功"或"编译失败"）。
 
+【编译/验证分段声明】（平台按这两行判定阶段进度与产物保留，务必遵守）
+① 产物全部编出、已放到 /work/output 之后，在回复正文里**单独写一行**：
+   [产物就绪] <产物文件名，空格分隔，最多列 5 个>
+   例如：[产物就绪] vllm-0.30.0-cp311-cp311-linux_loongarch64.whl
+   只在确实编出来时写；没编出来绝不写（平台会核对文件是否真实存在，谎报会被核对回落）。
+   产物完整清单写进 BUILD_NOTES.md 的产物清单节（平台从那里读，不依赖本行）。
+② 三件套验证做完后，在回复正文里**单独写一行**：
+   验证通过 → [验证通过] <一句结论>
+   验证失败 → [验证失败] <失败原因，一句话>
+   验证失败是正常结局，如实写即可——平台会保留已编出的产物供下载，不会丢弃。
+③ 最终总结段仍按原要求写（含"编译成功"或"编译失败"字样），平台据此判任务终态。
+
 【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
 ① 干净环境安装产物（pip install whl / npm i tgz / 二进制 ldd+file 检查，按产物类型）
 ② 导入/加载（python -c "import x" / node require / ./bin --version）
@@ -639,6 +651,11 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 默认降级为 NOTES"建议深挖项"，不为其编写测试夹具。例外：服务管理器类产物允许在两三条命令内
 起 svscan+svstat 冒烟监督链，禁止为此新建 chroot/设备节点/PATH 框架。
 （教训 801346：三件套被做成 22 项检查+百行 chroot 夹具，光调夹具就烧 30 分钟。）
+
+【验证产物隔离】（平台会把 /work/output 打包交付给用户）
+- 验证过程的临时物（venv、pip/npm 缓存、测试输出、验证脚本）一律放 /work/verify/，不要放 /work/output；
+- /work/output 只放**最终交付物**（包、库、可执行文件）+ BUILD_NOTES.md；
+- 若已把临时物放进 /work/output，收尾前 mv 到 /work/verify/ 即可。
 
 【PASS 即终局（硬约束）】
 ① 验证脚本必须输出一行机读结果：`RESULT pass=<N> fail=<M>`。首次 fail=0 = 验证通过，
@@ -804,6 +821,12 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 
             for msg in messages[prev_msg_count:]:
                 _render_agent_message(msg, state, start_ts, on_log)
+                # 阶段5 子阶段判定（2026-11-02）：扫 AI 原文里的声明行——用 msg.content 原文
+                # 而非 log 行（log 行被 _truncate 到 160 字符，长清单不可靠）
+                if (getattr(msg, "type", None) or getattr(msg, "role", None)) == "ai":
+                    _scan_stage5_marks(
+                        msg.content if isinstance(msg.content, str) else str(msg.content or ""),
+                        state, on_log)
             prev_msg_count = len(messages)
             result = chunk
         state["_stage5_done"] = True
@@ -821,9 +844,17 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             state["last_error"] = f"编译失败: {_truncate(str(final), 500)}"
             _log(state, "error", state["last_error"], on_log)
 
+        # 子阶段兜底定稿（2026-11-02）：声明缺失时按最终输出保守推断
+        # 先扫 final——最终 assistant 消息走 result["messages"][-1]，不经过 chunk 循环的
+        # messages[prev_msg_count:]，AI 常把 [验证通过] 写在最终总结里（真机实测 node-pty：
+        # AI 确实写了 [验证通过]，但因不经 chunk 循环而漏扫）
+        _scan_stage5_marks(str(final or ""), state, on_log)
+        _finalize_stage5_substages(state, final, on_log)
+
         if state["status"] != TaskStatus.FAILED.value:
             src_dir = f"{state['container_work_dir']}/src"
             state["artifacts"] = _collect_artifacts(container, state["output_dir"], src_dir)
+            state["compiled_ok"] = True          # 走到这行说明 agent 报成功=产物已出
             _log(state, "info", f"[阶段5] 产物: {len(state['artifacts'])} 个", on_log)
     except Exception as e:
         state["status"] = TaskStatus.FAILED.value
@@ -834,7 +865,175 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
     return state
 
 
+# ==================== 阶段 5 子阶段：编译/验证 分段判定（2026-11-02）====================
+# 背景：vllm 案例——wheel 在 +4068s 已编出（34.8MB），验证烧 6800s 后墙钟强停，
+#       产物随容器删除全丢，用户只看到"编译失败"。本组函数把 stage5 拆成
+#       "5-编译"/"5-验证"两个可观测子阶段，并在失败路径保留已编出的产物。
+#
+# 机制定稿：单 agent、一次 agent.stream()、**零新增线程**——
+#   ① AI 声明（提示词两段）→ chunk 循环内扫原文判定（原文完整，log 行被截断 160 字符）
+#   ② AI 收尾声明 → 兜底定稿（老攻略无声明时按"编译成功"推断，标 inferred）
+#   ③ 终态一次性 find（stage6 失败路径）→ 覆盖"被墙钟强停、来不及声明"的场景
+_MARK_COMPILED = "[产物就绪]"
+_MARK_VERIFIED_OK = "[验证通过]"
+_MARK_VERIFIED_FAIL = "[验证失败]"
+
+
+def _scan_stage5_marks(text: str, st: dict, on_log=None) -> None:
+    """扫 AI 本轮文本里的平台声明行，置 compiled_ok/verified_ok 并打标记行。
+
+    只认固定前缀（AI 文本进 log 时被 _truncate 到 160 字符，长清单不可靠；
+    判定用 msg.content 原文，清单另存 BUILD_NOTES.md 由引擎从容器内读）。
+    """
+    if not text:
+        return
+    if _MARK_COMPILED in text and not st.get("compiled_ok"):
+        st["compiled_ok"] = True
+        _log(st, "success", "[阶段5-编译] ✓ 完成", on_log)
+    if _MARK_VERIFIED_OK in text and st.get("verified_ok") is None:
+        st["verified_ok"] = True
+        st["verified_failed"] = False
+        _log(st, "success", "[阶段5-验证] ✓ 通过", on_log)
+    elif _MARK_VERIFIED_FAIL in text and st.get("verified_ok") is None:
+        st["verified_ok"] = False
+        st["verified_failed"] = True
+        _log(st, "error", "[阶段5-验证] ✗ 未通过（AI 声明）", on_log)
+
+
+def _finalize_stage5_substages(st: dict, final: str, on_log=None) -> None:
+    """收尾：子阶段兜底定稿（保守）。
+
+    compiled_ok —— 已由声明置位则保持；否则留 None（等 stage6 终态 find 兜底裁定）
+    verified_ok —— 声明过则保持；未声明时：
+                   最终输出含"编译成功"且任务判成功 → True（标 inferred，兼容老攻略）
+                   否则 → False（没明说=没过；宁可标未通过也不谎标通过）
+    """
+    fin = str(final or "")
+    if st.get("verified_ok") is None:
+        if ("编译成功" in fin or "success" in fin.lower()) and st.get("status") == TaskStatus.SUCCESS.value:
+            st["verified_ok"] = True
+            st["verified_ok_inferred"] = True
+            _log(st, "success", "[阶段5-验证] ✓ 通过（据最终输出推断，未见显式声明）", on_log)
+        else:
+            st["verified_ok"] = False
+            st["verified_failed"] = True
+            _log(st, "error", "[阶段5-验证] ✗ 未通过", on_log)
+    if st.get("compiled_ok") is None:
+        _log(st, "warn", "[阶段5-编译] 状态未知（AI 未显式声明），将由终态产物核对裁定", on_log)
+
+
+def _phase_snapshot(state: dict) -> dict:
+    """七段子阶段快照（phase_state 列）。
+
+    只存 5-compile / 5-verify 两个新子阶段——阶段 1-4/6 由前端从 log 行前缀
+    （[阶段N]）推导，不新增状态位（改动面减半，DB 不冗余）。
+    """
+    compiled = state.get("compiled_ok")
+    verified = state.get("verified_ok")
+    status = state.get("status")
+    return {
+        "5-compile": {"done": bool(compiled),
+                      "state": "done" if compiled else ("skipped" if status == TaskStatus.FAILED.value else "running")},
+        "5-verify": {"done": bool(verified),
+                     "state": "done" if verified else ("failed" if verified is False else "running")},
+    }
+
+
+# 交付物排除名单（归档侧过滤，双保险：提示词要求验证物放 /work/verify/，
+# 但 AI 可能不遵守——这里再挡一层，不让 venv/缓存/测试输出混进交付包）
+_ARTIFACT_EXCLUDE_PREFIX = ("verify", ".venv", "venv", "__pycache__", ".pytest_cache",
+                            ".cache", "node_modules", ".mypy_cache", ".ruff_cache")
+_ARTIFACT_EXCLUDE_NAMES = ("BUILD_NOTES.md",)
+
+
+def _is_deliverable_artifact(name: str) -> bool:
+    """交付物判定：排除验证临时物与杂项。"""
+    low = name.lower()
+    if name in _ARTIFACT_EXCLUDE_NAMES:
+        return False
+    if any(low.startswith(p) for p in _ARTIFACT_EXCLUDE_PREFIX):
+        return False
+    return True
+
+
 # ==================== 阶段 6 ====================
+def _archive_partial_artifacts(state: TaskState, container, on_log=None) -> bool:
+    """失败/取消路径的产物抢救：有产物就整棵归档，返回是否抢救成功。
+
+    与成功路径同款取物（container.get_archive(output_dir) + safe_extract），
+    差别只在"允许 status != success"与"标注 partial（未验证）"。
+    关键前提：墙钟强停只 stop 不 remove（_wall_guard:722）→ 容器仍在，get_archive 可用
+    ——这正是 vllm 案例可救的技术前提。
+    归档后仍照旧 stop/remove 容器 → 不泄漏磁盘。
+    产物非空校验：归档树里没有真实产物 → 视为没编出来，compiled_ok 保持 False。
+    """
+    if container is None:
+        return False
+    if state.get("status") == "cancelled":   # cancelled 不在 TaskStatus 枚举里（用户主动取消是裸 str）
+        # 取消=用户主动放弃，抢救产物无意义且占磁盘（2026-11-02 拍板：只有 failed 才保留）
+        _log(state, "info", "[阶段6] 任务已取消，不保留产物", on_log)
+        return False
+    try:
+        artifacts_dir = Path(state.get("work_dir", "")) / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        chunks, _ = container.get_archive(state["output_dir"])
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
+                for chunk in chunks:
+                    tmp.write(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+                tmp_path = tmp.name
+            from app.services import safe_extract
+            safe_extract.safe_extract_tar(tmp_path, artifacts_dir)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        # 产物非空校验 + 交付物过滤（排除验证临时物：verify*/.venv 等，双保险）
+        out_dir = artifacts_dir / "output"
+        real = []
+        if out_dir.is_dir():
+            for p in sorted(out_dir.iterdir()):
+                if _is_deliverable_artifact(p.name):
+                    real.append(p)
+                    continue
+                # 命中排除名单的交付物：从归档树里移除（不进下载包）
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        p.unlink()
+                except Exception:
+                    pass
+        if not real:
+            _log(state, "warn", "[阶段6] 失败路径未抢救到可交付产物（output 无有效产物）", on_log)
+            return False
+
+        state["artifacts"] = _manifest_from_host(state.get("work_dir", "")) or []
+        state["compiled_ok"] = True
+        state["artifact_partial"] = True
+        if state.get("verified_ok") is None:
+            state["verified_ok"] = False
+        if state.get("status") == TaskStatus.FAILED.value and not state.get("last_error"):
+            state["last_error"] = "编译已完成但验证未通过/中断（产物已保留，可下载排查）"
+
+        # 同样打 tar.gz（下载端点直接返它）
+        bundle_path = artifacts_dir.parent / f"{artifacts_dir.name}.tar.gz"
+        try:
+            with tarfile.open(bundle_path, "w:gz") as tar:
+                tar.add(artifacts_dir, arcname=artifacts_dir.name)
+            state["bundle_size"] = bundle_path.stat().st_size
+        except Exception as e:
+            _log(state, "warn", f"[阶段6] 部分产物打包失败（下载时将实时打包）: {e}", on_log)
+
+        _log(state, "success",
+             f"[阶段6] 已保留未验证产物: {len(real)} 项（编译成功但验证未通过/中断，可下载）", on_log)
+        return True
+    except Exception as e:
+        _log(state, "warn", f"[阶段6] 失败路径产物抢救失败: {e}", on_log)
+        return False
+
+
 def _rescue_build_notes(state: TaskState, container, on_log=None) -> None:
     """BUILD_NOTES 落定到任务目录固定路径（与 build.log 同级，供工单/经验流消费）。
     成功任务：从 stage6 归档产物树拷；失败任务：容器将删，单独 get_archive 抢救。
@@ -918,21 +1117,27 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
             # 清单以宿主机归档树为准（与 tar 同源可对账；容器 find 仅前中期过程视图）
             _mf = _manifest_from_host(state.get("work_dir", ""))
             if _mf is not None:
-                state["artifacts"] = _mf
-                _log(state, "info", f"[阶段6] 产物清单(宿主机对账): {len(_mf)} 项（目录折叠）", on_log)
+                # 归档侧过滤（2026-11-02 拍板③）：验证临时物不进交付清单
+                _mf_f = [x for x in _mf if _is_deliverable_artifact(x.get("name") or "")]
+                state["artifacts"] = _mf_f
+                _log(state, "info", f"[阶段6] 产物清单(宿主机对账): {len(_mf_f)} 项（目录折叠，已排验证临时物）", on_log)
             # BUILD_NOTES 落定固定路径（从归档树拷）
             _rescue_build_notes(state, None, on_log)
         except Exception as e:
             _log(state, "warn", f"[阶段6] 产物归档失败: {e}", on_log)
     else:
-        # 非 success（failed/cancelled）：容器马上被删，先抢救 BUILD_NOTES（工单流原料）
+        # 非 success（failed/cancelled）：容器马上被删——但产物可能已经编出来了！
+        # 2026-11-02 vllm 案例：wheel +4068s 已产出，验证烧 6800s 后墙钟强停，
+        # 产物随容器删除全丢（用户只看到"编译失败"）。现在：有产物就归档。
+        # 顺序不可颠倒：抢救 → 打 tar → 才 stop/remove 容器。
         _fail_c = None
         try:
             if state.get("container_id"):
                 _fail_c = cli.containers.get(state["container_id"])
         except Exception:
             _fail_c = None
-        _rescue_build_notes(state, _fail_c, on_log)
+        _archive_partial_artifacts(state, _fail_c, on_log)
+        _rescue_build_notes(state, _fail_c, on_log)   # BUILD_NOTES 可能在 output 外，单独抢救
 
     if state.get("container_id"):
         try:

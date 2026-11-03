@@ -175,6 +175,11 @@ class CompileTask(Base):
     completed_at = Column(DateTime)
     # 软删（admin 删除功能 2026-10-30）：行保留、外键零破坏；purge 才清磁盘/容器
     deleted_at = Column(DateTime)
+    # 阶段5 子阶段（2026-11-02）：编译/验证分段——编译成功但验证失败时产物仍保留可下载
+    compiled_ok = Column(Boolean, default=False)      # 5-编译 子阶段是否绿
+    verified_ok = Column(Boolean, default=False)      # 5-验证 子阶段是否绿
+    artifact_partial = Column(Boolean, default=False)  # 产物=未验证半成品（下载需标注）
+    phase_state = Column(Text)                        # JSON：子阶段快照（只存 5-compile/5-verify）
     duration_seconds = Column(Integer)
 
     # 关系
@@ -374,6 +379,14 @@ def ensure_softdelete_columns():
     _safe_add_column("tickets", "deleted_at", "TIMESTAMP")
 
 
+def ensure_stage5_phase_columns():
+    """阶段5 子阶段四列幂等 DDL（2026-11-02；存量行默认 false/null=未分段，不回填）"""
+    _safe_add_column("compile_tasks", "compiled_ok", "BOOLEAN DEFAULT FALSE")
+    _safe_add_column("compile_tasks", "verified_ok", "BOOLEAN DEFAULT FALSE")
+    _safe_add_column("compile_tasks", "artifact_partial", "BOOLEAN DEFAULT FALSE")
+    _safe_add_column("compile_tasks", "phase_state", "TEXT")
+
+
 def _relax_auditlog_user_notnull():
     """T10：存量 audit_logs.user_id 解 NOT NULL（超出 _safe_add_column 能力的已有列约束变更，
     显式幂等 SQL；PG 对已 nullable 是 no-op）"""
@@ -427,6 +440,7 @@ def init_db():
     # T10 操作审计（2026-10-27）：存量库幂等三段——新库由 create_all 成型，这里全 no-op
     _safe_add_column("audit_logs", "target_key", "VARCHAR(100)")
     ensure_softdelete_columns()
+    ensure_stage5_phase_columns()
     _relax_auditlog_user_notnull()
     _ensure_audit_indexes()
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
