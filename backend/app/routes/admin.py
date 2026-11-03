@@ -634,6 +634,13 @@ async def list_skills(
     return ApiResponse(data=data)
 
 
+@router.get("/llm/stats", response_model=ApiResponse)
+async def llm_stats():
+    """LLM 模型池状态（2026-11-03）：限流/切换可观测——谈提额与排障的唯一数据源。"""
+    from app.services.llm_client import llm_stats as _stats
+    return ApiResponse(data=_stats())
+
+
 @router.post("/skills", response_model=ApiResponse)
 async def create_skill(
     skill_data: SkillCreate,

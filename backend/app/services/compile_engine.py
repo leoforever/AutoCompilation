@@ -42,6 +42,7 @@ from app.services.skill_loader import get_skills_paths, SKILLS_DIR_HOST, SKILLS_
 # C-3（2026-10-26）：三件套单源归 config.py（此前本文件与 experience_generator 各
 # 一份拷贝、带同一个 agnes 死默认，已删）；消费点函数名保持本地别名零改动
 from app.config import ai_model as _ai_model, ai_api_key as _ai_api_key, ai_base_url as _ai_base_url
+from app.services.llm_client import LlmThrottledError
 
 def _max_retries() -> int:
     return int(get_cfg("compile.max_retries", 4, env_alias="MAX_RETRIES"))
@@ -578,13 +579,10 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
         _log(state, "error", state["last_error"], on_log)
         return state
 
-    from langchain_openai import ChatOpenAI
-    llm = ChatOpenAI(
-        model=_ai_model(),
-        api_key=api_key,
-        base_url=_ai_base_url() or None,
-        temperature=0.1,
-    )
+    # LLM 统一入口（2026-11-03）：共享节流闸 + 429 阶梯退避 + 模型池兜底
+    # （设计档 references/llm-multimodel-throttle-design-20261103.md）
+    from app.services.llm_client import make_llm
+    llm = make_llm(temperature=0.1, call_site="compile.stage5")
 
     # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
     _skills_paths = get_skills_paths()
@@ -1483,6 +1481,31 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
 
         _summary()
         return _persist_and_return(db, task, state)
+    except LlmThrottledError as e:
+        # LLM 限流（429）退避耗尽：人话文案 + 审计留痕（2026-11-03）
+        # 与"代码编译失败"严格区分——用户不该以为自己的代码有问题
+        from app.services.llm_client import LlmThrottledError, THROTTLE_MSG
+        state["status"] = TaskStatus.FAILED.value
+        state["last_error"] = (f"{THROTTLE_MSG}（已等待 {e.waited:.0f}s，尝试 {e.attempts} 次"
+                               f"，模型 {e.slot_id or '-'}）")
+        _log(state, "error", f"[run_task] {state['last_error']}", on_log)
+        try:
+            from app.services.audit import log_audit
+            log_audit(db, user_id=(task.user_id if task else None),
+                      action="llm_throttled", target_type="compile_task",
+                      target_id=(task.id if task else None),
+                      target_key=(task.task_id if task else None),
+                      details=f"call_site={e.call_site},slot={e.slot_id},"
+                              f"waited={e.waited:.0f}s,attempts={e.attempts}")
+            db.commit()
+        except Exception as _ae:
+            _log(state, "warn", f"[run_task] llm_throttled 审计写入失败: {_ae}", on_log)
+        try:
+            stage6_cleanup(state, on_log)
+        except Exception:
+            pass
+        _summary()
+        return _persist_and_return(db, task, state)
     except Exception as e:
         state["status"] = TaskStatus.FAILED.value
         state["last_error"] = f"{type(e).__name__}: {e}"
@@ -1533,14 +1556,12 @@ def _summarize_log_for_ticket(software_name: str, task_status: str, log_tail: st
         return fallback_title, fallback_summary, fallback_desc
 
     try:
-        from langchain_openai import ChatOpenAI
         from langchain_core.messages import HumanMessage, SystemMessage
-        llm = ChatOpenAI(
-            model=_ai_model(),
-            api_key=_ai_api_key(),
-            base_url=_ai_base_url() or None,
+        from app.services.llm_client import make_llm
+        llm = make_llm(
             temperature=0.0,  # 总结任务要确定
             max_tokens=2048,  # 思考型模型 reasoning 吃预算，600 实测 content 空→静默回退模板（2026-10-21 同 2048 病根）
+            call_site="compile.summary",
         )
         # 日志太长截断（保险）
         log_for_llm = log_tail[-6000:] if len(log_tail) > 6000 else log_tail

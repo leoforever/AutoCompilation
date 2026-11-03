@@ -39,6 +39,38 @@ auth:
   allow_self_register: false  # 自助注册开关（env ALLOW_SELF_REGISTER=1 可开）
   reconcile_auto: true        # 对账自愈开关（env RECONCILE_AUTO=0 可关）
 
+llm:                          # LLM 调用治理（2026-11-03；设计档 references/llm-multimodel-throttle-design-20261103.md）
+  # 全局限流参数（各模型可用 llm.models 里的同名字段覆盖）
+  max_concurrent: 2            # 同时在飞的 LLM HTTP 请求数（worker=8 → 聚合压到 1/4）
+  min_interval_ms: 1500        # 相邻请求放行最小间隔（毫秒，预约制实现）
+  throttle_retries: 3          # 429 退避重放次数（不含首次）
+  throttle_backoff: "30,60,120"  # 阶梯退避秒数；与 Retry-After 取大
+  throttle_max_wait: 300       # 单次调用累计等待上限（秒）；超过放弃并报限流
+  circuit_threshold: 3         # 连续 N 次限流/失败 → 熔断该模型
+  circuit_cooldown: 120        # 熔断持续秒数
+  # 模型池（有序=优先级，第一个=主模型；不配则用 AI_MODEL/AI_BASE_URL/AI_API_KEY 造单模型池）
+  # 2026-11-03 双模型真开：主 MiniMax（M3.1-Flash）+ 备 Qwen（qwen3.8-flash，跨厂商→配额池独立，
+  # 主模型被限流时自动接手）。密钥只存 .env.compile（不入 git），yaml 只引用变量名。
+  models:
+    - id: minimax-m31
+      provider: openai_compatible     # openai_compatible | anthropic | google_genai
+      model: MiniMax-M3.1-Flash
+      base_url: https://api.minimaxi.com/v1
+      api_key_env: AI_API_KEY         # 密钥只走 env，不进 yaml
+      enabled: true
+      priority: 1
+      max_concurrent: 2               # 该模型自己的配额池上限（覆盖全局）
+      min_interval_ms: 1500
+    - id: qwen-flash
+      provider: openai_compatible
+      model: qwen3.8-flash
+      base_url: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1
+      api_key_env: AI_ALT_API_KEY
+      enabled: true
+      priority: 2
+      max_concurrent: 2
+      min_interval_ms: 1500
+
 stage5:                       # agent 编译阶段闸门
   max_seconds: 10800          # 阶段总墙钟（秒），勿低于 3600：torch 实测 3064s
   max_chunks: 500             # 死循环保险：工具调用 chunk 总量上限

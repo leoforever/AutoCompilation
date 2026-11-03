@@ -268,29 +268,42 @@ def _validate_draft(content: str) -> tuple[bool, str]:
 # ==================== LLM 调用 ====================
 
 def _call_llm(system: str, user: str, temperature: float = 0.3,
-              max_tokens: int | None = None) -> str:
+              max_tokens: int | None = None, call_site: str = "",
+              response_json: bool = False) -> str:
     """调 LLM，返回文本输出。无 key 则抛 RuntimeError
 
     max_tokens：输出上限。思考型模型（reasoning token 计入输出预算）写长文档时
     2048 会被 reasoning 吃光导致 content 为空——攻略生成用更大值。
     """
-    from langchain_openai import ChatOpenAI  # lazy：避免 module-load 时拉无关依赖
+    from app.services.llm_client import make_llm  # lazy：避免 module-load 时拉无关依赖
 
     key = _ai_api_key()
     if not key:
         raise RuntimeError("AI_API_KEY 未配置（请检查后端环境变量）")
 
-    llm = ChatOpenAI(
-        model=_ai_model(),
-        api_key=key,
-        base_url=_ai_base_url() or None,
+    # call_site 可区分调用方（QA 传 qa.ask，草稿传 exp.draft）——限流审计用
+    llm = make_llm(
         temperature=temperature,
-        max_completion_tokens=max_tokens or _MAX_TOKENS,
+        max_tokens=max_tokens or _MAX_TOKENS,
+        call_site=call_site or "exp.draft",
     )
-    resp = llm.invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=user),
-    ])
+    # response_json：JSON mode（OpenAI 兼容协议专有 kwarg，11-03 实测 MiniMax/Qwen
+    # 均支持——服务端约束输出合法 JSON，思考模型"未按 schema 输出"的根治法）。
+    # 能力探测式：TypeError/ValueError=该 provider 不认此参数 → 降级裸调用，
+    # 由系统帧的 JSON 指令 + _parse_out 宽容解析兜底（不硬编码模型清单，防漂移）
+    msgs = [SystemMessage(content=system), HumanMessage(content=user)]
+    if response_json:
+        # JSON mode 硬要求 messages 里出现 "json" 字样（部分 provider 直接报错）；
+        # 系统帧含"严格 JSON"但保守起见在 user 前再钉一句（幂等无害）
+        if "json" not in user.lower():
+            user = "请以 JSON 对象回答。\n" + user
+        msgs = [SystemMessage(content=system), HumanMessage(content=user)]
+        try:
+            resp = llm.invoke(msgs, response_format={"type": "json_object"})
+        except (TypeError, ValueError):
+            resp = llm.invoke(msgs)
+    else:
+        resp = llm.invoke(msgs)
     # ChatOpenAI 返回 AIMessage，content 可能是 str 或 list
     content = resp.content
     if isinstance(content, list):

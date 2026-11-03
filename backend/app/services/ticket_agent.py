@@ -433,13 +433,8 @@ class TicketAgentManager:
 
         # 5) 启动 DeepAgent（接单时一次 Skills 注入）
         phase_cb("init_llm", f"初始化 LLM client ({_ai_model()})...")
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model=_ai_model(),
-            api_key=_ai_api_key(),
-            base_url=_ai_base_url() or None,
-            temperature=0.1,
-        )
+        from app.services.llm_client import make_llm
+        llm = make_llm(temperature=0.1, call_site="ticket.agent")
         # 接管 mkdir 容器内 .patches/（记录修改）
         backend.execute("mkdir -p /work/.patches")
 
