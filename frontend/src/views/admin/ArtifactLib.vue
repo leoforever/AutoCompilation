@@ -6,9 +6,7 @@
       <div class="disk-row">
         <span>磁盘已用 <b>{{ disk.root_used_pct }}%</b>（剩 {{ disk.root_free_gb }}GB，警戒线 {{ disk.warn_pct }}%）</span>
         <el-divider direction="vertical" />
-        <span>交付区 artifacts {{ disk.artifacts_mb }}MB</span>
-        <el-divider direction="vertical" />
-        <span>复用货架 cache <b>{{ disk.cache_mb }}MB</b></span>
+        <span>在架货架 <b>{{ disk.shelf_count }}</b> 件 / {{ disk.cache_mb }}MB（账本口径）</span>
         <el-tag v-if="disk.warn" type="warning" size="small" style="margin-left:10px">接近警戒线：请在本页决定去留（平台不会自动删货架）</el-tag>
         <span class="spacer" />
         <el-button v-if="isAdmin" size="small" :loading="reindexing" @click="doReindex">账本对账</el-button>
@@ -195,7 +193,7 @@ const showDeleted = ref(false)
 const loading = ref(false)
 const pendingCount = ref(0)
 const systems = ref<any[]>([])
-const disk = reactive<any>({ root_used_pct: '-', root_free_gb: '-', artifacts_mb: '-', cache_mb: '-', warn: false, warn_pct: 85 })
+const disk = reactive<any>({ root_used_pct: '-', root_free_gb: '-', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
 
 const cur = ref<any>(null)
 const detailVisible = ref(false)

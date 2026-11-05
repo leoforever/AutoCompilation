@@ -451,47 +451,26 @@ def _is_deliverable(name: str) -> bool:
 
 
 # ── 磁盘简报（P3：只报不删，11-03 拍板）───────────────────────────
-_disk_cache: dict = {"t": 0.0, "data": None}
-
-
-def disk_report(ttl: float = 60.0) -> dict:
-    """磁盘简报（60s TTL 缓存：分钟级变化数据，连续开页不重复遍历——
-    11-05 .209 案：大 artifacts 树 rglob 数十秒，调用方必须 to_thread，
-    本缓存只是第二道；ttl=0 强制实时）。"""
-    import time as _t
-    now = _t.monotonic()
-    if ttl and _disk_cache["data"] is not None and now - _disk_cache["t"] < ttl:
-        return _disk_cache["data"]
+def disk_report(db) -> dict:
+    """磁盘简报 c 方案（11-05 拍板"不用那么准"）：statvfs + 账本 SUM，零遍历。
+    - 分区用量：O(1) 系统调用，告警主功能（85% 线）与本函数耗时无关
+    - 货架合计：账本口径（approved∪存量 ∧未软删∧cache_path）——与页面所见一致，
+      且"唯一写库通道"纪律下不走通道的文件本就不算货架；不再 rglob 猜盘上实况
+    artifacts 交付区汇总数字退役（中间物归 7/90 天钟与单任务逐项 size，无人依赖此数）"""
     import shutil as _sh
     du = _sh.disk_usage("/")
     pct = round(du.used / du.total * 100, 1)
-    def _dir_mb(p: Path) -> int:
-        if not p.is_dir():
-            return 0
-        total = 0
-        for f in _walk_files(p):
-            try:
-                total += f.stat().st_size
-            except OSError:
-                pass
-        return total // (1024 * 1024)
-    from app.config import artifacts_dir
-    art = artifacts_dir()
+    from sqlalchemy import func
+    from app.models import ArtifactIndex
+    cnt, total = db.query(func.count(ArtifactIndex.id),
+                          func.coalesce(func.sum(ArtifactIndex.size_bytes), 0)).filter(
+        ArtifactIndex.deleted_at.is_(None),
+        ArtifactIndex.status.in_(("approved", "")),
+        ArtifactIndex.cache_path != "").one()
     warn = int(get_cfg("artifact_cache.disk_warn_pct", 85))
-    data = {"root_used_pct": pct, "root_free_gb": round(du.free / 2**30, 1),
-            "artifacts_mb": _dir_mb(art), "cache_mb": _dir_mb(cache_root()),
+    return {"root_used_pct": pct, "root_free_gb": round(du.free / 2**30, 1),
+            "shelf_count": int(cnt), "cache_mb": int(total) // (1024 * 1024),
             "warn": pct >= warn, "warn_pct": warn}
-    _disk_cache["t"] = now
-    _disk_cache["data"] = data
-    return data
-
-
-def _walk_files(p: Path):
-    """容错遍历（坏文件跳过，不因一个 lstat 炸整个简报）。"""
-    try:
-        yield from (x for x in p.rglob("*") if x.is_file())
-    except OSError:
-        return
 
 
 # ── 期二：容器挂载构造（stage3 调；独立成函数=可单测 ro/rw/降级）──────────

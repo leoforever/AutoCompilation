@@ -2643,12 +2643,11 @@ async def list_artifacts(
 
 
 @router.get("/artifacts/disk", response_model=ApiResponse)
-async def artifacts_disk(current_user: User = Depends(get_current_user)):
-    """磁盘简报（P3：只报不删，11-03 拍板）。"""
+async def artifacts_disk(db: Session = Depends(get_db),
+                         current_user: User = Depends(get_current_user)):
+    """磁盘简报（P3：只报不删，11-03 拍板；c 方案：statvfs+账本 SUM 零遍历）。"""
     from app.services.artifact_lib import disk_report
-    import asyncio as _aio
-    # 同步 rglob 遍历挪工作线程（11-05 .209 案：事件循环里裸跑=冻结全站 API）
-    return ApiResponse(data=await _aio.to_thread(disk_report))
+    return ApiResponse(data=disk_report(db))
 
 
 @router.post("/artifacts/upload", response_model=ApiResponse)
