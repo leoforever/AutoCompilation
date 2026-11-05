@@ -2278,7 +2278,8 @@ async def force_cleanup_ticket_agent(
         try:
             work_path = _Path(rec.work_dir)
             if work_path.exists():
-                shutil.rmtree(work_path, ignore_errors=True)
+                import asyncio as _aio
+                await _aio.to_thread(shutil.rmtree, str(work_path), True)
         except Exception as e:
             print(f"[force-cleanup] 删 work_dir 异常: {e}")
         rec.work_dir = None
@@ -2509,7 +2510,8 @@ async def delete_compile_task(
     linked = soft_delete_task(db, task)          # 恒为 CompileTask（R 系）
     purged = []
     if purge:
-        purged = _purge_task_artifacts([task] + linked)
+        import asyncio as _aio
+        purged = await _aio.to_thread(_purge_task_artifacts, [task] + linked)
     log_audit(db, user_id=current_user.user_id, action="task_deleted", target_type="compile_task",
               target_id=task.id, target_key=task.task_id, request=request,
               details=f"purge={purge}, cascade_R={len(linked)}, purged={purged}")
@@ -2542,7 +2544,8 @@ async def delete_ticket(
         main_task = db.query(CompileTask).filter(CompileTask.id == ticket.task_id).first()
         purge_set = ([main_task] if main_task is not None else []) + \
             [t for t in linked_tasks if isinstance(t, CompileTask)]
-        purged = _purge_task_artifacts(purge_set, ticket_id=ticket_id)
+        import asyncio as _aio
+        purged = await _aio.to_thread(_purge_task_artifacts, purge_set, ticket_id=ticket_id)
     log_audit(db, user_id=current_user.user_id, action="ticket_deleted", target_type="ticket",
               target_id=ticket.ticket_id, target_key=f"#{ticket_id}", request=request,
               details=f"purge={purge}, cascade_tasks={len(linked_tasks) + 1}, purged={purged}")
@@ -2643,7 +2646,9 @@ async def list_artifacts(
 async def artifacts_disk(current_user: User = Depends(get_current_user)):
     """磁盘简报（P3：只报不删，11-03 拍板）。"""
     from app.services.artifact_lib import disk_report
-    return ApiResponse(data=disk_report())
+    import asyncio as _aio
+    # 同步 rglob 遍历挪工作线程（11-05 .209 案：事件循环里裸跑=冻结全站 API）
+    return ApiResponse(data=await _aio.to_thread(disk_report))
 
 
 @router.post("/artifacts/upload", response_model=ApiResponse)

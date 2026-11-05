@@ -451,7 +451,17 @@ def _is_deliverable(name: str) -> bool:
 
 
 # ── 磁盘简报（P3：只报不删，11-03 拍板）───────────────────────────
-def disk_report() -> dict:
+_disk_cache: dict = {"t": 0.0, "data": None}
+
+
+def disk_report(ttl: float = 60.0) -> dict:
+    """磁盘简报（60s TTL 缓存：分钟级变化数据，连续开页不重复遍历——
+    11-05 .209 案：大 artifacts 树 rglob 数十秒，调用方必须 to_thread，
+    本缓存只是第二道；ttl=0 强制实时）。"""
+    import time as _t
+    now = _t.monotonic()
+    if ttl and _disk_cache["data"] is not None and now - _disk_cache["t"] < ttl:
+        return _disk_cache["data"]
     import shutil as _sh
     du = _sh.disk_usage("/")
     pct = round(du.used / du.total * 100, 1)
@@ -468,9 +478,12 @@ def disk_report() -> dict:
     from app.config import artifacts_dir
     art = artifacts_dir()
     warn = int(get_cfg("artifact_cache.disk_warn_pct", 85))
-    return {"root_used_pct": pct, "root_free_gb": round(du.free / 2**30, 1),
+    data = {"root_used_pct": pct, "root_free_gb": round(du.free / 2**30, 1),
             "artifacts_mb": _dir_mb(art), "cache_mb": _dir_mb(cache_root()),
             "warn": pct >= warn, "warn_pct": warn}
+    _disk_cache["t"] = now
+    _disk_cache["data"] = data
+    return data
 
 
 def _walk_files(p: Path):
