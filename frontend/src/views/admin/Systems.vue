@@ -19,7 +19,10 @@
       <el-table :data="filteredSystems" stripe style="width: 100%" v-loading="loading">
         <el-table-column type="index" label="#" width="56" />
         <el-table-column prop="name" label="系统名称" min-width="200" />
-        <el-table-column label="编译镜像" min-width="280">
+                <el-table-column label="glibc 基线" width="100">
+          <template #default="{ row }">{{ row.glibc_version || '—' }}</template>
+        </el-table-column>
+<el-table-column label="编译镜像" min-width="280">
           <template #default="{ row }">
             <code class="img-code">{{ row.base_image }}</code>
           </template>
@@ -59,6 +62,9 @@
           <el-input v-model="form.name" placeholder="如：openEuler 24.03 LTS" />
           <div class="form-hint">用户提交编译时从这个下拉选，唯一</div>
         </el-form-item>
+        <el-form-item label="glibc 基线">
+          <el-input v-model="form.glibc_version" placeholder="如：2.38（公共池配给判据，可留空）" />
+        </el-form-item>
         <el-form-item label="编译镜像" prop="base_image">
           <el-input v-model="form.base_image" placeholder="如：loongnix-build:23.2" />
           <div class="form-hint">完整镜像名（含 tag）。worker 会 docker pull 这个镜像</div>
@@ -94,6 +100,7 @@ const form = ref({
   system_id: null as number | null,
   name: '',
   base_image: '',
+  glibc_version: '',
   is_active: true,
 })
 
@@ -134,6 +141,7 @@ function editSystem(s: any) {
     system_id: s.system_id,
     name: s.name,
     base_image: s.base_image,
+    glibc_version: s.glibc_version || '',
     is_active: s.is_active,
   }
   dialogVisible.value = true
@@ -144,6 +152,7 @@ function resetForm() {
     system_id: null,
     name: '',
     base_image: '',
+    glibc_version: '',
     is_active: true,
   }
   formRef.value?.clearValidate()
@@ -161,6 +170,7 @@ async function saveSystem() {
       await api.put(`/admin/systems/${form.value.system_id}`, {
         name: form.value.name,
         base_image: form.value.base_image,
+        glibc_version: form.value.glibc_version || '',   // 每次显式带（空串=清空基线）
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已更新')
@@ -168,6 +178,7 @@ async function saveSystem() {
       await api.post('/admin/systems', {
         name: form.value.name,
         base_image: form.value.base_image,
+        glibc_version: form.value.glibc_version || '',
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已创建')

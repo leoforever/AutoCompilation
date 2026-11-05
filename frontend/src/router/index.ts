@@ -71,6 +71,13 @@ const router = createRouter({
       meta: { requiresAuth: true, role: 'admin' }
     },
     {
+      path: '/admin/artifacts',
+      name: 'artifactlib',
+      component: () => import('@/views/admin/ArtifactLib.vue'),
+      // 拍板6：产物库全体登录用户可见可查（管理动作页内按角色控制）——role 不设
+      meta: { requiresAuth: true }
+    },
+    {
       path: '/admin/systems',
       name: 'systems-admin',
       component: () => import('@/views/admin/Systems.vue'),

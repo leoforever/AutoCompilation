@@ -1,7 +1,7 @@
 """
 Database models for LoongArch Compile Platform
 """
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Index
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Index, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -135,12 +135,47 @@ class User(Base):
     audit_logs = relationship("AuditLog", back_populates="user")
 
 
+
+class ArtifactIndex(Base):
+    """产物复用库账本（P1，11-03 总设计 §2）：行=一个可复用文件。
+    AI 永不接触本表（AI 只读 /work/cache 与 INDEX.md）；hits/last_used_at
+    由引擎扫命令被动记账；库的生死归管理员（无自动逐出，11-03 拍板）。
+    status：pending=待晋升(等审批) approved=在架 rejected=驳回留痕 ""=存量/上传直入。"""
+    __tablename__ = "artifact_index"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), index=True)              # 货架文件名（带版本，命名规则见总档§5）
+    name_norm = Column(String(200), index=True)         # 归一软件名（匹配/目录键）
+    version = Column(String(100), default="")
+    system_id = Column(Integer, index=True)             # 复用必须同系统（分池第一道隔离）
+    kind = Column(String(20), default="other")          # whl/tgz/rpm/binary/node_binding/so/a/tool
+    origin = Column(String(10), default="task")         # task=晋升 | upload=管理员
+    status = Column(String(12), default="")             # pending|approved|rejected|""
+    source_task_id = Column(Integer, nullable=True)
+    source_task_key = Column(String(50), default="")
+    uploader = Column(String(50), default="")
+    build_env = Column(Text, default="")                # meta.toolchain JSON（ABI 决策依据）
+    image = Column(String(200), default="")
+    cache_path = Column(String(400), default="")        # approved 后相对 cache 根；pending 空
+    size_bytes = Column(BigInteger, default=0)
+    glibc_requires = Column(String(20), default="")   # 运行需求下限（入库时 objdump 机提，不信自报；公共池配给判据）
+    hits = Column(Integer, default=0)
+    views = Column(Integer, default=0)               # 查阅计数（cat/ls/tar -t；与 hits=消费分开，11-04 拍板）
+    last_used_at = Column(DateTime, nullable=True)
+    source_commit = Column(String(64), default="")   # 身份钉①：产出货的源码 commit（晋升自 state）
+    sha256 = Column(String(64), default="")          # 身份钉②：平台自算文件指纹（不信 AI 自报；审批复核）
+    note = Column(String(300), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)   # 全链 naive UTC 纪律
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class TargetSystem(Base):
     __tablename__ = "target_systems"
 
     system_id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), unique=True, nullable=False)  # 如：openEuler 24.03 LTS
     base_image = Column(String(255), nullable=False)  # Docker/Podman 镜像（不含 tag）
+    glibc_version = Column(String(20), default="")    # 系统 glibc 基线（11-05 公共池配给闸：SP2=2.38 等，管理员填）
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -158,6 +193,8 @@ class CompileTask(Base):
     software_name = Column(String(100), nullable=False)
     source_type = Column(String(20), nullable=False)
     source_path = Column(String(255))
+    # 上传源码包指纹（upload 路身份链，11-04 拍板）：落盘即算，"产物=哪包编的"硬证
+    source_sha256 = Column(String(64), default="")
     git_url = Column(String(500))
     git_branch = Column(String(100))
     build_args = Column(Text)  # JSON 字符串
@@ -379,6 +416,17 @@ def ensure_softdelete_columns():
     _safe_add_column("tickets", "deleted_at", "TIMESTAMP")
 
 
+def ensure_artifact_identity_columns():
+    """产物账本身份/查用列（11-04 补刀：commit+sha256 硬钉、views 与 hits 分账）"""
+    _safe_add_column("artifact_index", "source_commit", "VARCHAR(64) DEFAULT ''")
+    _safe_add_column("artifact_index", "sha256", "VARCHAR(64) DEFAULT ''")
+    _safe_add_column("artifact_index", "views", "INTEGER DEFAULT 0")
+    _safe_add_column("compile_tasks", "source_sha256", "VARCHAR(64) DEFAULT ''")
+    # 公共池三层闸（11-05 用户指出"SP2 产物老 Loongnix 跑不了"后的配给设计）
+    _safe_add_column("target_systems", "glibc_version", "VARCHAR(20) DEFAULT ''")
+    _safe_add_column("artifact_index", "glibc_requires", "VARCHAR(20) DEFAULT ''")
+
+
 def ensure_stage5_phase_columns():
     """阶段5 子阶段四列幂等 DDL（2026-11-02；存量行默认 false/null=未分段，不回填）"""
     _safe_add_column("compile_tasks", "compiled_ok", "BOOLEAN DEFAULT FALSE")
@@ -441,6 +489,7 @@ def init_db():
     _safe_add_column("audit_logs", "target_key", "VARCHAR(100)")
     ensure_softdelete_columns()
     ensure_stage5_phase_columns()
+    ensure_artifact_identity_columns()
     _relax_auditlog_user_notnull()
     _ensure_audit_indexes()
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）

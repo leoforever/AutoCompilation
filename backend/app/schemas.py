@@ -67,11 +67,13 @@ class TargetSystemCreate(BaseModel):
     # 镜像（不含 tag，admin 写完整 image:tag 字符串，如 loongnix-build:23.2）
     # 默认值给老数据迁移兜底（init_db seed 走老 path 时不写也会用默认）
     base_image: str = Field(default="loongnix-build:23.2", min_length=1)
+    glibc_version: str = Field(default="", max_length=20)   # 11-05 公共池配给基线（SP2=2.38）
 
 
 class TargetSystemUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     base_image: Optional[str] = Field(None, min_length=1)
+    glibc_version: Optional[str] = Field(None, max_length=20)   # 空串=显式清空基线
     is_active: Optional[bool]
 
 
@@ -80,6 +82,7 @@ class TargetSystemResponse(BaseModel):
     system_id: int
     name: str
     base_image: str
+    glibc_version: str = ""
     is_active: bool
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -153,7 +156,7 @@ class CompileTaskResponse(BaseModel):
     # matched_skills 列是 Text（JSON 字符串 list[str]，2026-10-20 起落 agent 实际读过的 SKILL.md 名单）
     # 声明成 dict 会在非空值时 Pydantic 校验 500——用 str，前端 JSON.parse
     matched_skills: Optional[str]
-    depend_tree: Optional[dict]
+    depend_tree: Optional[dict]   # ORM 为 Text 存 JSON str；validator 出参对齐 dict（11-04 血缘首次写值暴露）
     artifact_path: Optional[str]
     bundle_size: Optional[int] = None  # artifacts.tar.gz 真实字节数=下载传输量（非 ORM 列，路由注入）
     # 阶段5 子阶段（2026-11-02）：编译/验证分段 + 未验证产物标记
@@ -161,6 +164,19 @@ class CompileTaskResponse(BaseModel):
     verified_ok: bool = False
     artifact_partial: bool = False
     phase_state: Optional[str]
+
+    @field_validator("depend_tree", mode="before")
+    @classmethod
+    def _parse_depend_tree(cls, v):
+        """ORM Text 列存 JSON 字符串；出参契约保持 dict（str 直喂 dict 字段=11-04 任务列表 500 事故）。
+        坏 JSON 返回 None 不炸——血缘是可观测数据，解析失败不该拖垮整个列表页。"""
+        if isinstance(v, str):
+            import json as _j
+            try:
+                return _j.loads(v)
+            except ValueError:
+                return None
+        return v
     error_message: Optional[str]
     created_at: datetime
     started_at: Optional[datetime]

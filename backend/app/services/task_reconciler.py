@@ -12,8 +12,11 @@
 - 每轮结果存 last_result 供 /admin/stats/overview health 字段消费
 """
 import json
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -62,6 +65,75 @@ def _rebuild_artifacts(output_dir: Path) -> list:
             size = sum((Path(dp) / fn).stat().st_size for dp, _, fns in os.walk(item) for fn in fns)
             out.append({"name": item.name, "path": f"/work/output/{item.name}", "size": size})
     return out
+
+
+
+
+# ── P3 保留策略（11-03 总设计 §4；拍板4：自动删仅限这两类中间物，货架永不自动动）──
+def cleanup_intermediates() -> dict:
+    """1) container_work mtime 超 ttl 天且任务非在途 → 整目录删（纯中间物：src clone/
+       构建残留，任何可下载内容不在其中）；
+       2) 成功任务 artifacts.tar.gz 龄 >90 天 → 删 bundle 留树（下载端点本就实时
+       重打包兜底，删包零风险；新任务两份都留，下载秒回）。
+       只删这两类——货架(cache/)、产物树、promote_pending 一律不碰（人工管理）。"""
+    import time
+    import shutil
+    from app.config import get_cfg, artifacts_dir
+    from app.models import CompileTask, TaskStatus, SessionLocal
+    stats = {"container_work": 0, "bundle": 0, "mb_freed": 0}
+    ttl_days = int(get_cfg("artifact_cache.container_work_ttl_days", 7))
+    if ttl_days <= 0:
+        return stats
+    art = artifacts_dir()
+    now = time.time()
+    db = SessionLocal()
+    try:
+        live = {t.task_id for t in db.query(CompileTask).filter(
+            CompileTask.status.in_((TaskStatus.SUBMITTED.value, TaskStatus.COMPILING.value))
+        ).all()}
+        for d in art.iterdir():
+            if not d.is_dir() or d.name in ("sources",):
+                continue
+            tid = d.name
+            cw = d / "container_work"
+            if cw.is_dir() and tid not in live:
+                try:
+                    if now - cw.stat().st_mtime > ttl_days * 86400:
+                        mb = _dir_mb(cw)
+                        shutil.rmtree(cw, ignore_errors=True)
+                        stats["container_work"] += 1
+                        stats["mb_freed"] += mb
+                except OSError:
+                    pass
+            # bundle 90 天瘦身（树在包删；下载走实时重打包兜底）
+            bundle = d / "artifacts.tar.gz"
+            tree = d / "artifacts"
+            if bundle.is_file() and tree.is_dir() and tid not in live \
+               and now - bundle.stat().st_mtime > 90 * 86400:
+                try:
+                    stats["mb_freed"] += bundle.stat().st_size // (1024 * 1024)
+                    bundle.unlink()
+                    stats["bundle"] += 1
+                except OSError:
+                    pass
+        if any((stats["container_work"], stats["bundle"])):
+            logger.info("[cleanup_intermediates] %s", stats)
+    except Exception:
+        logger.exception("[cleanup_intermediates] 异常（不影响对账主流程）")
+    finally:
+        db.close()
+    return stats
+
+
+def _dir_mb(p) -> int:
+    total = 0
+    try:
+        for x in p.rglob("*"):
+            if x.is_file():
+                total += x.stat().st_size
+    except OSError:
+        pass
+    return total // (1024 * 1024)
 
 
 def reconcile_stuck_tasks() -> dict:
@@ -132,4 +204,9 @@ def reconcile_stuck_tasks() -> dict:
     finally:
         db.close()
         last_result = stats
+    # P3 搭对账周期顺风车（main.py sweep_loop 每小时级）；独立异常域
+    try:
+        stats["cleanup"] = cleanup_intermediates()
+    except Exception:
+        logger.exception("[reconcile] cleanup 异常")
     return stats

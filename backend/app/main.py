@@ -164,7 +164,8 @@ async def lifespan(app: FastAPI):
                 # 批2-②（2026-10-26）：纯同步 DB 函数裸跑在事件循环上——DB 打嗝即
                 # 全站冻结（generate-draft 同族病）；搬进线程池
                 rs = await asyncio.to_thread(reconcile_stuck_tasks)
-                if any(k != "at" and v for k, v in rs.items()):
+                if any(k != "at" and (sum(v.values()) if isinstance(v, dict) else v)
+                       for k, v in rs.items()):
                     logger.info(f"[reconcile] 任务对账: {rs}")
             except Exception:
                 logger.exception("[reconcile] 任务对账异常")
@@ -218,7 +219,7 @@ app.add_middleware(
 )
 
 # 导入路由（延迟导入避免循环依赖）
-from app.routes import auth, compile, tickets, experience, admin, notifications, qa, ws
+from app.routes import auth, compile, tickets, experience, admin, notifications, qa, ws, artifacts_public
 from app.models import init_db
 from app.dependencies import require_admin, require_qa_owner
 
@@ -232,6 +233,7 @@ app.include_router(experience.router, prefix="/api/experience", tags=["经验管
 app.include_router(notifications.router, prefix="/api", tags=["通知"])
 app.include_router(qa.router, prefix="/api", tags=["问答台"], dependencies=[Depends(require_qa_owner)])
 # 管理员路由组统一角色守卫（端点级 get_current_user 之上再加一道，漏写的也兜住）
+app.include_router(artifacts_public.router, prefix="/api/artifacts", tags=["产物货架(公开)"])
 app.include_router(admin.router, prefix="/api/admin", tags=["管理员接口"],
                    dependencies=[Depends(require_admin)])
 app.include_router(ws.router, tags=["WebSocket"])

@@ -220,7 +220,7 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             return state
         state["system_name"] = sys_rec.name
         # base_image 是 admin 配置的完整镜像名（含 tag）
-        state["docker_image"] = sys_rec.base_image or DEFAULT_BASE_IMAGE
+        state["docker_image"] = (sys_rec.base_image or DEFAULT_BASE_IMAGE).strip()
         _log(state, "info", f"[阶段2] 环境匹配: {sys_rec.name} (image={state['docker_image']})", on_log)
     finally:
         db.close()
@@ -228,6 +228,45 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 
 
 # ==================== 阶段 3 ====================
+def ensure_image(cli, image: str, state: TaskState, on_log) -> bool:
+    """镜像就位保障（11-04 拍板"配了系统就能用"）：本地无此镜像→自动 docker pull。
+    返回 True=可用。失败不静默——last_error 给人话（含仓库网络提示），不再让
+    invalid reference format 这类底层报错直接糊到用户脸上。
+    长轮询进度按 30s 心跳摘要（GB 级镜像拉取在静默期是正常形态，心跳防误杀）。"""
+    import time as _t
+    try:
+        cli.images.get(image)
+        return True
+    except Exception:
+        pass
+    _log(state, "info", f"[阶段3] 本地无镜像 {image}，开始自动拉取（GB 级可能需数分钟）…", on_log)
+    t0 = _t.time()
+    last_hb = t0
+    try:
+        # 低层 api.pull 才返回进度生成器（高层 images.pull 吞掉 stream 直返 Image——
+        # 11-04 auto-pull 首秀实测：对 Image 迭代 TypeError；官方 docstring 明言
+        # "want raw pull output → low-level API"）
+        repo, _, tag = image.rpartition(":")
+        if not tag:
+            repo, tag = image, "latest"
+        for ev in cli.api.pull(repo, tag=tag, stream=True, decode=True):
+            st = ev.get("status") or ""
+            if "complete" in st.lower() or "Downloaded" in st:
+                _log(state, "info", f"[阶段3]   {st}", on_log)
+            if _t.time() - last_hb >= 30:
+                prog = ev.get("progress") or ""
+                _log(state, "info", f"[阶段3]   拉取中 {int(_t.time()-t0)}s: {st[:60]} {prog[:40]}", on_log)
+                last_hb = _t.time()
+        _log(state, "success", f"[阶段3] 镜像拉取完成: {image} (耗时 {int(_t.time()-t0)}s)", on_log)
+        return True
+    except Exception as e:
+        state["status"] = TaskStatus.FAILED.value
+        state["last_error"] = (f"镜像拉取失败: {image}（{type(e).__name__}: {str(e)[:160]}）"
+                               "——请确认目标系统的镜像名与本机到镜像仓库的网络")
+        _log(state, "error", f"[阶段3] {state['last_error']}", on_log)
+        return False
+
+
 def stage3_create_container(state: TaskState, on_log: Optional[LogCallback] = None,
                              existing_container_id: Optional[str] = None) -> TaskState:
     """阶段 3：建容器 / 复用现有容器
@@ -271,13 +310,19 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback] = No
     try:
         # 镜像名从 stage2 读 DB 拿（admin 在 /admin/systems 配的）
         # state["docker_image"] 一定有值（DB 字段非空 + DEFAULT 兜底）
-        image = state.get("docker_image") or "loongnix-build:23.2"
+        image = (state.get("docker_image") or "loongnix-build:23.2").strip()
         _log(state, "info", f"[阶段3] 使用镜像: {image}", on_log)
+        if not ensure_image(cli, image, state, on_log):
+            return state
         volumes = {
             str(container_work): {"bind": state["container_work_dir"], "mode": "rw"},
         }
         if SKILLS_DIR_HOST.exists():
             volumes[str(SKILLS_DIR_HOST)] = {"bind": SKILLS_DIR_CONTAINER, "mode": "ro"}
+        # 产物复用库挂载（期二 11-04）：/work/cache(ro 系统池)+/work/cache_out(rw 晋升口)
+        # 失败只 warn 降级——复用是增益不是依赖（总设计公理）
+        from app.services.artifact_lib import cache_volumes
+        cache_volumes(state, container_work, volumes, _log)
 
         container = cli.containers.run(
             image,
@@ -632,6 +677,30 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
    验证失败 → [验证失败] <失败原因，一句话>
    验证失败是正常结局，如实写即可——平台会保留已编出的产物供下载，不会丢弃。
 ③ 最终总结段仍按原要求写（含"编译成功"或"编译失败"字样），平台据此判任务终态。
+
+【产物复用】（先查再编，命中即省几十分钟）
+/work/cache 是本目标系统已验证产物的货架（只读），货架全表在 /work/cache/INDEX.md。
+开工探测阶段先 cat 它；**编译/验证任何时刻**缺依赖（whl/tgz/binding/工具链母包等），
+再查它——命中即 cp 到工作目录直接使用，跳过源码编译与网络下载，并在
+货架件也可当**行为基准**用（对照它的 --help/退出码/产物布局来
+校准你的构建与验收，A95824 实测这招省掉了整轮功能试错），但基准≠交付：
+任务要新编的产物必须新编。cache_out 里直接平铺放文件（可带子目录，
+meta 与文件同目录即可），别只放一半；
+BUILD_NOTES.md"复用"节写明用了哪个文件。货架行的『来源标识』列（git:commit 或
+archive:包指纹）是出身硬证：复用前对一下来源与版本——git 源对上游 commit、上传包
+对 archive 指纹（同包=同身份），对不上就重编，宁慢勿错。
+你新编出的可复用产物（binary/tgz/whl/rpm/so 等白名单成品；config.mk 类配置文件、
+验证临时物、日志、脚本不放），收尾前 cp 进 /work/cache_out/。**每个放进来的文件
+都要单独配一个同名 <产物文件名>.meta.json**——放 lsxdemo 就配 lsxdemo.meta.json；
+按软件名合写一份（如 lsx.meta.json）对不上文件号，会整批按"缺 meta"拒收。
+meta 内容照抄这个完整例子改值
+（python3 -c 或 write_file 都行；**toolchain 为空的 meta 必被平台拒收**）：
+  {{"name": "软件名", "version": "1.1.0", "kind": "tgz",
+   "toolchain": {{"node": "v24.22.1", "gcc": "12.3.1", "glibc": "2.38"}}}}
+kind 取 whl/tgz/rpm/binary/node_binding/so/a 之一；toolchain 至少填一项且必须是
+**本机实测值**（node -v / python3 -V / gcc --version / ldd --version 一行抄）——
+这是后续任务判断 ABI/兼容性的唯一依据，编造或留空等于白交。只放成品，
+验证临时物/日志/脚本不放。平台在任务成功后核对门禁并提交管理员审批，通过才上架。
 
 【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
 ① 干净环境安装产物（pip install whl / npm i tgz / 二进制 ldd+file 检查，按产物类型）
@@ -1231,6 +1300,12 @@ def _render_agent_message(msg, state: TaskState, start_ts: float, on_log: Option
             tag = f"[{_cid}]" if _cid else ""
             if tool_name == "execute":
                 preview = f"$ {_truncate(_tool_arg(tool_args, 'command', 'cmd'), 300)}"
+                # 复用命中被动记账（期二）：扫完整命令，state 延后账、run_task 末落库
+                try:
+                    from app.services.artifact_lib import scan_cache_use
+                    scan_cache_use(state, _tool_arg(tool_args, "command", "cmd"))
+                except Exception:
+                    pass
             elif tool_name in ("ls", "read_file"):
                 # deepagents read_file/ls 参数名是 file_path/path 两种都兼容（历史 bug：只取 path 显示空）
                 preview = _tool_arg(tool_args, "file_path", "path") or _truncate(str(tool_args), 120)
@@ -1476,7 +1551,45 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
             _summary()
             return _persist_and_return(db, task, state)
 
+        # 复用货架预备（期二 11-04）：INDEX 与账本对齐 + top15 摘要进 state
+        # （失败静默——AI 自查 INDEX 兜底，摘要只是"睁眼见货架"的便利）
+        # ⚠ commit() 收尾不可省（R2 事故 11-04）：db 是全任务寿命 session，只读块
+        # SELECT 后留事务=idle in transaction 持 compile_tasks 行锁，worker 线程
+        # _periodic_persist 的 UPDATE 永久堵死、agent 开局冻结 31 分钟被看门狗标 failed
+        try:
+            from app.services.artifact_lib import shelf_summary, regenerate_index
+            regenerate_index(db, task.system_id)
+            state["cache_manifest"] = shelf_summary(db, task.system_id)
+            db.commit()
+        except Exception:
+            db.rollback()
+            state["cache_manifest"] = ""
         _fin("阶段5", lambda: stage5_run_agent(state, on_log))
+        # 复用闭环落账（期二）：hits 延后账 + 晋升提取（**stage6 删 container_work 前**）+ 血缘
+        # 本函数是五调用点唯一有 db 句柄的层——stage5/6 无 db，同 skill 命中延后账先例
+        try:
+            from app.services.artifact_lib import flush_hits, extract_promotions
+            from app.config import artifacts_dir as _adir
+            _hitset = state.get("_cache_hits") or set()
+            _viewset = (state.get("_cache_views") or set()) - _hitset
+            _hits = flush_hits(db, task.system_id, _hitset, _viewset)
+            _prom, _rej = extract_promotions(db, task, state, _adir() / task.task_id)
+            if _hits or _prom or _rej or _viewset:   # viewed 也触发（11-05 A95824 只览不编
+                import json as _json                #   时血缘整条 NULL，查不到"它看过货架"）
+                task.depend_tree = _json.dumps(
+                    {"consumed": sorted(_hitset), "promoted": _prom,
+                     "rejected": _rej[:5], "hits_rows": _hits,
+                     "viewed": sorted(_viewset)}, ensure_ascii=False)
+            db.commit()          # 无条件闭合（flush_hits/extract 内部有 add/dirty 都要落地）
+            if _hits:
+                _log(state, "info", f"[阶段5] 复用命中记账：{len(_hitset)} 项货架件被使用", on_log)
+            if _prom:
+                _log(state, "info", f"[阶段5] 晋升候选 {len(_prom)} 件待管理员审批: {_prom}", on_log)
+            if _rej:
+                _log(state, "info", f"[阶段5] 晋升拒收: {_rej}", on_log)
+        except Exception as _ce:
+            db.rollback()        # 异常后必须闭合，否则又留 idle in transaction（R2 同族病）
+            _log(state, "warn", f"[阶段5] 复用落账跳过: {_ce}", on_log)
         _fin("阶段6", lambda: stage6_cleanup(state, on_log))
 
         _summary()

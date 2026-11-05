@@ -71,6 +71,15 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
       max_concurrent: 2
       min_interval_ms: 1500
 
+artifact_cache:                 # 产物复用库（总设计 artifact-reuse-master-design-20261103.md）
+  enabled: true                 # 关闭=停止晋升与挂载注入（账本页仍可用）
+  promote_kinds: "whl,tgz,rpm,binary,node_binding,so,a"   # 晋升白名单（tool 类走上传通道）
+  max_item_mb: 500              # 晋升单件上限
+  per_task_promote_mb: 1024     # 单任务晋升总量上限（防整坨倒货）
+  upload_max_mb: 2048           # 管理员上传单件上限
+  container_work_ttl_days: 7    # P3：中间物自动清龄（拍板：自动删仅限 container_work）
+  disk_warn_pct: 85             # 磁盘水位只警不删（11-03 拍板）
+
 stage5:                       # agent 编译阶段闸门
   max_seconds: 10800          # 阶段总墙钟（秒），勿低于 3600：torch 实测 3064s
   max_chunks: 500             # 死循环保险：工具调用 chunk 总量上限

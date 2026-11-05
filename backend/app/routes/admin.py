@@ -2,12 +2,13 @@
 Admin routes
 Based on design doc section 11.2: stats, tickets management, skill CRUD, users, systems
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, UploadFile
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
 import json
 import time
+from pathlib import Path
 import bcrypt
 
 from app.models import get_db, Ticket, Experience, Skill, User, TargetSystem, CompileTask, \
@@ -18,7 +19,7 @@ from app.schemas import (
     UserPasswordReset, UserAdminCreate, UserAdminUpdate,
     StatsOverview, ApiResponse
 )
-from app.dependencies import get_current_user, require_preset_admin
+from app.dependencies import get_current_user, require_preset_admin, require_admin
 from app.services.audit import log_audit
 from app.services.notify import notify
 from app.services.skill_loader import write_skill_to_disk, read_skill_from_disk, remove_skill_from_disk
@@ -987,7 +988,7 @@ async def create_system(
         raise HTTPException(status_code=400, detail=f"系统名已存在: {system_data.name}")
     system = TargetSystem(
         name=system_data.name,
-        base_image=system_data.base_image,
+        base_image=system_data.base_image.strip(),   # 11-04 事故根治：带空格=invalid reference format
     )
     db.add(system)
     try:
@@ -1027,7 +1028,9 @@ async def update_system(
             raise HTTPException(status_code=400, detail=f"系统名已存在: {system_data.name}")
         system.name = system_data.name
     if system_data.base_image:
-        system.base_image = system_data.base_image
+        system.base_image = system_data.base_image.strip()   # 11-04 事故根治：手滑带空格=invalid reference format
+    if system_data.glibc_version is not None:
+        system.glibc_version = system_data.glibc_version.strip()   # 11-05 配给基线
     if system_data.is_active is not None:
         system.is_active = system_data.is_active
 
@@ -2562,6 +2565,15 @@ def _purge_task_artifacts(tasks, ticket_id: int = None) -> list:
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
             purged.append(f"dir:{t.task_id}")
+        # 上传源码包随任务一起走（11-04 补：sources/<task_id>.* 此前是清理漏网物）
+        if t.source_path:
+            try:
+                sp = Path(t.source_path)
+                if sp.is_file() and sp.parent.name == "sources":
+                    sp.unlink()
+                    purged.append(f"source-pkg:{sp.name}")
+            except Exception as _pe:
+                logger.warning("[purge] 源码包清理跳过 %s: %s", t.task_id, _pe)
         # 编译容器（label=task_id）
         try:
             ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=task_id={t.task_id}"],
@@ -2581,3 +2593,247 @@ def _purge_task_artifacts(tasks, ticket_id: int = None) -> list:
         except Exception as e:
             logger.warning("[purge] 工单容器清理跳过 #%s: %s", ticket_id, e)
     return purged
+
+
+# ============== 产物复用库（P1，11-03 总设计；账本 API，AI 不接触）==============
+
+@router.get("/artifacts", response_model=ApiResponse)
+async def list_artifacts(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: str = "",
+    system_id: int | None = None,
+    kind: str = "",
+    status: str = "",
+    include_deleted: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),        # 拍板6：全体登录用户可查
+):
+    """货架账本查询：pending/approved/存量/上传全在一页筛；软删行默认隐藏。"""
+    from app.models import ArtifactIndex
+    from sqlalchemy import or_
+    q = db.query(ArtifactIndex)
+    if not include_deleted:
+        q = q.filter(ArtifactIndex.deleted_at.is_(None))
+    if search:
+        like = f"%{search.strip()}%"
+        q = q.filter(or_(ArtifactIndex.name.ilike(like), ArtifactIndex.name_norm.ilike(like),
+                         ArtifactIndex.source_task_key.ilike(like)))
+    if system_id:
+        q = q.filter(ArtifactIndex.system_id == system_id)
+    if kind:
+        q = q.filter(ArtifactIndex.kind == kind)
+    if status is not None and status != "":
+        q = q.filter(ArtifactIndex.status == status)
+    total = q.count()
+    rows = q.order_by(ArtifactIndex.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return ApiResponse(data={"total": total, "items": [{
+        "id": r.id, "name": r.name, "name_norm": r.name_norm, "version": r.version,
+        "system_id": r.system_id, "kind": r.kind, "origin": r.origin, "status": r.status,
+        "source_task_key": r.source_task_key, "uploader": r.uploader, "build_env": r.build_env,
+        "image": r.image, "cache_path": r.cache_path, "size_bytes": r.size_bytes,
+        "hits": r.hits, "views": r.views, "source_commit": r.source_commit,
+        "glibc_requires": r.glibc_requires, "sha256": r.sha256,
+        "last_used_at": r.last_used_at, "note": r.note,
+        "created_at": r.created_at, "deleted_at": r.deleted_at,
+    } for r in rows]})
+
+
+@router.get("/artifacts/disk", response_model=ApiResponse)
+async def artifacts_disk(current_user: User = Depends(get_current_user)):
+    """磁盘简报（P3：只报不删，11-03 拍板）。"""
+    from app.services.artifact_lib import disk_report
+    return ApiResponse(data=disk_report())
+
+
+@router.post("/artifacts/upload", response_model=ApiResponse)
+async def upload_artifact(
+    request: Request,
+    file: UploadFile,
+    system_id: int = Form(0),                    # 11-05 拍板：0/不填=公共池（所有系统可用）
+    name: str = Form(...),                      # 软件名（货架目录键；通用名会被规则改名）
+    version: str = Form(""),
+    note: str = Form(""),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """管理员上传（第二入库通道：人放的免 kind 白名单免人审，直接上架）。
+    命名规则（总档§5）：货架靠文件名认货——原名太通用按 <名>-<版本>.<ext> 改名入库。"""
+    from app.services.artifact_lib import (system_cache_dir, name_norm_of, kind_of,
+                                           safe_shelf_name, regenerate_index)
+    from app.config import get_cfg
+    max_mb = int(get_cfg("artifact_cache.upload_max_mb", 2048))
+    fn = (file.filename or "").split("/")[-1].split("\\")[-1]
+    if not fn or fn in (".", "..") or ".." in fn:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    from app.models import ArtifactIndex, TargetSystem
+    norm = name_norm_of(name) or name.strip().lower()
+    shelf, renamed = safe_shelf_name(name, norm, version, fn)
+    knd = kind_of(shelf)
+    # ── 三层闸·第一层（11-05 用户指出"SP2 产物老 Loongnix 跑不了"）：
+    #    链接产物类绑构建环境（glibc 版本+新旧 ABI），**不得进公共池**——
+    #    公共池只收 工具母包/源码包/mirror 类（whl/.so/.a/.node/rpm/binary 拒 422）
+    if system_id == 0 and knd in ("whl", "so", "a", "node_binding", "rpm", "binary"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{knd} 类是链接产物，绑定构建系统的 glibc/ABI，不允许进公共池——"
+                   "请选目标系统按池上架；跨系统需求请上传工具母包/源码包（node/rust/cmake/上游包）")
+    if system_id != 0 and not db.query(TargetSystem).filter(
+            TargetSystem.system_id == system_id,
+            TargetSystem.is_active == True).first():
+        raise HTTPException(status_code=404, detail="目标系统不存在或已禁用")
+    size = 0
+    dst_dir = system_cache_dir(system_id) / norm
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / shelf
+    tmp = dst.with_name(dst.name + ".uploading")
+    try:
+        with open(tmp, "wb") as out:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > max_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413,
+                                        detail=f"超过上传上限 {max_mb}MB（已读 {size // 2**20}MB）")
+                out.write(chunk)
+        tmp.replace(dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    from datetime import datetime as _dt
+    # ── 三层闸·第二层：运行需求机提（objdump/tar 展开实测，不信自报；判不了=空=未知放行+标注）
+    from app.services.artifact_lib import extract_glibc_requires
+    glibc_req = extract_glibc_requires(dst)
+    scope_txt = "公共池(全系统)" if system_id == 0 else f"系统{system_id}"
+    meta = {"name": norm, "version": version, "kind": knd, "origin": "upload",
+            "uploader": current_user.username, "system_id": system_id,
+            "glibc_requires": glibc_req,
+            "uploaded_at": _dt.utcnow().isoformat(), "toolchain": {"note": note or "管理员上传"}}
+    dst.with_name(dst.name + ".meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    row = ArtifactIndex(name=shelf, name_norm=norm, version=version, system_id=system_id,
+                        kind=knd, origin="upload", status="approved",
+                        uploader=current_user.username,
+                        build_env=json.dumps({"note": note[:200]}, ensure_ascii=False),
+                        glibc_requires=glibc_req,
+                        cache_path=f"{system_id}/{norm}/{shelf}", size_bytes=size, note=note[:290])
+    db.add(row)
+    # 公共池变更 → 刷新所有系统 INDEX/视图缓存入口（视图每任务重建，这里刷各池 INDEX 无意义；
+    # 公共池自身生成一份备查）
+    regenerate_index(db, system_id)
+    log_audit(db, user_id=current_user.user_id, action="artifact_uploaded",
+              target_type="artifact", target_id=None, target_key=shelf, request=request,
+              details=f"system={system_id},scope={scope_txt},size={size},renamed={renamed},glibc_req={glibc_req or '未知'}")
+    db.commit()
+    return ApiResponse(data={"id": row.id, "name": shelf, "renamed": renamed,
+                             "glibc_requires": glibc_req, "scope": scope_txt,
+                             "cache_path": row.cache_path},
+                       message=f"已上架到{'公共池——所有系统货架可见' if system_id == 0 else '本系统货架'}（上传件免审直入）"
+                               + ("；原名过通用，已按规则改名" if renamed else "")
+                               + (f"；机提运行需求 glibc≥{glibc_req}" if glibc_req else ""))
+
+
+@router.post("/artifacts/{artifact_db_id}/approve", response_model=ApiResponse)
+async def approve_artifact(
+    artifact_db_id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """晋升审批（拍板5）：pending 件 move 进货架 + INDEX 重生成。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import approve_row
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账本行不存在")
+    try:
+        rel = approve_row(db, row, current_user.user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log_audit(db, user_id=current_user.user_id, action="artifact_promoted",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details=f"from_task={row.source_task_key},path={rel}")
+    db.commit()
+    return ApiResponse(data={"cache_path": rel}, message="已晋升上架")
+
+
+@router.post("/artifacts/{artifact_db_id}/reject", response_model=ApiResponse)
+async def reject_artifact(
+    artifact_db_id: int, request: Request, reason: str = Form("驳回"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """晋升驳回：理由留痕（同经验审批口径）；文件随 promote_pending 生命周期走。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import reject_row
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账本行不存在")
+    try:
+        reject_row(db, row, reason)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log_audit(db, user_id=current_user.user_id, action="artifact_rejected",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details=f"reason={reason[:120]},from_task={row.source_task_key}")
+    db.commit()
+    return ApiResponse(message="已驳回（理由留痕）")
+
+
+@router.delete("/artifacts/{artifact_db_id}", response_model=ApiResponse)
+async def delete_artifact(
+    artifact_db_id: int, request: Request, purge: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),
+):
+    """下架（拍板4：库的生死归管理员）。软删=出注入面（摘要/INDEX 重生成）；
+    purge=物理删货架文件+meta。路径安全：cache_path 解析必须仍在 cache_root 内。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import cache_root, regenerate_index
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账本行不存在")
+    row.deleted_at = datetime.utcnow()
+    removed = []
+    if purge and row.cache_path:
+        root = cache_root().resolve()
+        target = (root / row.cache_path).resolve()
+        if not str(target).startswith(str(root) + "/"):
+            raise HTTPException(status_code=400, detail="货架路径异常，拒绝物理删")
+        for p in (target, target.with_name(target.name + ".meta.json")):
+            if p.is_file():
+                p.unlink()
+                removed.append(p.name)
+        # <norm> 目录搬空即收（11-05 实弹后遗留 demo-elf-tool/node 空目录教训；
+        # 目录清理非数据删除——文件已走，rmdir 只收空壳，不违"生死归管理员"拍板）
+        d = target.parent
+        if d.is_dir() and not any(d.iterdir()):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        regenerate_index(db, row.system_id)     # 文件没了，货架表同步（软删行已被过滤）
+    log_audit(db, user_id=current_user.user_id, action="artifact_deleted",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details=f"purge={purge},removed={removed}")
+    db.commit()
+    return ApiResponse(data={"purged": removed}, message="已下架" + ("并物理清除" if purge else "（文件保留，可恢复）"))
+
+
+@router.post("/artifacts/reindex", response_model=ApiResponse)
+async def reindex_artifacts(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """存量回填+漂移对账（幂等；missing 只标注不动手——拍板4精神）。"""
+    from app.services.artifact_lib import reindex
+    stats = reindex(db)
+    log_audit(db, user_id=current_user.user_id, action="artifact_reindexed",
+              target_type="artifact", target_id=None, target_key="all", request=request,
+              details=str(stats))
+    db.commit()
+    return ApiResponse(data=stats)

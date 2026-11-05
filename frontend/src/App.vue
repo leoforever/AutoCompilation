@@ -170,6 +170,7 @@ const menuItems = computed(() => {
       { id: 'tickets', ico: '🐛', label: '问题上报中心' },
       { id: 'contributions', ico: '💡', label: '经验贡献中心' },
       { id: 'download', ico: '⬇️', label: '客户端下载入口' },
+      { id: 'artifactlib', ico: '📦', label: '产物复用库' },
     ]
   } else {
     return [
@@ -177,6 +178,7 @@ const menuItems = computed(() => {
       { id: 'tickets-admin', ico: '🎫', label: '报错工单管理' },
       { id: 'review', ico: '✅', label: 'Skill 经验审核' },
       { id: 'skilllib', ico: '📚', label: '经验库管理' },
+      { id: 'artifactlib', ico: '📦', label: '产物复用库' },
       { id: 'systems-admin', ico: '🖥️', label: '目标系统管理' },
       { id: 'users', ico: '👥', label: '用户权限管理' },
       { id: 'audit-logs', ico: '📋', label: '操作日志审计' },

@@ -224,6 +224,14 @@ async def upload_and_submit(
         stored_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"保存源码包失败：{e}")
 
+    # 4.5 包指纹（身份钉·upload 路）：权威时刻=落盘即算；算失败不挡任务（reindex 可补）
+    source_sha = ""
+    try:
+        from app.services.artifact_lib import sha256_of
+        source_sha = sha256_of(stored_path)
+    except Exception:
+        pass
+
     # 5. 解析 build_args
     parsed_build_args = None
     if build_args:
@@ -242,6 +250,7 @@ async def upload_and_submit(
             software_name=software_name,
             source_type="upload",
             source_path=str(stored_path),
+            source_sha256=source_sha,
             git_url=None,
             git_branch=git_branch,
             build_args=json.dumps(parsed_build_args) if parsed_build_args else None,
