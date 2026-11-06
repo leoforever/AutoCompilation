@@ -343,40 +343,14 @@ def reject_row(db, row, reason: str) -> None:
 
 
 # ── hits 被动记账（引擎 chunk 循环调，行为数据非汇报数据）────────
-_CACHE_USE_RE = re.compile(r"/work/cache/(?!_out)[\w./\-]*")
+# 货架路径两形态（11-06 .209 2500D1 案：AI 用 `pip install ./cache/torch/x.whl` 相对路径——
+# 旧式只认 /work/cache/ 字面量 → hits/views 全漏、depend_tree NULL。容器 working_dir=/work，
+# ./cache 即货架 bind，契约背书其语义）：
+#   绝对 /work/cache/…   相对 ./cache/…（lookbehind 挡 ~/.cache、某URL…/cache/ 误计）
+# 两形态 cache 后强制 "/" → /work/cache_out、./cache_out 天然不匹配（晋升出口不记）
+_CACHE_USE_RE = re.compile(r"/work/cache/[\w./\-]*|(?<![\w./\-])\./cache/[\w./\-]*")
 
 
-def record_hits(db, system_id: int, command_text: str) -> int:
-    """扫一条 execute 命令文本；命中在架文件/目录 → hits+1、last_used_at=now。
-    返回命中行数。cache_out（晋升口）不算复用。"""
-    from app.models import ArtifactIndex
-    segs = _CACHE_USE_RE.findall(command_text or "")
-    if not segs:
-        return 0
-    n = 0
-    now = datetime.utcnow()
-    for seg in segs:
-        # seg 恒以 /work/cache/ 开头 → 去前缀后首段即 name_norm（parts 索引曾两轮修歪，
-        # 教训：切 "work/cache/x" 后 norm 在 [2] 不在 [0]/[1]——统一用前缀剥离，别再数）
-        rest = seg[len("/work/cache/"):].strip("/")
-        parts = rest.split("/")
-        if len(parts) >= 2 and parts[-1] != "INDEX.md":
-            row = db.query(ArtifactIndex).filter(
-                ArtifactIndex.system_id == system_id,
-                ArtifactIndex.name_norm == parts[0].lower(),
-                ArtifactIndex.deleted_at.is_(None),
-                ArtifactIndex.status.in_(("approved", "")),
-            ).first()
-            if row:
-                row.hits = (row.hits or 0) + 1
-                row.last_used_at = now
-                n += 1
-    if n:
-        db.commit()
-    return n
-
-
-# ── reindex：存量回填 + 漂移对账（幂等，只报不手）────────────────
 def reindex(db) -> dict:
     """1) 扫 artifacts/<task>/artifacts/ 树为历史成功任务建账（cache_path 空=仅账本）；
     2) 对账：账本 cache_path 指向的文件不在盘 → 标 missing 注记（警示，不删行不删文件）。
@@ -681,21 +655,31 @@ def cache_volumes(state: dict, container_work, volumes: dict, log_fn=None) -> No
 
 
 # ── 期二：hits 被动记账（chunk 循环调，state 延后账；同 _record_skill_match 先例）──
-def scan_cache_use(state: dict, command_text: str) -> None:
-    """扫一条 execute 命令：命中 /work/cache/<norm>/<file> → state['_cache_hits']。
-    cache_out（晋升口）与 INDEX.md（查表本身）不计。分两账（11-04 用户拍板"查≠用"）：
-      用(hits)：cp/mv/install/tar -x*/unzip/直接引用安装 —— 真消费交付
-      览(views)：cat/ls/head/tar -t*/grep/find/stat/diff/du —— 查阅行为
-    前缀命中"用"即计用（一条命令里既有 tar -tzf 又有 cp 时从严归用）。"""
+def _cache_norms(command_text: str) -> set:
+    """一条命令引用的货架件目录名集合（hits/views 共用；段解析只此一份）。
+    目录级放宽（11-06 .209 案：`ls -la /work/cache/torch` 旧式 len(parts)>=2 漏 views，
+    现在 /work/cache/<norm>[/...] 均计）；裸 /work/cache/ 与 INDEX.md 表头不计。"""
+    norms = set()
     for seg in _CACHE_USE_RE.findall(command_text or ""):
-        rest = seg[len("/work/cache/"):].strip("/")   # 前缀剥离口径（别再数下标，教训在案）
-        parts = rest.split("/")
-        if len(parts) >= 2 and parts[-1] != "INDEX.md":
-            norm = parts[0].lower()
-            if _USE_RE.search(command_text or ""):
-                state.setdefault("_cache_hits", set()).add(norm)
-            else:
-                state.setdefault("_cache_views", set()).add(norm)
+        pfx = "/work/cache/" if seg.startswith("/work/cache/") else "./cache/"
+        rest = seg[len(pfx):].strip("/")
+        if not rest:
+            continue
+        norm = rest.split("/")[0].lower()
+        if norm != "index.md":
+            norms.add(norm)
+    return norms
+
+
+def scan_cache_use(state: dict, command_text: str) -> None:
+    """扫一条 execute 命令 → state['_cache_hits'/'_cache_views']（延后账，flush_hits 落库）。
+    分两账（11-04 拍板"查≠用"）：命令含消费动词（_USE_RE）→ 用(hits)；否则 → 览(views)。
+    同命令既有 -tzf 清点又有 cp 交付时从严归用。口径统一在 _cache_norms。"""
+    norms = _cache_norms(command_text)
+    if not norms:
+        return
+    key = "_cache_hits" if _USE_RE.search(command_text or "") else "_cache_views"
+    state.setdefault(key, set()).update(norms)
 
 
 _USE_RE = re.compile(
@@ -705,7 +689,7 @@ _USE_RE = re.compile(
     #   清点是览：-tzf/-tf 不含 x，天然走 views（-tzf 的 t 不会误配）
     r"(?:^|[;&|]|\bsudo)\s*(?:cp\b|mv\b|install\b|tar\s+(?:\S+\s+)*?-?\w*x\w*"
     r"|unzip\b|dpkg\s+-i|rpm\s+-i|npm\s+i(?:nstall)?\b|pip\s+install|python\d*\s+-m\s+pip\s+install)"
-    r"[^\n]*?/work/cache/")
+    r"[^\n]*?(?:/work/cache/|(?<![\w./\-])\./cache/)")
 
 
 def flush_hits(db, system_id: int, names: set, views: "set | None" = None) -> int:

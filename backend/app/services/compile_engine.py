@@ -678,7 +678,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
    验证失败是正常结局，如实写即可——平台会保留已编出的产物供下载，不会丢弃。
 ③ 最终总结段仍按原要求写（含"编译成功"或"编译失败"字样），平台据此判任务终态。
 
-【产物复用】（先查再编，命中即省几十分钟）
+【产物复用】（先查再编，命中即省几十分钟；货架路径一律用绝对 /work/cache/… 书写）
 /work/cache 是本目标系统已验证产物的货架（只读），货架全表在 /work/cache/INDEX.md。
 开工探测阶段先 cat 它；**编译/验证任何时刻**缺依赖（whl/tgz/binding/工具链母包等），
 再查它——命中即 cp 到工作目录直接使用，跳过源码编译与网络下载，并在
@@ -688,7 +688,8 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 meta 与文件同目录即可），别只放一半；
 BUILD_NOTES.md"复用"节写明用了哪个文件。货架行的『来源标识』列（git:commit 或
 archive:包指纹）是出身硬证：复用前对一下来源与版本——git 源对上游 commit、上传包
-对 archive 指纹（同包=同身份），对不上就重编，宁慢勿错。
+对 archive 指纹（同包=同身份），对不上就重编，宁慢勿错；同名软件在架**多个版本**时，
+拿本项目 requirements 的 pin 对照构建上下文列（底库/glibc/python 版本）选件，别抓第一条。
 你新编出的可复用产物（binary/tgz/whl/rpm/so 等白名单成品；config.mk 类配置文件、
 验证临时物、日志、脚本不放），收尾前 cp 进 /work/cache_out/。**每个放进来的文件
 都要单独配一个同名 <产物文件名>.meta.json**——放 lsxdemo 就配 lsxdemo.meta.json；
@@ -699,7 +700,10 @@ meta 内容照抄这个完整例子改值
    "toolchain": {{"node": "v24.22.1", "gcc": "12.3.1", "glibc": "2.38"}}}}
 kind 取 whl/tgz/rpm/binary/node_binding/so/a 之一；toolchain 至少填一项且必须是
 **本机实测值**（node -v / python3 -V / gcc --version / ldd --version 一行抄）——
-这是后续任务判断 ABI/兼容性的唯一依据，编造或留空等于白交。只放成品，
+这是后续任务判断 ABI/兼容性的唯一依据，编造或留空等于白交。
+产物链接了主版本敏感底库（numpy/protobuf/openssl 等）的，toolchain 里**必须加记构建
+时所用底库版本**（如 "numpy": "1.26.5"）——漏记，下游就会撞 torch(编于 numpy1.x)×
+numpy2.x 桥接瘫痪这类坑（2500D1 实证）。只放成品，
 验证临时物/日志/脚本不放。平台在任务成功后核对门禁并提交管理员审批，通过才上架。
 
 【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
