@@ -58,7 +58,7 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
       base_url: https://api.minimaxi.com/v1
       api_key_env: AI_API_KEY         # 密钥只走 env，不进 yaml
       enabled: true
-      priority: 1
+      priority: 2
       max_concurrent: 2               # 该模型自己的配额池上限（覆盖全局）
       min_interval_ms: 1500
     - id: qwen-flash
@@ -67,7 +67,7 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
       base_url: https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1
       api_key_env: AI_ALT_API_KEY
       enabled: true
-      priority: 2
+      priority: 1
       max_concurrent: 2
       min_interval_ms: 1500
 
