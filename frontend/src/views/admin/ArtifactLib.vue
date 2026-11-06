@@ -8,6 +8,11 @@
         <el-divider direction="vertical" />
         <span>在架货架 <b>{{ disk.shelf_count }}</b> 件 / {{ disk.cache_mb }}MB（账本口径）</span>
         <el-tag v-if="disk.warn" type="warning" size="small" style="margin-left:10px">接近警戒线：请在本页决定去留（平台不会自动删货架）</el-tag>
+        <template v-if="sel.length">
+          <el-divider direction="vertical" />
+          <el-button size="small" @click="selectAllSource">全选本来源</el-button>
+          <el-button size="small" type="primary" plain :loading="batchDl" @click="doBatchDownload">批量下载 {{ sel.length }}</el-button>
+        </template>
         <template v-if="isAdmin && sel.length">
           <el-divider direction="vertical" />
           <el-button size="small" type="success" @click="openBatch('approve')">批量通过 {{ sel.length }}</el-button>
@@ -28,21 +33,23 @@
           <el-badge v-if="pendingCount" :value="pendingCount" class="tab-badge" />
         </template>
       </el-tab-pane>
-      <el-tab-pane label="全部账本" name="all" />
+
     </el-tabs>
 
     <div class="toolbar">
       <el-input v-model="search" placeholder="搜软件名 / 文件名 / 任务号" clearable style="width: 260px" @change="load" />
+      <el-select v-model="source" placeholder="来源" clearable filterable style="width: 210px" @change="load">
+        <el-option v-for="sc in sources" :key="sc" :label="sc === 'upload' ? '上传件' : sc" :value="sc" />
+      </el-select>
       <el-select v-model="kind" placeholder="类型" clearable style="width: 130px" @change="load">
         <el-option v-for="k in KINDS" :key="k" :label="k" :value="k" />
       </el-select>
       <el-select v-model="systemId" placeholder="目标系统" clearable style="width: 200px" @change="load">
         <el-option v-for="sy in systems" :key="sy.system_id" :label="sy.name" :value="sy.system_id" />
       </el-select>
-      <el-checkbox v-if="tab === 'all'" v-model="showDeleted" @change="load">含已下架</el-checkbox>
     </div>
 
-    <el-table :data="rows" v-loading="loading" size="small" border
+    <el-table ref="tableRef" :data="rows" v-loading="loading" size="small" border
               @selection-change="(v: any[]) => sel = v">
       <el-table-column v-if="isAdmin" type="selection" width="42" :selectable="() => isAdmin" />
       <el-table-column type="index" label="#" width="52" />
@@ -92,9 +99,10 @@
                      :disabled="!canManage" @click="doApprove(row)">通过</el-button>
           <el-button v-if="isAdmin && row.status === 'pending'" size="small" type="warning"
                      :disabled="!canManage" @click="openReject(row)">驳回</el-button>
-          <el-button v-if="isAdmin && !row.deleted_at" size="small" type="danger" plain
-                     :disabled="!isPreset" :title="isPreset ? '软删出货架；勾选 purge 连文件物理删' : '仅预置 admin 可删'"
+          <el-button v-if="isAdmin && tab === 'shelf'" size="small" type="danger" plain
+                     :disabled="!canManage" title="货架文件物理删除，不可恢复（账留墓碑）"
                      @click="openDelete(row)">下架</el-button>
+
         </template>
       </el-table-column>
     </el-table>
@@ -129,21 +137,21 @@
       </template>
     </el-dialog>
 
-    <!-- 下架确认（软删/purge 二段语义，同任务删除口径） -->
+    <!-- 下架确认（简化拍板：下架=删货终局；restore/ledger 留后端应急，UI 不挂） -->
     <el-dialog v-model="delVisible" title="下架产物" width="480">
-      <p>下架 <b>{{ cur?.name }}</b>：</p>
-      <el-checkbox v-model="delPurge">同时物理删除货架文件（purge，不可恢复）</el-checkbox>
-      <p class="tip">{{ delPurge ? '行与文件都物理删除，不可恢复。' : '仅软删（退出货架与 AI 摘要，文件保留可恢复）。' }}</p>
+      <p>下架 <b>{{ cur?.name }}</b></p>
+      <p class="tip">货架文件与 meta 将<b>物理删除，不可恢复</b>；账本留墓碑（复用史/指纹入审计可考）。
+        需要再用它=重新上传或重编审批。</p>
       <template #footer>
         <el-button @click="delVisible = false">取消</el-button>
-        <el-button type="danger" @click="doDelete">确认下架</el-button>
+        <el-button type="danger" @click="doDelete">确认下架（删除文件）</el-button>
       </template>
     </el-dialog>
 
     <!-- 上传对话框（人放的免审直入；拍板6 权限=管理角色） -->
     <el-dialog v-model="batchVisible" :title="batchTitle" width="640">
       <el-alert v-if="batchAction === 'delete'" :closable="false" type="warning" style="margin-bottom:10px"
-                title="下架=软删可恢复；勾选物理清除后文件与 meta 立即删除、不可恢复——下方清单逐件过目再决定" />
+                title="下架将物理删除各件货架文件与 meta，不可恢复——下方清单逐件过目再决定" />
       <el-alert v-else-if="batchAction === 'approve'" :closable="false" type="info" style="margin-bottom:10px"
                 title="通过后文件移入货架并对全部编译任务可见（同名件按'新版本赢'合并历史账）" />
       <el-table :data="sel" size="small" border max-height="240">
@@ -155,9 +163,6 @@
         <el-table-column prop="kind" label="类型" width="80" />
         <el-table-column prop="status" label="状态" width="90" />
       </el-table>
-      <el-checkbox v-if="batchAction === 'delete'" v-model="batchPurge" style="margin-top:10px">
-        同时物理清除文件（purge，不可恢复）——默认不勾
-      </el-checkbox>
       <div v-if="batchAction === 'reject'" style="margin-top:10px">
         <el-input v-model="batchReason" placeholder="统一驳回理由（逐件留痕）" maxlength="120" show-word-limit />
       </div>
@@ -170,7 +175,7 @@
       <template #footer>
         <el-button @click="batchVisible = false">关闭</el-button>
         <el-button :type="batchAction === 'delete' ? 'danger' : 'primary'" :loading="batchBusy" :disabled="!!batchResult" @click="doBatch">
-          {{ batchAction === 'approve' ? '确认通过' : batchAction === 'reject' ? '确认驳回' : (batchPurge ? '确认下架并物理清除' : '确认下架（保留文件）') }}
+          {{ batchAction === 'approve' ? '确认通过' : batchAction === 'reject' ? '确认驳回' : '确认下架（删除文件）' }}
         </el-button>
       </template>
     </el-dialog>
@@ -219,19 +224,19 @@ import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
 const isAdmin = computed(() => auth.user?.role === 'admin')
-const isPreset = computed(() => auth.user?.username === 'admin')   // 删除闸=预置 admin（同任务删除口径）
-// 拍板6：审批/上传=管理角色（后端 require_admin 同口径）；删除=预置 admin（isPreset）
+// 简化拍板①（11-06）：驳回/下架全部=require_admin（任意管理员）；
+// restore/ledger 后端仍 require_preset_admin（应急后门未上 UI）——isPreset 随退役钮一同退出前端
 const canManage = computed(() => isAdmin.value)
 
 const KINDS = ['whl', 'tgz', 'rpm', 'binary', 'node_binding', 'so', 'a', 'tool', 'other']
 const tab = ref('shelf')
 const rows = ref<any[]>([])
+const tableRef = ref<any>(null)
 const total = ref(0)
 const page = ref(1)
 const search = ref('')
 const kind = ref('')
 const systemId = ref<number | ''>('')
-const showDeleted = ref(false)
 const loading = ref(false)
 const pendingCount = ref(0)
 const systems = ref<any[]>([])
@@ -242,21 +247,47 @@ const detailVisible = ref(false)
 const rejectVisible = ref(false)
 const rejectReason = ref('')
 const delVisible = ref(false)
-const delPurge = ref(false)
 const uploadVisible = ref(false)
 const uploading = ref(false)
 const reindexing = ref(false)
 const sel = ref<any[]>([])
+const source = ref('')
+const sources = ref<string[]>([])
+const batchDl = ref(false)
+function selectAllSource() {
+  // 勾满当前筛选（=选了来源时就是"该来源全部在架件"）——跨页场景先按筛选后本集导，2GB 上限兜底
+  rows.value.forEach((r) => { if (!sel.value.includes(r)) tableRef.value?.toggleRowSelection(r, true) })
+}
+async function doBatchDownload() {
+  batchDl.value = true
+  try {
+    const token = localStorage.getItem('token') || ''
+    const r = await fetch('/api/artifacts/batch-download', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: sel.value.map((x) => x.id) }),
+    })
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`
+      try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 保留码 */ }
+      throw new Error(msg)
+    }
+    const blob = await r.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `shelf-batch-${sel.value.length}items.tar.gz`
+    a.click(); URL.revokeObjectURL(a.href); ElMessage.success('批量包已开始下载')
+  } catch (e: any) { ElMessage.error(e?.message || '批量下载失败') }
+  finally { batchDl.value = false }
+}
 const batchVisible = ref(false)
 const batchAction = ref<'approve' | 'reject' | 'delete'>('approve')
-const batchPurge = ref(false)          // 11-06 拍板：purge 在预览里默认不勾
 const batchReason = ref('批量驳回')
 const batchBusy = ref(false)
 const batchResult = ref<any>(null)
 const batchTitle = computed(() => ({ approve: '批量审批上架', reject: '批量驳回', delete: '批量下架' }[batchAction.value]))
 function openBatch(a: 'approve' | 'reject' | 'delete') {
   batchAction.value = a
-  batchPurge.value = false             // 每次重开都回默认不勾
   batchResult.value = null
   batchVisible.value = true
 }
@@ -264,7 +295,7 @@ async function doBatch() {
   batchBusy.value = true
   try {
     const r: any = await api.post(`/admin/artifacts/batch-${batchAction.value}`, {
-      ids: sel.value.map((x) => x.id), reason: batchReason.value, purge: batchPurge.value,
+      ids: sel.value.map((x) => x.id), reason: batchReason.value,
     })
     batchResult.value = r?.data ?? { ok: [], failed: [] }
     ElMessage.success(r?.message || '批量完成')
@@ -324,25 +355,27 @@ async function load() {
       // 普通用户：公开端点（服务端 SQL 钉死仅在架件；无 status 入口、无 pending/账本概念）
       const params: any = { page: page.value, page_size: 20 }
       if (search.value) params.search = search.value
+      if (source.value) params.source = source.value
       if (kind.value) params.kind = kind.value
       if (systemId.value) params.system_id = systemId.value
       const t: any = await api.get('/artifacts', { params })
       const d = t?.data || t || {}
       rows.value = d.items || []
+      sources.value = d.sources || sources.value
       total.value = d.total || 0
       return
     }
     const params: any = { page: page.value, page_size: 20 }
     if (search.value) params.search = search.value
+    if (source.value) params.source = source.value
     if (kind.value) params.kind = kind.value
     if (systemId.value) params.system_id = systemId.value
-    if (tab.value === 'shelf') params.status = 'approved'
-    else if (tab.value === 'pending') params.status = 'pending'
-    else if (!showDeleted.value) params.include_deleted = false
-    if (tab.value === 'all') delete params.status
+    // 简化后仅剩两 tab，状态恒有——include_deleted 参数面退役（墓碑行查询不再暴露 UI）
+    params.status = tab.value === 'shelf' ? 'approved' : 'pending' 
     const t: any = await api.get('/admin/artifacts', { params })
     const d = t?.data || t || {}          // 拦截器返回 ApiResponse 整包，取 .data（平台惯例同 SkillLib）
     rows.value = d.items || []
+    sources.value = d.sources || sources.value
     total.value = d.total || 0
     if (tab.value !== 'pending') {
       const p: any = await api.get('/admin/artifacts', { params: { page: 1, page_size: 1, status: 'pending' } })
@@ -381,11 +414,11 @@ async function doReject() {
     rejectVisible.value = false; load()
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '驳回失败') }
 }
-function openDelete(row: any) { cur.value = row; delPurge.value = false; delVisible.value = true }
+function openDelete(row: any) { cur.value = row; delVisible.value = true }
 async function doDelete() {
   try {
-    await api.delete(`/admin/artifacts/${cur.value.id}`, { params: { purge: delPurge.value } })
-    ElMessage.success(delPurge.value ? '已下架并物理清除' : '已软删下架（可恢复）')
+    await api.delete(`/admin/artifacts/${cur.value.id}`)
+    ElMessage.success('已下架（文件已删除）')
     delVisible.value = false; load(); loadDisk()
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '下架失败') }
 }

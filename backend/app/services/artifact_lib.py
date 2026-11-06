@@ -269,10 +269,12 @@ def regenerate_index(db, system_id: int) -> str:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",
-    ).order_by(ArtifactIndex.hits.desc()).all()
+    ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     d = shelf_dir(system_id)
     d.mkdir(parents=True, exist_ok=True)
     lines = ["# 复用库货架（平台自动生成，勿手改；缺依赖先查此表）",
+             f"# 共 {len(rows)} 件，按复用次数排列（同次数新件在前）；行多时工具可能截断显示，"
+             f"找不到就 grep /work/cache/INDEX.md 或 ls /work/cache/",
              "",
              "| 软件名 | 文件 | 版本 | 类型 | 构建上下文 | 大小 | 复用次数 | 来源标识 |",
              "|---|---|---|---|---|---|---|---|"]
@@ -299,7 +301,7 @@ def shelf_summary(db, system_id: int, limit: int = 15) -> str:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",          # 仅账本的回填行不进 AI 摘要（真在架才算货架）
-    ).order_by(ArtifactIndex.hits.desc()).all()
+    ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     baseline = system_baseline(db, system_id)
     rows = [r for r in rows
             if r.system_id != COMMON_SYSTEM_ID or _common_passes(r, baseline)][:limit]
@@ -356,13 +358,48 @@ def approve_row(db, row, operator_id: int) -> str:
     return rel
 
 
-def reject_row(db, row, reason: str) -> None:
-    """驳回：账本记 rejected+理由留痕；文件随 promote_pending 生命周期清理（不即删——
-    留反悔窗口，purge 时一并走）。出注入面：本就不在架，INDEX 无需动。"""
+def _rm_pair(p) -> list:
+    """删文件+同名 meta（存在才删），返回删除名列表。"""
+    gone = []
+    for q in (p, p.with_name(p.name + ".meta.json")):
+        try:
+            if q.is_file():
+                q.unlink()
+                gone.append(q.name)
+        except OSError:
+            pass
+    return gone
+
+
+def withdraw_row(db, row, reason: str = "") -> list:
+    """下架/驳回统一收口（11-06 简化拍板：六态塌缩成 pending→在架→withdrawn）。
+    删货：货架件（purge_shelf_files 带路径守卫/空壳回收/INDEX 刷新）+ 待晋升位（幂等清）。
+    账本行不物删——status='withdrawn' + deleted_at：对全部查询/注入面天然隐身（既有
+    deleted_at 过滤一网打尽），且是 reindex 防复活桩；hits/views/sha/来源字段留档可考。
+    不可逆是设计语义：反悔=重新上传/重编（restore/ledger 端点保留为应急后门，UI 不挂）。
+    调用方负责 commit。返回删除文件名列表。"""
+    from app.config import artifacts_dir
+    if row.cache_path:
+        removed = purge_shelf_files(db, row)          # 含 regenerate_index + 空壳收
+    else:
+        removed = []
+    if row.source_task_key and row.name:              # promote_pending 位（驳回场景主删点）
+        pend = (artifacts_dir() / row.source_task_key / "promote_pending").resolve()
+        t2 = pend / row.name
+        if str(t2).startswith(str(pend) + os.sep):
+            removed += _rm_pair(t2)
+    row.status = "withdrawn"
+    if reason:
+        row.note = (reason or "驳回")[:300]
+    row.deleted_at = datetime.utcnow()
+    return removed
+
+
+def reject_row(db, row, reason: str) -> list:
+    """驳回（简化语义）：仅 pending 可驳；清待晋升文件+墓碑留痕。"""
     if row.status != "pending":
         raise ValueError("仅 pending 可驳回")
-    row.status = "rejected"
-    row.note = (reason or "驳回")[:300]
+    return withdraw_row(db, row, reason or "驳回")
 
 
 # ── hits 被动记账（引擎 chunk 循环调，行为数据非汇报数据）────────
@@ -381,7 +418,7 @@ def reindex(db) -> dict:
     from app.config import artifacts_dir
     from app.models import ArtifactIndex, CompileTask, TaskStatus
     art = artifacts_dir()
-    created = updated = missing = 0
+    created = updated = missing = skipped = 0
     tasks = db.query(CompileTask).filter(
         CompileTask.status == TaskStatus.SUCCESS.value,
         CompileTask.deleted_at.is_(None)).all()
@@ -390,34 +427,60 @@ def reindex(db) -> dict:
         scan = outd if outd.is_dir() else (art / t.task_id / "artifacts")
         if not scan.is_dir():
             continue
-        for f in scan.rglob("*"):
-            if not f.is_file() or f.name.endswith(".meta.json") or f.name == "BUILD_NOTES.md":
-                continue
-            if not _is_deliverable(f.name):
-                continue
-            rel = f.relative_to(scan)
-            nm = f.name
+        # 折叠口径与产物清单 _manifest_from_host 同源（11-06 拍板③：128 行树碎片淹没账本，
+        # llama.cpp 一棵树=上百行 .h/.so 明细对任何决策无意义；目录整体一条行）
+        entries = []
+        for p in sorted(scan.iterdir()):
+            if p.is_file() and not p.name.endswith(".meta.json") and p.name != "BUILD_NOTES.md" \
+                    and _is_deliverable(p.name):
+                entries.append(p)
+            elif p.is_dir():
+                n_files = sum(len(fns) for _dp, _dd, fns in __import__("os").walk(p))
+                entries.append((p, n_files))
+        for e in entries:
+            f, is_dir = (e, False) if isinstance(e, __import__("pathlib").Path) else (e[0], True)
+            nm = f.name + ("/" if is_dir else "")
             row = db.query(ArtifactIndex).filter(
                 ArtifactIndex.source_task_id == t.id,
-                ArtifactIndex.name == str(rel)).first()
+                ArtifactIndex.name == nm).first()
+            if row is not None and (row.status == "withdrawn" or row.deleted_at is not None):
+                skipped += 1                          # 墓碑不复活不更新（11-06 简化：下架/驳回=终局）
+                continue
             if row is None:
                 _cid = _reindex_identity(t)
                 row = ArtifactIndex(source_task_id=t.id, source_task_key=t.task_id,
-                                    name=str(rel), name_norm=name_norm_of(nm),
-                                    version=version_of(nm), kind=kind_of(nm),
-                                    origin="task", status="", size_bytes=f.stat().st_size,
-                                    system_id=t.system_id, sha256=sha256_of(f),
+                                    name=nm, name_norm=name_norm_of(f.name),
+                                    version="" if is_dir else version_of(f.name),
+                                    kind="dir" if is_dir else kind_of(f.name),
+                                    origin="task", status="",
+                                    size_bytes=0 if is_dir else f.stat().st_size,
+                                    system_id=t.system_id,
+                                    sha256="" if is_dir else sha256_of(f),
                                     source_commit=_cid,
-                                    note="存量回填(无meta,上下文未知)")
+                                    note=("存量回填(目录折叠)" if is_dir else "存量回填(无meta,上下文未知)"))
+                if is_dir:
+                    row.note = f"存量回填(目录折叠,含{e[1]}个文件)"
                 db.add(row)
                 created += 1
             else:
-                row.size_bytes = f.stat().st_size
-                if not row.sha256:
-                    row.sha256 = sha256_of(f)
+                if not is_dir:
+                    row.size_bytes = f.stat().st_size
+                    if not row.sha256:
+                        row.sha256 = sha256_of(f)
                 if not row.source_commit:
                     row.source_commit = _reindex_identity(t)
                 updated += 1
+
+    # 碎片归并一次性清账：历史 rglob 逐文件行（name 含子路径 /）软删留痕
+    # （cache_path 恒空=从未上架、零引用方——非货架数据，不触"自动逐出"红线；行不物理删可逆查）
+    folded = 0
+    for r in db.query(ArtifactIndex).filter(
+            ArtifactIndex.deleted_at.is_(None), ArtifactIndex.status == "",
+            ArtifactIndex.name.like("%/%")).all():
+        r.deleted_at = datetime.utcnow()
+        r.status = "withdrawn"   # 与简化态一致（reindex skip 认 withdrawn/deleted 双标）
+        r.note = ((r.note or "") + " [树碎片归并至目录条目]").strip()[:300]
+        folded += 1
     for r in db.query(ArtifactIndex).filter(ArtifactIndex.cache_path != "",
                                             ArtifactIndex.deleted_at.is_(None)).all():
         if not (cache_root() / r.cache_path).is_file():
@@ -433,7 +496,8 @@ def reindex(db) -> dict:
             regenerate_index(db, sid)
         except Exception:
             pass
-    return {"created": created, "updated": updated, "missing_marked": missing}
+    return {"created": created, "updated": updated, "missing_marked": missing,
+            "folded": folded, "skipped_withdrawn": skipped}
 
 
 def _is_deliverable(name: str) -> bool:
@@ -448,6 +512,21 @@ def _is_deliverable(name: str) -> bool:
 
 
 # ── 磁盘简报（P3：只报不删，11-03 拍板）───────────────────────────
+def shelf_sources(db) -> list:
+    """在架件来源全集（distinct 任务号 + 有上传件时追加 'upload'）——货架"来源"下拉数据，
+    口径不受分页/筛选影响（admin/公开 list 共用，11-06）。"""
+    from app.models import ArtifactIndex
+    srcs = sorted({x[0] for x in db.query(ArtifactIndex.source_task_key).filter(
+        ArtifactIndex.deleted_at.is_(None), ArtifactIndex.status.in_(("approved", "")),
+        ArtifactIndex.cache_path != "", ArtifactIndex.origin == "task").distinct().all() if x[0]})
+    if db.query(ArtifactIndex.id).filter(
+            ArtifactIndex.deleted_at.is_(None), ArtifactIndex.origin == "upload",
+            ArtifactIndex.cache_path != "", ArtifactIndex.status.in_(("approved", "")),
+            ArtifactIndex.system_id == 0).first():
+        srcs.append("upload")
+    return srcs
+
+
 def disk_report(db) -> dict:
     """磁盘简报 c 方案（11-05 拍板"不用那么准"）：statvfs + 账本 SUM，零遍历。
     - 分区用量：O(1) 系统调用，告警主功能（85% 线）与本函数耗时无关
@@ -620,10 +699,12 @@ def build_shelf_view(db, system_id: int, container_work) -> Path:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",
-    ).order_by(ArtifactIndex.hits.desc()).all()
+    ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     rows = [r for r in rows if r.system_id != COMMON_SYSTEM_ID or _common_passes(r, baseline)]
     lines = ["# 复用库货架（平台自动生成，勿手改；缺依赖先查此表）",
              "# 行首带『通用』= 所有系统可用的工具母包（公共池）；其余为本系统已验证产物",
+             f"# 共 {len(rows)} 件，按复用次数排列（同次数新件在前）；行多时工具可能截断显示，"
+             f"找不到就 grep /work/cache/INDEX.md 或 ls /work/cache/",
              "",
              "| 软件名 | 文件 | 版本 | 类型 | 构建上下文 | 大小 | 复用次数 | 来源标识 |",
              "|---|---|---|---|---|---|---|---|"]

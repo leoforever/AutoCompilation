@@ -2609,16 +2609,22 @@ async def list_artifacts(
     system_id: int | None = None,
     kind: str = "",
     status: str = "",
+    source: str = "",
     include_deleted: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),        # 拍板6：全体登录用户可查
 ):
-    """货架账本查询：pending/approved/存量/上传全在一页筛；软删行默认隐藏。"""
+    """货架账本查询：pending/approved/存量/上传全在一页筛；软删行默认隐藏。
+    source=任务号 精确筛该来源上架件；source=upload 筛全部上传件（11-06 来源聚合）。"""
     from app.models import ArtifactIndex
     from sqlalchemy import or_
     q = db.query(ArtifactIndex)
     if not include_deleted:
         q = q.filter(ArtifactIndex.deleted_at.is_(None))
+    if source == "upload":
+        q = q.filter(ArtifactIndex.origin == "upload")
+    elif source:
+        q = q.filter(ArtifactIndex.source_task_key == source)
     if search:
         like = f"%{search.strip()}%"
         q = q.filter(or_(ArtifactIndex.name.ilike(like), ArtifactIndex.name_norm.ilike(like),
@@ -2631,7 +2637,9 @@ async def list_artifacts(
         q = q.filter(ArtifactIndex.status == status)
     total = q.count()
     rows = q.order_by(ArtifactIndex.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
-    return ApiResponse(data={"total": total, "items": [{
+    from app.services.artifact_lib import shelf_sources
+    _sources = shelf_sources(db)   # 在架来源全集（不受分页影响）
+    return ApiResponse(data={"total": total, "sources": _sources, "items": [{
         "id": r.id, "name": r.name, "name_norm": r.name_norm, "version": r.version,
         "system_id": r.system_id, "kind": r.kind, "origin": r.origin, "status": r.status,
         "source_task_key": r.source_task_key, "uploader": r.uploader, "build_env": r.build_env,
@@ -2777,43 +2785,42 @@ async def reject_artifact(
     if not row:
         raise HTTPException(status_code=404, detail="账本行不存在")
     try:
-        reject_row(db, row, reason)
+        removed = reject_row(db, row, reason)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     log_audit(db, user_id=current_user.user_id, action="artifact_rejected",
               target_type="artifact", target_id=row.id, target_key=row.name, request=request,
-              details=f"reason={reason[:120]},from_task={row.source_task_key}")
+              details=f"reason={reason[:120]},from_task={row.source_task_key},removed={removed}")
     db.commit()
-    return ApiResponse(message="已驳回（理由留痕）")
+    return ApiResponse(data={"removed": removed}, message="已驳回（待晋升文件已清理，不可恢复）")
 
 
 @router.delete("/artifacts/{artifact_db_id}", response_model=ApiResponse)
 async def delete_artifact(
-    artifact_db_id: int, request: Request, purge: bool = False,
+    artifact_db_id: int, request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_preset_admin),
+    current_user: User = Depends(require_admin),          # 11-06 简化拍板①：管理员即可
 ):
-    """下架（拍板4：库的生死归管理员）。软删=出注入面（摘要/INDEX 重生成）；
-    purge=物理删货架文件+meta。路径安全：cache_path 解析必须仍在 cache_root 内。"""
+    """下架（简化语义=终局）：删货架文件+meta，账本打 withdrawn 墓碑（不可恢复，
+    反悔走重新上传/重编；restore/ledger 为应急后门不在 UI 挂）。pending 件请走驳回。"""
     from app.models import ArtifactIndex
-    from app.services.artifact_lib import cache_root, regenerate_index
+    from app.services.artifact_lib import withdraw_row
     row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
                                          ArtifactIndex.deleted_at.is_(None)).first()
     if not row:
         raise HTTPException(status_code=404, detail="账本行不存在")
-    row.deleted_at = datetime.utcnow()
-    removed = []
-    if purge and row.cache_path:
-        from app.services.artifact_lib import purge_shelf_files
-        try:
-            removed = purge_shelf_files(db, row)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    if row.status == "pending":
+        raise HTTPException(status_code=400, detail="待晋升件请用『驳回』")
+    try:
+        removed = withdraw_row(db, row)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     log_audit(db, user_id=current_user.user_id, action="artifact_deleted",
               target_type="artifact", target_id=row.id, target_key=row.name, request=request,
-              details=f"purge={purge},removed={removed}")
+              details=f"withdrawn,removed={removed},sha={(row.sha256 or '')[:12]}")
     db.commit()
-    return ApiResponse(data={"purged": removed}, message="已下架" + ("并物理清除" if purge else "（文件保留，可恢复）"))
+    return ApiResponse(data={"removed": removed},
+                       message="已下架（货架文件已删除，不可恢复）")
 
 
 @router.post("/artifacts/batch-approve", response_model=ApiResponse)
@@ -2869,10 +2876,10 @@ async def batch_reject_artifacts(
             failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
             continue
         try:
-            reject_row(db, row, body.reason)
+            removed = reject_row(db, row, body.reason)
             log_audit(db, user_id=current_user.user_id, action="artifact_rejected",
                       target_type="artifact", target_id=row.id, target_key=row.name,
-                      request=request, details=f"batch,reason={body.reason[:120]},from_task={row.source_task_key}")
+                      request=request, details=f"batch,reason={body.reason[:120]},from_task={row.source_task_key},removed={removed}")
             db.commit()
             ok.append({"id": row.id, "name": row.name})
         except ValueError as e:
@@ -2890,12 +2897,12 @@ async def batch_reject_artifacts(
 async def batch_delete_artifacts(
     body: ArtifactBatchRequest, request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_preset_admin),   # 与单件同闸：预置 admin
+    current_user: User = Depends(require_admin),          # 与单件同闸（简化拍板①）
 ):
-    """批量下架：软删恒做；purge=预览勾选才物理删（默认 false，11-06 拍板①——
-    不可逆动作必须逐批显式知情，路径越界件走 failed 不拖全批）。"""
+    """批量下架（简化=终局语义逐件化）：删货+withdrawn 墓碑；pending 混入=该件 failed
+    提示走驳回，不拖全批。"""
     from app.models import ArtifactIndex
-    from app.services.artifact_lib import purge_shelf_files
+    from app.services.artifact_lib import withdraw_row
     ok, failed = [], []
     for i in body.ids[:100]:
         row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i,
@@ -2903,14 +2910,15 @@ async def batch_delete_artifacts(
         if not row:
             failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
             continue
-        removed: list = []
+        if row.status == "pending":
+            db.rollback()
+            failed.append({"id": i, "name": row.name, "why": "待晋升件请用批量驳回"})
+            continue
         try:
-            if body.purge and row.cache_path:
-                removed = purge_shelf_files(db, row)
-            row.deleted_at = datetime.utcnow()
+            removed = withdraw_row(db, row)
             log_audit(db, user_id=current_user.user_id, action="artifact_deleted",
                       target_type="artifact", target_id=row.id, target_key=row.name,
-                      request=request, details=f"batch,purge={body.purge},removed={removed}")
+                      request=request, details=f"batch,withdrawn,removed={removed}")
             db.commit()
             ok.append({"id": row.id, "name": row.name, "removed": len(removed)})
         except ValueError as e:
@@ -2918,11 +2926,114 @@ async def batch_delete_artifacts(
             failed.append({"id": row.id, "name": row.name, "why": str(e)[:120]})
     log_audit(db, user_id=current_user.user_id, action="artifact_batch",
               target_type="artifact", target_id=None, target_key=f"delete x{len(body.ids)}",
-              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]},purge={body.purge}")
+              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]}")
     db.commit()
     return ApiResponse(data={"ok": ok, "failed": failed},
-                       message=f"下架 {len(ok)} 件" + ("（含物理删）" if body.purge else "（文件保留可恢复）")
-                               + (f"；失败 {len(failed)} 件" if failed else ""))
+                       message=f"下架 {len(ok)} 件（文件已删）" + (f"；失败 {len(failed)} 件" if failed else ""))
+
+
+def _purge_row_gate(db, row):
+    """销账资格判定（单条/批量共用）。合格返回 None，不合格返回人话原因。
+    拍板链（11-06 完整版）：账本行的物理删除=管理员最后一层橡皮擦——
+    ① 必须已下架（软删）② 货架文件必须已不在盘（有货先走下架purge）
+    ③ 销账前整行快照进审计 details（账可考不可复活）。自动机制永不触达本函数。"""
+    from app.services.artifact_lib import cache_root
+    if row.deleted_at is None:
+        return "未下架的行不可销账（先下架或驳回）"
+    if row.cache_path and (cache_root() / row.cache_path).is_file():
+        return "货架文件仍在盘——请先『下架+连货清除』再销账"
+    return None
+
+
+def _purge_snapshot(row) -> str:
+    """整行关键字段快照（审计里留底，行删后对账可考）。"""
+    keys = ("id", "name", "name_norm", "version", "system_id", "kind", "origin", "status",
+            "source_task_key", "uploader", "cache_path", "size_bytes", "hits", "views",
+            "source_commit", "glibc_requires", "sha256", "note")
+    return json.dumps({k: str(getattr(row, k, "")) for k in keys}, ensure_ascii=False)
+
+
+@router.delete("/artifacts/{artifact_db_id}/ledger", response_model=ApiResponse)
+async def purge_artifact_ledger(
+    artifact_db_id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),
+):
+    """销账（完整版第三层，11-06 拍板）：物理删除 artifact_index 行本身。
+    资格=已下架∧货不在盘；整行快照入审计后行即蒸发——账可考不可复活。
+    层级语义：下架(可逆) → 下架+清货(货不可逆/账在) → 销账(账不可逆/快照在)。"""
+    from app.models import ArtifactIndex
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账本行不存在")
+    why = _purge_row_gate(db, row)
+    if why:
+        raise HTTPException(status_code=400, detail=why)
+    log_audit(db, user_id=current_user.user_id, action="artifact_ledger_purged",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details="销账快照:" + _purge_snapshot(row))
+    db.delete(row)
+    db.commit()
+    return ApiResponse(message=f"已销账：{row.name}（快照见审计）")
+
+
+@router.post("/artifacts/{artifact_db_id}/restore", response_model=ApiResponse)
+async def restore_artifact(
+    artifact_db_id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),   # 与下架同闸（生死对偶）
+):
+    """恢复上架（11-06：下架=软删，文件仍在盘——清戳即满血，hits/views 历史账随行走）。
+    仅对软删行；货架件须文件仍在盘（purge 过的行没有可恢复的货，拒——重传/重编正路）。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import cache_root, regenerate_index
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_not(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="无此行或该行未下架")
+    if row.cache_path and not (cache_root() / row.cache_path).is_file():
+        raise HTTPException(status_code=400, detail="货架文件不在盘（已 purge），无法恢复；请重新上传或重编")
+    row.deleted_at = None
+    if row.cache_path:
+        regenerate_index(db, row.system_id)   # 在架投影即时回归（含同名 norm 路径）
+    log_audit(db, user_id=current_user.user_id, action="artifact_restored",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details=f"sys={row.system_id},status={row.status or '存量'},cache_path={row.cache_path or '-'}")
+    db.commit()
+    return ApiResponse(message=f"已恢复：{row.name}")
+
+
+@router.post("/artifacts/batch-purge-ledger", response_model=ApiResponse)
+async def batch_purge_ledger(
+    body: ArtifactBatchRequest, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),
+):
+    """批量销账：逐件资格判定（未下架/货在盘=failed 不拖批），快照审计×N + 一条总账。"""
+    from app.models import ArtifactIndex
+    ok, failed = [], []
+    for i in body.ids[:100]:
+        row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i).first()
+        if not row:
+            failed.append({"id": i, "name": "", "why": "行不存在（或已销）"})
+            continue
+        why = _purge_row_gate(db, row)
+        if why:
+            db.rollback()
+            failed.append({"id": i, "name": row.name, "why": why})
+            continue
+        log_audit(db, user_id=current_user.user_id, action="artifact_ledger_purged",
+                  target_type="artifact", target_id=row.id, target_key=row.name,
+                  request=request, details="销账快照:" + _purge_snapshot(row))
+        db.delete(row)
+        db.commit()
+        ok.append({"id": i, "name": row.name})
+    log_audit(db, user_id=current_user.user_id, action="artifact_batch",
+              target_type="artifact", target_id=None, target_key=f"purge-ledger x{len(body.ids)}",
+              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]}")
+    db.commit()
+    return ApiResponse(data={"ok": ok, "failed": failed},
+                       message=f"销账 {len(ok)} 行" + (f"；不合格 {len(failed)} 行" if failed else ""))
 
 
 @router.post("/artifacts/reindex", response_model=ApiResponse)
