@@ -178,6 +178,29 @@ def sha256_of(path) -> str:
     return h.hexdigest()
 
 
+def purge_shelf_files(db, row) -> list:
+    """物理删货架文件+meta，搬空即收 <norm> 空壳（单件/批量共用，11-06 抽出）。
+    cache_path 空=无文件可删返回 []；路径解析越出 cache 根抛 ValueError（端点转 400）。
+    ⚠ 只删货架件本体——软删（deleted_at）由调用方负责，本函数不碰账本状态。"""
+    root = cache_root().resolve()
+    target = (root / row.cache_path).resolve()
+    if not str(target).startswith(str(root) + "/"):
+        raise ValueError("货架路径异常，拒绝物理删")
+    removed = []
+    for p in (target, target.with_name(target.name + ".meta.json")):
+        if p.is_file():
+            p.unlink()
+            removed.append(p.name)
+    d = target.parent
+    if d.is_dir() and not any(d.iterdir()):   # 11-05 实弹遗留空目录教训（X11 锁在案）
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    regenerate_index(db, row.system_id)       # 文件没了，货架表同步（软删行已被过滤）
+    return removed
+
+
 # ── 晋升三门禁（stage6 success 调，返回可晋升清单+拒绝原因账）──────
 def collect_promotables(cache_out: Path, system_id: int) -> tuple[list[dict], list[str]]:
     """扫 cache_out → [{file, meta_path, name, name_norm, kind, size, meta}] 合格件。

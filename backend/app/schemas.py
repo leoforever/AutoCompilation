@@ -77,6 +77,13 @@ class TargetSystemUpdate(BaseModel):
     is_active: Optional[bool]
 
 
+class ArtifactBatchRequest(BaseModel):
+    """货架批量操作（11-06 拍板：pending 积压逐件点之痛）。上限 100 防误刷大事务面。"""
+    ids: List[int]
+    reason: str = "批量驳回"      # reject 用
+    purge: bool = False           # delete 用；前端预览默认不勾
+
+
 class TargetSystemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     system_id: int

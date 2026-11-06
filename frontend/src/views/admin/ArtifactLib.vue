@@ -8,6 +8,12 @@
         <el-divider direction="vertical" />
         <span>在架货架 <b>{{ disk.shelf_count }}</b> 件 / {{ disk.cache_mb }}MB（账本口径）</span>
         <el-tag v-if="disk.warn" type="warning" size="small" style="margin-left:10px">接近警戒线：请在本页决定去留（平台不会自动删货架）</el-tag>
+        <template v-if="isAdmin && sel.length">
+          <el-divider direction="vertical" />
+          <el-button size="small" type="success" @click="openBatch('approve')">批量通过 {{ sel.length }}</el-button>
+          <el-button size="small" type="warning" @click="openBatch('reject')">批量驳回 {{ sel.length }}</el-button>
+          <el-button v-if="canManage" size="small" type="danger" plain @click="openBatch('delete')">批量下架 {{ sel.length }}</el-button>
+        </template>
         <span class="spacer" />
         <el-button v-if="isAdmin" size="small" :loading="reindexing" @click="doReindex">账本对账</el-button>
         <el-button v-if="canManage" type="primary" size="small" @click="uploadVisible = true">上传工具</el-button>
@@ -36,7 +42,9 @@
       <el-checkbox v-if="tab === 'all'" v-model="showDeleted" @change="load">含已下架</el-checkbox>
     </div>
 
-    <el-table :data="rows" v-loading="loading" size="small" border>
+    <el-table :data="rows" v-loading="loading" size="small" border
+              @selection-change="(v: any[]) => sel = v">
+      <el-table-column v-if="isAdmin" type="selection" width="42" :selectable="() => isAdmin" />
       <el-table-column type="index" label="#" width="52" />
       <el-table-column prop="name" label="文件名" min-width="220" show-overflow-tooltip />
       <el-table-column prop="name_norm" label="软件名" width="150" show-overflow-tooltip />
@@ -133,6 +141,40 @@
     </el-dialog>
 
     <!-- 上传对话框（人放的免审直入；拍板6 权限=管理角色） -->
+    <el-dialog v-model="batchVisible" :title="batchTitle" width="640">
+      <el-alert v-if="batchAction === 'delete'" :closable="false" type="warning" style="margin-bottom:10px"
+                title="下架=软删可恢复；勾选物理清除后文件与 meta 立即删除、不可恢复——下方清单逐件过目再决定" />
+      <el-alert v-else-if="batchAction === 'approve'" :closable="false" type="info" style="margin-bottom:10px"
+                title="通过后文件移入货架并对全部编译任务可见（同名件按'新版本赢'合并历史账）" />
+      <el-table :data="sel" size="small" border max-height="240">
+        <el-table-column prop="id" label="#" width="52" />
+        <el-table-column prop="name" label="文件" min-width="200" show-overflow-tooltip />
+        <el-table-column label="系统" width="130">
+          <template #default="{ row }">{{ sysName(row.system_id) }}</template>
+        </el-table-column>
+        <el-table-column prop="kind" label="类型" width="80" />
+        <el-table-column prop="status" label="状态" width="90" />
+      </el-table>
+      <el-checkbox v-if="batchAction === 'delete'" v-model="batchPurge" style="margin-top:10px">
+        同时物理清除文件（purge，不可恢复）——默认不勾
+      </el-checkbox>
+      <div v-if="batchAction === 'reject'" style="margin-top:10px">
+        <el-input v-model="batchReason" placeholder="统一驳回理由（逐件留痕）" maxlength="120" show-word-limit />
+      </div>
+      <div v-if="batchResult" style="margin-top:10px;font-size:12px">
+        成功 {{ batchResult.ok.length }} 件<span v-if="batchResult.failed.length">；失败 {{ batchResult.failed.length }} 件：</span>
+        <ul style="margin:4px 0;padding-left:18px">
+          <li v-for="f in batchResult.failed" :key="f.id">#{{ f.id }} {{ f.name }} —— {{ f.why }}</li>
+        </ul>
+      </div>
+      <template #footer>
+        <el-button @click="batchVisible = false">关闭</el-button>
+        <el-button :type="batchAction === 'delete' ? 'danger' : 'primary'" :loading="batchBusy" :disabled="!!batchResult" @click="doBatch">
+          {{ batchAction === 'approve' ? '确认通过' : batchAction === 'reject' ? '确认驳回' : (batchPurge ? '确认下架并物理清除' : '确认下架（保留文件）') }}
+        </el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="uploadVisible" title="上传工具到复用货架" width="560">
       <el-form label-width="110px">
         <el-form-item label="目标系统">
@@ -204,6 +246,33 @@ const delPurge = ref(false)
 const uploadVisible = ref(false)
 const uploading = ref(false)
 const reindexing = ref(false)
+const sel = ref<any[]>([])
+const batchVisible = ref(false)
+const batchAction = ref<'approve' | 'reject' | 'delete'>('approve')
+const batchPurge = ref(false)          // 11-06 拍板：purge 在预览里默认不勾
+const batchReason = ref('批量驳回')
+const batchBusy = ref(false)
+const batchResult = ref<any>(null)
+const batchTitle = computed(() => ({ approve: '批量审批上架', reject: '批量驳回', delete: '批量下架' }[batchAction.value]))
+function openBatch(a: 'approve' | 'reject' | 'delete') {
+  batchAction.value = a
+  batchPurge.value = false             // 每次重开都回默认不勾
+  batchResult.value = null
+  batchVisible.value = true
+}
+async function doBatch() {
+  batchBusy.value = true
+  try {
+    const r: any = await api.post(`/admin/artifacts/batch-${batchAction.value}`, {
+      ids: sel.value.map((x) => x.id), reason: batchReason.value, purge: batchPurge.value,
+    })
+    batchResult.value = r?.data ?? { ok: [], failed: [] }
+    ElMessage.success(r?.message || '批量完成')
+    load(); if (isAdmin.value) loadDisk()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '批量操作失败') }
+  finally { batchBusy.value = false }
+}
+
 const up = reactive<any>({ system_id: '' as any, name: '', version: '', note: '', file: null as File | null })
 
 function fmtSize(b: number) {

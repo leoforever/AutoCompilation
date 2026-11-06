@@ -17,6 +17,7 @@ from app.schemas import (
     TargetSystemCreate, TargetSystemUpdate, TargetSystemResponse,
     SkillCreate, SkillUpdate, SkillResponse,
     UserPasswordReset, UserAdminCreate, UserAdminUpdate,
+    ArtifactBatchRequest,
     StatsOverview, ApiResponse
 )
 from app.dependencies import get_current_user, require_preset_admin, require_admin
@@ -2803,28 +2804,125 @@ async def delete_artifact(
     row.deleted_at = datetime.utcnow()
     removed = []
     if purge and row.cache_path:
-        root = cache_root().resolve()
-        target = (root / row.cache_path).resolve()
-        if not str(target).startswith(str(root) + "/"):
-            raise HTTPException(status_code=400, detail="货架路径异常，拒绝物理删")
-        for p in (target, target.with_name(target.name + ".meta.json")):
-            if p.is_file():
-                p.unlink()
-                removed.append(p.name)
-        # <norm> 目录搬空即收（11-05 实弹后遗留 demo-elf-tool/node 空目录教训；
-        # 目录清理非数据删除——文件已走，rmdir 只收空壳，不违"生死归管理员"拍板）
-        d = target.parent
-        if d.is_dir() and not any(d.iterdir()):
-            try:
-                d.rmdir()
-            except OSError:
-                pass
-        regenerate_index(db, row.system_id)     # 文件没了，货架表同步（软删行已被过滤）
+        from app.services.artifact_lib import purge_shelf_files
+        try:
+            removed = purge_shelf_files(db, row)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     log_audit(db, user_id=current_user.user_id, action="artifact_deleted",
               target_type="artifact", target_id=row.id, target_key=row.name, request=request,
               details=f"purge={purge},removed={removed}")
     db.commit()
     return ApiResponse(data={"purged": removed}, message="已下架" + ("并物理清除" if purge else "（文件保留，可恢复）"))
+
+
+@router.post("/artifacts/batch-approve", response_model=ApiResponse)
+async def batch_approve_artifacts(
+    body: ArtifactBatchRequest, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """批量审批上架。**逐件独立事务**：一件脏（文件不在盘/指纹不符/非 pending）
+    只失败自己、已成功不回滚——历史回填行常夹账实差，大事务会逼管理员退回逐件点。
+    审计双落：逐件 artifact_promoted（口径同单件）+ 一条 artifact_batch 总账。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import approve_row
+    ok, failed = [], []
+    for i in body.ids[:100]:
+        row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i,
+                                             ArtifactIndex.deleted_at.is_(None)).first()
+        if not row:
+            failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
+            continue
+        try:
+            rel = approve_row(db, row, current_user.user_id)
+            log_audit(db, user_id=current_user.user_id, action="artifact_promoted",
+                      target_type="artifact", target_id=row.id, target_key=row.name,
+                      request=request, details=f"batch,from_task={row.source_task_key},path={rel}")
+            db.commit()
+            ok.append({"id": row.id, "name": row.name})
+        except (FileNotFoundError, ValueError) as e:
+            db.rollback()
+            failed.append({"id": row.id, "name": row.name, "why": str(e)[:120]})
+    log_audit(db, user_id=current_user.user_id, action="artifact_batch",
+              target_type="artifact", target_id=None, target_key=f"approve x{len(body.ids)}",
+              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]}")
+    db.commit()
+    return ApiResponse(data={"ok": ok, "failed": failed},
+                       message=f"通过 {len(ok)} 件" + (f"；失败 {len(failed)} 件" if failed else ""))
+
+
+@router.post("/artifacts/batch-reject", response_model=ApiResponse)
+async def batch_reject_artifacts(
+    body: ArtifactBatchRequest, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """批量驳回：统一理由逐件留痕（reject_row 自带非 pending 拒——转 failed 不炸批）。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import reject_row
+    ok, failed = [], []
+    for i in body.ids[:100]:
+        row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i,
+                                             ArtifactIndex.deleted_at.is_(None)).first()
+        if not row:
+            failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
+            continue
+        try:
+            reject_row(db, row, body.reason)
+            log_audit(db, user_id=current_user.user_id, action="artifact_rejected",
+                      target_type="artifact", target_id=row.id, target_key=row.name,
+                      request=request, details=f"batch,reason={body.reason[:120]},from_task={row.source_task_key}")
+            db.commit()
+            ok.append({"id": row.id, "name": row.name})
+        except ValueError as e:
+            db.rollback()
+            failed.append({"id": row.id, "name": row.name, "why": str(e)[:120]})
+    log_audit(db, user_id=current_user.user_id, action="artifact_batch",
+              target_type="artifact", target_id=None, target_key=f"reject x{len(body.ids)}",
+              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]}")
+    db.commit()
+    return ApiResponse(data={"ok": ok, "failed": failed},
+                       message=f"驳回 {len(ok)} 件" + (f"；失败 {len(failed)} 件" if failed else ""))
+
+
+@router.post("/artifacts/batch-delete", response_model=ApiResponse)
+async def batch_delete_artifacts(
+    body: ArtifactBatchRequest, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_preset_admin),   # 与单件同闸：预置 admin
+):
+    """批量下架：软删恒做；purge=预览勾选才物理删（默认 false，11-06 拍板①——
+    不可逆动作必须逐批显式知情，路径越界件走 failed 不拖全批）。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import purge_shelf_files
+    ok, failed = [], []
+    for i in body.ids[:100]:
+        row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i,
+                                             ArtifactIndex.deleted_at.is_(None)).first()
+        if not row:
+            failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
+            continue
+        removed: list = []
+        try:
+            if body.purge and row.cache_path:
+                removed = purge_shelf_files(db, row)
+            row.deleted_at = datetime.utcnow()
+            log_audit(db, user_id=current_user.user_id, action="artifact_deleted",
+                      target_type="artifact", target_id=row.id, target_key=row.name,
+                      request=request, details=f"batch,purge={body.purge},removed={removed}")
+            db.commit()
+            ok.append({"id": row.id, "name": row.name, "removed": len(removed)})
+        except ValueError as e:
+            db.rollback()
+            failed.append({"id": row.id, "name": row.name, "why": str(e)[:120]})
+    log_audit(db, user_id=current_user.user_id, action="artifact_batch",
+              target_type="artifact", target_id=None, target_key=f"delete x{len(body.ids)}",
+              request=request, details=f"ok={len(ok)},failed={[f['id'] for f in failed]},purge={body.purge}")
+    db.commit()
+    return ApiResponse(data={"ok": ok, "failed": failed},
+                       message=f"下架 {len(ok)} 件" + ("（含物理删）" if body.purge else "（文件保留可恢复）")
+                               + (f"；失败 {len(failed)} 件" if failed else ""))
 
 
 @router.post("/artifacts/reindex", response_model=ApiResponse)
