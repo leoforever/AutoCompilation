@@ -37,7 +37,6 @@ description: |
 3. 安装 loongarch64 可用系统依赖：
 
    ```bash
-   dnf install -y sleef sleef-devel cpuinfo cpuinfo-devel
    dnf install -y python3-numpy python3-pyyaml python3-sympy python3-networkx
    dnf install -y openblas-devel
    dnf install -y numactl-devel libunwind-devel glog-devel gflags-devel libuv-devel
@@ -46,17 +45,30 @@ description: |
 
    实测预装版本：sleef 3.8.0-2、cpuinfo 24.09.26、numpy 1.26.4、PyYAML 6.0.2、sympy 1.11.1、networkx 2.8.8、OpenBLAS 0.3.28。
 
+   **sleef / cpuinfo 不在 dnf 仓库里**——`dnf install sleef-devel` 必报 `No match for
+   argument`，这不代表系统没有它们（多数镜像已预装）。先 `rpm -q sleef cpuinfo` 与
+   `ls /lib64/libsleef.so*` 核实；预装齐则直接走 `USE_SYSTEM_SLEEF=1 USE_SYSTEM_CPUINFO=1`。
+   确认缺失或头文件不齐时**不必再做多轮独立试编译探测**，直接按坑 6 的三处源码补丁打
+   （答案已验证过两代分支：2.16.0a0 与 v2.14.1）。
+
 4. 安装 Python 构建依赖。默认 pip 源不可用时，显式使用 `https://pypi.org/simple`：
 
    ```bash
    python3 -m pip install --index-url https://pypi.org/simple \
        'setuptools>=77,<82' 'packaging>=24.2' 'sympy>=1.13.3' \
-       pyyaml cmake ninja pybind11 typing-extensions filelock jinja2 \
+       pyyaml pybind11 typing-extensions filelock jinja2 \
        networkx fsspec optree scikit-build-core spin requests six \
        expecttest hypothesis psutil build
    ```
 
-   实测结果：cmake 4.4.4、ninja 1.13.2、optree 0.20.0、setuptools 81.0.0、sympy 1.14.0、packaging 26.3、scikit-build-core 1.1.1、build 1.6.1。cmake、ninja、optree、MarkupSafe、hypothesis、psutil 从 sdist 现场编译出 loongarch64 wheel。
+   **不要把 cmake / ninja 放进 pip 列表**（11-09 两任务实测：lpypi 与 pypi 的 cmake 都只有
+   sdist，pip 装它会现场自举 C++ 构建，10~21 分钟无收益，两次都靠 pkill 中途止损）。
+   ninja-build 步骤 2 的 dnf 清单已装；cmake 用系统自带（多数镜像预装 3.30.5，满足 pytorch
+   的 `>=3.27`；缺则 `dnf install -y cmake`，别走 pip）。
+   历史那次成功构建用的 pip cmake 4.4.4 / ninja 1.13.2 是从 sdist 现编的
+   （实测结果见下），能跑但不是必经之路，别再重付这段时间。
+
+   实测结果（历史那次，pip 版 cmake/ninja 在列时）：cmake 4.4.4、ninja 1.13.2、optree 0.20.0、setuptools 81.0.0、sympy 1.14.0、packaging 26.3、scikit-build-core 1.1.1、build 1.6.1。cmake、ninja、optree、MarkupSafe、hypothesis、psutil 从 sdist 现场编译出 loongarch64 wheel。
 
 5. 初始化顶层 submodule：
 
@@ -125,6 +137,9 @@ description: |
    USE_PYTORCH_QNNPACK=0 USE_FBGEMM=0 USE_KLEIDIAI=0 USE_VULKAN=0 USE_MPS=0 USE_MKLDNN=0
    USE_DISTRIBUTED=0 USE_SYSTEM_SLEEF=1 USE_SYSTEM_CPUINFO=1 USE_OPENMP=1 BLAS=OpenBLAS BUILD_TEST=0
    ```
+
+   注：`USE_SYSTEM_SLEEF=1 USE_SYSTEM_CPUINFO=1` 仅在确认系统预装两者头文件/so 时保留；
+   走坑 6 的源码补丁路线（sleef 从 third_party 一起编）时把这两项置 0，否则开关与补丁矛盾。
 
    实测 ninja 编译 1581 targets + install + 打包约 5 分钟，零 `error:`，产出：
 
@@ -248,20 +263,26 @@ description: |
 
    规避：用 `tomllib` 比对出全部缺失项，并从 `pyproject.toml` 删除这 11 条 license glob，不初始化无关 GPU 树；复核 missing=0。
 
-6. 源码构建 SLEEF 在 loongarch64 上失败。
+6. 源码构建 SLEEF 在 loongarch64 上失败（主编译 `[522/1847]` 附近报
+   `EMITSX1064`/`purec.scalar` 相关错误）。
 
-   实测规避：使用系统包：
+   **首选规避=打三处源码补丁**（11-09 在 2.16.0a0 与 v2.14.1 两代分支上验证一遍过）。
+   若能在货架或历史任务产物中取到 `loongarch64.patch` 成品就照抄；取不到则按下面
+   三处锚点自改：
 
-   ```bash
-   USE_SYSTEM_SLEEF=1 USE_SYSTEM_CPUINFO=1
-   ```
+   - sleef 的 cmake 架构配置 `Configure.cmake`：架构分支表增加 `SLEEF_ARCH_LOONGARCH`
+     映射到 `helperpurec_scalar.h`（等同 riscv64 等标量回退架构的处理）；
+   - `third_party/sleef/src/libm/CMakeLists.txt`：loongarch 分支补 `SLEEF_HEADER_LIST`
+     （照 riscv64 段落抄），否则不生成头文件；
+   - `third_party/sleef/src/arch/helperpurec_scalar.h`：守卫条件加
+     `|| defined(__loongarch__)`。
 
-   wheel 不再捆绑 `libsleef.so` 和 `libcpuinfo.so`，运行期依赖系统：
+   打完补丁 `rm -rf build` 重新 configure 再全量编，主编译一遍过。
 
-   ```text
-   /lib64/libsleef.so.3
-   /lib64/libcpuinfo.so.24.09.26
-   ```
+   曾经写过的"用系统包"方案（`USE_SYSTEM_SLEEF=1 USE_SYSTEM_CPUINFO=1`，wheel 不捆绑
+   libsleef/libcpuinfo、运行期依赖 `/lib64/libsleef.so.3`）在 openEuler-24.03-SP2
+   镜像上 **11-09 两次实测均未躲过失败**（一次主编译照样撞坑、一次探测后弃用），
+   仅在确认系统确实预装 sleef-devel 头文件时可作尝试，不要当作主路径。
 
 7. 递归 submodule 时报 `Unable to find current revision`。
 
