@@ -337,9 +337,11 @@ def start_qa_job(db_factory, user_id: int, question: str, task_db_id: "int|None"
                 + f"\n\n【问题】\n{sanitize_details(question)[:2000]}"
             )
             from app.services.experience_generator import _call_llm
-            # max_tokens 8192：思考模型 reasoning + JSON 引文原文同吃输出预算，
-            # 4096 在素材多时截断（11-03 E4 实测 LengthFinishReasonError）
-            raw = _call_llm(system, user_prompt, temperature=0.2, max_tokens=8192,
+            # max_tokens 32768：思考模型 reasoning + JSON 引文原文同吃输出预算——
+            # 4096 素材多时截断（11-03 E4）、8192 被 reasoning 独吞截尾（11-09 实测
+            # LengthFinishReasonError：8190 中 7571 是思考 token）；qwen token-plan
+            # max_completion_tokens=32768 直测 200（11-09），预算放大 4 倍
+            raw = _call_llm(system, user_prompt, temperature=0.2, max_tokens=32768,
                             call_site="qa.ask", response_json=True)  # JSON mode（④）
             parsed = _parse_out(raw)
             valid, invalid = validate_citations(parsed.get("citations"), chunks)
