@@ -206,6 +206,7 @@
         <el-form-item label="文件" required>
           <input type="file" ref="fileInput" @change="onFile" />
           <div class="tip" v-if="up.file">已选 {{ up.file.name }}（{{ fmtSize(up.file.size) }}，≤2048MB）</div>
+          <el-progress v-if="uploading" :percentage="upPct" style="width:100%;margin-top:8px" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -249,6 +250,7 @@ const rejectReason = ref('')
 const delVisible = ref(false)
 const uploadVisible = ref(false)
 const uploading = ref(false)
+const upPct = ref(0)
 const reindexing = ref(false)
 const sel = ref<any[]>([])
 const source = ref('')
@@ -451,14 +453,25 @@ async function doUpload() {
   fd.append('note', up.note)
   uploading.value = true
   try {
+    upPct.value = 0
     const r: any = await api.post('/admin/artifacts/upload', fd, {
-      headers: { 'Content-Type': 'multipart/form-data' },    // 照 Workbench 上传先例
+      headers: { 'Content-Type': 'multipart/form-data' },
+      // 11-09 修"上传成功没提示"：全局 30s 超时必掐大文件（rust 280MB 案）——
+      // 浏览器 abort 但后端流式接收多半已完成=静默成功假象。仅此调用长超时 30min，勿动全局
+      timeout: 30 * 60 * 1000,
+      onUploadProgress: (ev: any) => { if (ev.total) upPct.value = Math.round((ev.loaded * 100) / ev.total) },
     })
     ElMessage.success(r?.message || '已上架')
     uploadVisible.value = false
     Object.assign(up, { system_id: '', name: '', version: '', note: '', file: null })
     load(); loadDisk()
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '上传失败') }
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail
+    if (detail) ElMessage.error(detail)
+    else if (/timeout|ECONNABORTED|network|ERR_NETWORK/i.test(`${e?.code || ''} ${e?.message || ''}`))
+      ElMessage.error('上传连接中断：服务器可能仍在接收完毕，请稍后刷新列表确认——勿重复上传（同名件会产生重复货架行）')
+    else ElMessage.error('上传失败')
+  }
   finally { uploading.value = false }
 }
 
