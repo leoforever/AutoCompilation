@@ -906,6 +906,21 @@ async def reconcile_skills(request: Request, db: Session = Depends(get_db),
     return ApiResponse(message=msg, data=stats)
 
 
+@router.post("/skills/sync-content", response_model=ApiResponse)
+async def sync_skills_content(request: Request, db: Session = Depends(get_db),
+                              current_user: User = Depends(get_current_user)):
+    """从磁盘同步 Skill 正文进数据库（页面按钮显式触发，reconcile 只报不写）。
+    场景：git pull 更新了 skills/ 磁盘文件，DB 备份行仍旧文本。"""
+    from app.services.skill_loader import sync_disk_content
+    st = sync_disk_content(db)
+    msg = (f"已从磁盘同步 {len(st['synced'])} 篇：" + "、".join(st["synced"][:8])) if st["synced"] else "没有需要同步的内容（磁盘与数据库一致）"
+    if st["synced"]:
+        log_audit(db, user_id=current_user.user_id, action="skill_sync_content", target_type="skill",
+                  request=request, details=f"disk→db synced={st['synced']}")
+        db.commit()
+    return ApiResponse(message=msg, data=st)
+
+
 @router.get("/skills/trash", response_model=ApiResponse)
 async def list_trash_skills(db: Session = Depends(get_db)):
     """回收站机制已下线（删 = 真删）。保留接口返空，兼容前端可能残留的菜单"""

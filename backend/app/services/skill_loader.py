@@ -202,9 +202,25 @@ def reconcile_all(db: "Session", *, dry_run: bool = False) -> dict:
     disk_only_keys = disk_keys - set(db_skills.keys())
     db_only_keys = set(db_skills.keys()) - disk_keys
 
+    # 第三态 mismatch（11-09）：两边都有但内容不一致——典型来源是 git pull 更新了磁盘
+    # 而 DB 备份还是旧文（models 注释既定"磁盘为准"）。reconcile 只检测上报，
+    # 绝不动手：覆盖 DB 是写操作，由管理页【从磁盘同步】按钮（sync_disk_content）显式触发。
+    mismatch = []
+    for key in sorted(disk_keys & set(db_skills.keys())):
+        skill_type, skill_name = key
+        try:
+            disk_body = (SKILLS_DIR_HOST / skill_type / skill_name / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        db_body = db_skills[key].skill_content
+        if (db_body or "").strip() != disk_body.strip():
+            mismatch.append(skill_name)
+
     stats = {
         "disk_only": 0,
         "db_only": 0,
+        "mismatch": len(mismatch),
+        "mismatch_names": mismatch,
         "total_disks": len(disk_keys),
         "total_dbs": len(db_skills),
     }
@@ -256,6 +272,32 @@ def reconcile_all(db: "Session", *, dry_run: bool = False) -> dict:
             db.rollback()
             logger.warning("[reconcile] db_only 删除失败 %s/%s: %s", skill_type, skill_name, e)
 
+    return stats
+
+
+def sync_disk_content(db) -> dict:
+    """【从磁盘同步】按钮后端：对 reconcile 认定的 mismatch 行，把磁盘 SKILL.md
+    刷进 DB（skill_content + description 重析）。只覆盖两边都存在且内容不一致的行——
+    disk_only 归 reconcile 插入、db_only 归 reconcile 删除，本函数不越权。
+    磁盘是权威源（models 注释既定）；调用方负责审计。返回 {synced:[names]}。"""
+    from app.models import Skill
+    stats = {"synced": []}
+    for s in db.query(Skill).filter(Skill.deleted_at.is_(None)).all() if hasattr(Skill, "deleted_at") else db.query(Skill).all():
+        p = SKILLS_DIR_HOST / str(s.type) / str(s.name) / "SKILL.md"
+        if not p.is_file():
+            continue
+        try:
+            body = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if (s.skill_content or "").strip() == body.strip():
+            continue
+        s.skill_content = body
+        d = _parse_frontmatter_description(body)
+        if d:
+            s.description = d
+        stats["synced"].append(str(s.name))
+    db.commit()
     return stats
 
 

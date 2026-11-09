@@ -50,6 +50,16 @@
         <el-button type="primary" @click="showAddDialog">+ 新增 Skill</el-button>
       </div>
 
+      <!-- 磁盘/库不一致提示条：git 更新磁盘后 DB 备份是旧文；点按钮才同步（不自动覆盖） -->
+      <el-alert v-if="mismatchCount" type="warning" :closable="true" show-icon style="margin-bottom:10px"
+                @update:visible="mismatchCount = 0">
+        <template #title>
+          {{ `磁盘有 ${mismatchCount} 篇攻略与数据库备份不一致（通常是 git 更新所致，编译任务读磁盘不受影响）：${mismatchNames.slice(0, 5).join('、')}` }}
+          <el-button size="small" type="warning" plain style="margin-left:10px"
+                     :loading="syncing" @click="doSyncContent">从磁盘同步</el-button>
+        </template>
+      </el-alert>
+
       <!-- 列表 -->
       <el-table :data="skills" stripe style="width: 100%" v-loading="loading">
         <el-table-column type="index" label="#" width="56" />
@@ -268,6 +278,19 @@ import { ElMessage, ElMessageBox, type FormInstance } from 'element-plus'
 const skills = ref<any[]>([])
 const systems = ref<any[]>([])
 const loading = ref(false)
+const mismatchCount = ref(0)
+const mismatchNames = ref<string[]>([])
+const syncing = ref(false)
+async function doSyncContent() {
+  syncing.value = true
+  try {
+    const r: any = await api.post('/admin/skills/sync-content')
+    ElMessage.success(r?.message || '同步完成')
+    mismatchCount.value = 0; mismatchNames.value = []
+    await loadSkills()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '同步失败') }
+  finally { syncing.value = false }
+}
 const saving = ref(false)
 
 // 回收站
@@ -385,6 +408,11 @@ onMounted(async () => {
     const s = res.data || {}
     if (s.disk_only || s.db_only) {
       ElMessage.success(`已同步：新增 ${s.disk_only}，清理 ${s.db_only}`)
+    }
+    // 11-09 三态：磁盘与库内容不一致（git pull 后典型）——只提示，用户点按钮才刷库
+    if (s.mismatch) {
+      mismatchNames.value = s.mismatch_names || []
+      mismatchCount.value = s.mismatch
     }
   } catch {
     // 静默失败（reconcile 是 best-effort）
