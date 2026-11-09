@@ -791,7 +791,10 @@ _USE_RE = re.compile(
     #   tar -C /usr/local -xzf f   （DADECE 案：-C 前置旧式漏判，hits 真丢）
     #   tar -xzf f / tar xzf f     （-x 可藏合写 flag 里：-\w*x\w*）
     #   清点是览：-tzf/-tf 不含 x，天然走 views（-tzf 的 t 不会误配）
-    r"(?:^|[;&|]|\bsudo)\s*(?:cp\b|mv\b|install\b|tar\s+(?:\S+\s+)*?-?\w*x\w*"
+    # 包装前缀（11-09 typstyle 案）：nohup/setsid + bash|sh -c ' 后紧跟引号再启动消费动词
+    # 必须判"用"——只许这组白名单壳，裸引号进分隔符类会让 echo "cp …货架" 变假 hits（E4 防线）
+    r"(?:^|[;&|]|\bsudo)\s*(?:(?:nohup|setsid)\s+)*(?:\b(?:ba)?sh\s+-\w*c\w*\s+)?[\"']?\s*"
+    r"(?:cp\b|mv\b|install\b|tar\s+(?:\S+\s+)*?-?\w*x\w*"
     r"|unzip\b|dpkg\s+-i|rpm\s+-i|npm\s+i(?:nstall)?\b|pip\s+install|python\d*\s+-m\s+pip\s+install)"
     r"[^\n]*?(?:/work/cache/|(?<![\w./\-])\./cache/)")
 
