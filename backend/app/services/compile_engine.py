@@ -819,93 +819,102 @@ numpy2.x 桥接瘫痪这类坑（2500D1 实证）。只放成品，
                     break
         threading.Thread(target=_wall_guard, daemon=True).start()
         _warned_at_80 = False
-        for chunk in agent.stream(
-            {"messages": [{"role": "user", "content": task_prompt}]},
-            stream_mode="values",
-        ):
-            chunk_count += 1
-            elapsed = time.time() - start_ts
-            # 心跳：距上一 chunk 静默 > _hb_gap 秒 → 补一行（stream 同步阻塞，心跳随下一 chunk 落地；
-            # 对 60s 静默 pip install 这类场景，用户至少能看到"刚才静默了 Xs，不是卡死"）
-            _gap = time.time() - _last_chunk_ts
-            if _gap > _hb_gap:
-                _log(state, "info",
-                     f"[阶段5] 💓 静默 {_gap:.0f}s 后恢复（长命令执行中，非卡死）",
-                     on_log)
-            _last_chunk_ts = time.time()
-            # 上限检查
-            if chunk_count > _max_chunks:
-                _log(state, "error",
-                     f"[阶段5] 超过 chunk 上限 ({_max_chunks})，强退（疑似 AI 死循环）",
-                     on_log)
-                state["status"] = TaskStatus.FAILED.value
-                state["last_error"] = f"stage5 超时：chunk 计数 {chunk_count} > {_max_chunks}"
-                state["_stage5_done"] = True
-                return state
-            if elapsed > _max_seconds:
-                _log(state, "error",
-                     f"[阶段5] 超过时长上限 ({_max_seconds}s)，强退",
-                     on_log)
-                state["status"] = TaskStatus.FAILED.value
-                state["last_error"] = f"stage5 超时：耗时 {elapsed:.1f}s > {_max_seconds}s"
-                state["_stage5_done"] = True
-                return state
-            # 软警告：超过 80% 时限发一条提示（用户能看到"在跑"）
-            if not _warned_at_80 and elapsed > _max_seconds * 0.8:
-                _warned_at_80 = True
-                _log(state, "warn",
-                     f"[阶段5] 已用 {elapsed:.0f}s / {_max_seconds}s（80%），仍在跑；如非预期可手动取消",
-                     on_log)
-            # 死循环启发式：扫这一批新增消息里的 tool result
-            messages = chunk.get("messages", [])
-            new_msgs = messages[prev_msg_count:]
-            now = time.time()
-            for nm in new_msgs:
-                nm_type = getattr(nm, "type", None) or getattr(nm, "role", None) or nm.__class__.__name__
-                if nm_type != "tool":
-                    continue
-                content = nm.content if isinstance(nm.content, str) else str(nm.content or "")
-                # T9-V：同一批 ToolMessage 喂收尾闸门做全绿检测（RESULT 机读行）
-                if _green_gate is not None:
-                    _green_gate.scan_tool_text(content)
-                is_fail = "error:" in content.lower() or "traceback" in content.lower()
-                # 间隔 = 当前 wall-clock - 上一条 tool result 时间
-                gap = now - _last_tool_ts
-                if is_fail and gap < _loop_window:
-                    _recent_fast_fail_count += 1
-                    if _recent_fast_fail_count >= _loop_threshold:
-                        _log(state, "error",
-                             f"[阶段5] 连续 {_loop_threshold} 次快速失败（间隔 < {_loop_window}s），疑似死循环，强退",
-                             on_log)
-                        state["status"] = TaskStatus.FAILED.value
-                        state["last_error"] = (
-                            f"stage5 死循环：连续 {_loop_threshold} 次快速失败"
-                        )
-                        state["_stage5_done"] = True
-                        return state
-                else:
-                    _recent_fast_fail_count = 0
-                _last_tool_ts = now
-            # 外部标了 failed/success：_periodic_persist 已经感知，强退
-            if state.get("_external_terminal"):
-                _log(state, "error",
-                     f"[阶段5] 外部已标 {state['_external_terminal']}，强退",
-                     on_log)
-                state["status"] = state["_external_terminal"]
-                state["last_error"] = state.get("_external_error") or state["last_error"]
-                state["_stage5_done"] = True
-                return state
+        _early_exit = False  # 循环体内提前终结（超时/上限/外部/死循环）→ 外层直接 return state
 
-            for msg in messages[prev_msg_count:]:
-                _render_agent_message(msg, state, start_ts, on_log)
-                # 阶段5 子阶段判定（2026-11-02）：扫 AI 原文里的声明行——用 msg.content 原文
-                # 而非 log 行（log 行被 _truncate 到 160 字符，长清单不可靠）
-                if (getattr(msg, "type", None) or getattr(msg, "role", None)) == "ai":
-                    _scan_stage5_marks(
-                        msg.content if isinstance(msg.content, str) else str(msg.content or ""),
-                        state, on_log)
-            prev_msg_count = len(messages)
-            result = chunk
+        def _stream_once(_input):
+            nonlocal result, prev_msg_count, chunk_count, _last_chunk_ts
+            nonlocal _warned_at_80, _recent_fast_fail_count, _last_tool_ts, _early_exit
+            for chunk in agent.stream(_input, stream_mode="values"):
+                chunk_count += 1
+                elapsed = time.time() - start_ts
+                # 心跳：距上一 chunk 静默 > _hb_gap 秒 → 补一行（stream 同步阻塞，心跳随下一 chunk 落地；
+                # 对 60s 静默 pip install 这类场景，用户至少能看到"刚才静默了 Xs，不是卡死"）
+                _gap = time.time() - _last_chunk_ts
+                if _gap > _hb_gap:
+                    _log(state, "info",
+                         f"[阶段5] 💓 静默 {_gap:.0f}s 后恢复（长命令执行中，非卡死）",
+                         on_log)
+                _last_chunk_ts = time.time()
+                # 上限检查
+                if chunk_count > _max_chunks:
+                    _log(state, "error",
+                         f"[阶段5] 超过 chunk 上限 ({_max_chunks})，强退（疑似 AI 死循环）",
+                         on_log)
+                    state["status"] = TaskStatus.FAILED.value
+                    state["last_error"] = f"stage5 超时：chunk 计数 {chunk_count} > {_max_chunks}"
+                    state["_stage5_done"] = True
+                    _early_exit = True
+                    return
+                if elapsed > _max_seconds:
+                    _log(state, "error",
+                         f"[阶段5] 超过时长上限 ({_max_seconds}s)，强退",
+                         on_log)
+                    state["status"] = TaskStatus.FAILED.value
+                    state["last_error"] = f"stage5 超时：耗时 {elapsed:.1f}s > {_max_seconds}s"
+                    state["_stage5_done"] = True
+                    _early_exit = True
+                    return
+                # 软警告：超过 80% 时限发一条提示（用户能看到"在跑"）
+                if not _warned_at_80 and elapsed > _max_seconds * 0.8:
+                    _warned_at_80 = True
+                    _log(state, "warn",
+                         f"[阶段5] 已用 {elapsed:.0f}s / {_max_seconds}s（80%），仍在跑；如非预期可手动取消",
+                         on_log)
+                # 死循环启发式：扫这一批新增消息里的 tool result
+                messages = chunk.get("messages", [])
+                new_msgs = messages[prev_msg_count:]
+                now = time.time()
+                for nm in new_msgs:
+                    nm_type = getattr(nm, "type", None) or getattr(nm, "role", None) or nm.__class__.__name__
+                    if nm_type != "tool":
+                        continue
+                    content = nm.content if isinstance(nm.content, str) else str(nm.content or "")
+                    # T9-V：同一批 ToolMessage 喂收尾闸门做全绿检测（RESULT 机读行）
+                    if _green_gate is not None:
+                        _green_gate.scan_tool_text(content)
+                    is_fail = "error:" in content.lower() or "traceback" in content.lower()
+                    # 间隔 = 当前 wall-clock - 上一条 tool result 时间
+                    gap = now - _last_tool_ts
+                    if is_fail and gap < _loop_window:
+                        _recent_fast_fail_count += 1
+                        if _recent_fast_fail_count >= _loop_threshold:
+                            _log(state, "error",
+                                 f"[阶段5] 连续 {_loop_threshold} 次快速失败（间隔 < {_loop_window}s），疑似死循环，强退",
+                                 on_log)
+                            state["status"] = TaskStatus.FAILED.value
+                            state["last_error"] = (
+                                f"stage5 死循环：连续 {_loop_threshold} 次快速失败"
+                            )
+                            state["_stage5_done"] = True
+                            _early_exit = True
+                            return
+                    else:
+                        _recent_fast_fail_count = 0
+                    _last_tool_ts = now
+                # 外部标了 failed/success：_periodic_persist 已经感知，强退
+                if state.get("_external_terminal"):
+                    _log(state, "error",
+                         f"[阶段5] 外部已标 {state['_external_terminal']}，强退",
+                         on_log)
+                    state["status"] = state["_external_terminal"]
+                    state["last_error"] = state.get("_external_error") or state["last_error"]
+                    state["_stage5_done"] = True
+                    _early_exit = True
+                    return
+
+                for msg in messages[prev_msg_count:]:
+                    _render_agent_message(msg, state, start_ts, on_log)
+                    # 阶段5 子阶段判定（2026-11-02）：扫 AI 原文里的声明行——用 msg.content 原文
+                    # 而非 log 行（log 行被 _truncate 到 160 字符，长清单不可靠）
+                    if (getattr(msg, "type", None) or getattr(msg, "role", None)) == "ai":
+                        _scan_stage5_marks(
+                            msg.content if isinstance(msg.content, str) else str(msg.content or ""),
+                            state, on_log)
+                    prev_msg_count = len(messages)
+                    result = chunk
+        _stream_once({"messages": [{"role": "user", "content": task_prompt}]})
+        if _early_exit:
+            return state
         state["_stage5_done"] = True
         if result is None:
             result = {"messages": []}
@@ -913,13 +922,45 @@ numpy2.x 桥接瘫痪这类坑（2500D1 实证）。只放成品，
         elapsed = time.time() - start_ts
         _log(state, "info", f"[阶段5] DeepAgent 完成: 耗时 {elapsed:.1f}s, chunks={chunk_count}", on_log)
 
-        if "编译成功" in str(final) or "success" in str(final).lower():
-            state["status"] = TaskStatus.SUCCESS.value
-            _log(state, "success", f"[阶段5] 编译成功", on_log)
-        else:
+        # 终局收口（11-09 CA1688 案：模型半截句无工具调用被当终局、'success' 子串误判双向风险）：
+        # C=只认显式『编译成功/编译失败』声明；A=未声明且有预算→带全史催轮续跑；
+        # B=催尽仍未声明→如实标"未声明终态即中止"，不再谎称"编译失败:<半句>"
+        try:
+            _nudge_max = int(get_cfg("stage5.nudge_rounds", 2))
+        except (TypeError, ValueError):
+            _nudge_max = 2
+        _nudged = 0
+        while True:
+            _f = str(final or "")
+            if "编译成功" in _f:
+                state["status"] = TaskStatus.SUCCESS.value
+                _log(state, "success", "[阶段5] 编译成功", on_log)
+                break
+            if "编译失败" in _f:
+                state["status"] = TaskStatus.FAILED.value
+                state["last_error"] = f"编译失败: {_truncate(_f, 500)}"
+                _log(state, "error", state["last_error"], on_log)
+                break
+            if _nudged < _nudge_max and time.time() - start_ts < _max_seconds:
+                _nudged += 1
+                _log(state, "warn",
+                     f"[阶段5] 最终输出无『编译成功/编译失败』声明（疑半截句早退，CA1688 防线），"
+                     f"催第 {_nudged}/{_nudge_max} 轮", on_log)
+                _hist = list(result["messages"]) if result and result.get("messages") else []
+                _hist.append({"role": "user", "content":
+                              "你上一条消息未声明任务终态且未调用任何工具——若工作未完成请继续执行；"
+                              "若已完成，必须输出含『编译成功』或『编译失败』字样的最终总结。"})
+                _stream_once({"messages": _hist})
+                if _early_exit:
+                    return state
+                final = result["messages"][-1].content if result and result.get("messages") else ""
+                continue
             state["status"] = TaskStatus.FAILED.value
-            state["last_error"] = f"编译失败: {_truncate(str(final), 500)}"
+            state["last_error"] = (
+                f"AI 未声明终态即中止（催 {_nudged} 轮无果；非编译失败）："
+                f"最后输出 {_truncate(_f, 200)}")
             _log(state, "error", state["last_error"], on_log)
+            break
 
         # 子阶段兜底定稿（2026-11-02）：声明缺失时按最终输出保守推断
         # 先扫 final——最终 assistant 消息走 result["messages"][-1]，不经过 chunk 循环的
