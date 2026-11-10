@@ -291,6 +291,12 @@ def sync_disk_content(db) -> dict:
         except OSError:
             continue
         if (s.skill_content or "").strip() == body.strip():
+            # 正文一致但描述仍是旧解析器的竖线产物 → 顺手重析（11-09 生产实弹暴露：
+            # 内容同步在先、解析器修好在后，description 没人负责补）
+            d = _parse_frontmatter_description(body)
+            if d and (s.description or "").strip() in ("", "|", ">", "|-", ">-"):
+                s.description = d
+                stats["synced"].append(str(s.name))
             continue
         s.skill_content = body
         d = _parse_frontmatter_description(body)
@@ -310,10 +316,25 @@ def _parse_frontmatter_description(content: str) -> str | None:
     if end < 0:
         return None
     fm = content[4:end]
-    m = re.search(r"^description:\s*(.+?)\s*$", fm, re.MULTILINE)
+    m = re.search(r"^description:[ \t]*(.*?)[ \t]*$", fm, re.MULTILINE)
     if not m:
         return None
     val = m.group(1).strip()
+    if val in ("|", ">", "|-", ">-", "|+", ">+"):
+        # block scalar（11-09 修）：10 篇里 7 篇用 description: | 多行写法，旧行式解析
+        # 取到 "|" 本身。收 description 后的缩进行直到顶格键；换行并以空格连接
+        # （管理页单行展示；AI 命中读磁盘原文不受影响）。不用 yaml 整块解析：
+        # 攻略描述里半角冒号常见，YAML 严格模式反而整块炸 None。
+        parts = []
+        for line in fm[m.end():].split("\n"):
+            if not line.strip():
+                continue
+            if line[0] in " \t":
+                parts.append(line.strip())
+            else:
+                break
+        val = " ".join(parts)
+        return val or None
     if " #" in val:
         val = val.split(" #", 1)[0].strip()
     if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
