@@ -45,9 +45,14 @@
         <el-table-column label="产物" min-width="140">
           <template #default="{ row }">
             <span v-if="!row.artifact_path" class="muted">—</span>
-            <span v-else :title="row.artifact_path" style="cursor:help">
-              {{ artifactSummary(row.artifact_path, row.bundle_size) }}
-            </span>
+            <el-tooltip v-else placement="right" effect="light" :show-after="200">
+              <template #content>
+                <div class="artifact-tip">
+                  <div v-for="(l, i) in artifactTipLines(row)" :key="i">{{ l }}</div>
+                </div>
+              </template>
+              <span style="cursor:help">{{ artifactSummary(row.artifact_path, row.bundle_size) }}</span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="时间" width="160">
@@ -241,20 +246,38 @@ function formatDate(dateStr: string) {
 }
 
 // artifact_path 是 JSON 字符串：文件 {name,size}；目录 {name:'x/', type:'dir', files}（不记磁盘和）
-// 摘要：首条目名 + 其余计数 + 真实下载体积（bundle_size=artifacts.tar.gz 字节，无包回退清单和标≈）
-function artifactSummary(artifactPath: string, bundleSize?: number): string {
+// 解析单源：列内摘要与悬停清单共用（容器内 path 不外漏——人看的地方只出现业务信息）
+function artifactItems(artifactPath: string): { name: string; type?: string; size?: number; files?: number }[] {
   try {
     const arr = JSON.parse(artifactPath)
-    if (!Array.isArray(arr) || arr.length === 0) return '—'
-    const first = arr[0]
-    const name = first.name || '?'
-    const totalBytes = bundleSize ?? arr.reduce((s: number, a: any) => s + (a.size || 0), 0)
-    const sizeStr = formatSize(totalBytes) + (bundleSize ? '' : '≈')
-    if (arr.length === 1) return `${name} (${sizeStr})`
-    return `${name} +${arr.length - 1}个 (${sizeStr})`
+    return Array.isArray(arr) ? arr : []
   } catch {
-    return '?'
+    return []
   }
+}
+
+// 悬停人话清单：逐行 "名称 · 大小/含N文件"，尾行打包体积（bundle_size=artifacts.tar.gz 真实字节）
+function artifactTipLines(row: any): string[] {
+  const items = artifactItems(row.artifact_path || '')
+  if (!items.length) return []
+  const lines = items.map(it =>
+    it.type === 'dir' || it.files
+      ? `${it.name} · 含 ${it.files ?? '?'} 个文件`
+      : `${it.name} · ${formatSize(it.size || 0)}`)
+  const total = row.bundle_size ?? items.reduce((s: number, a: any) => s + (a.size || 0), 0)
+  lines.push(`打包下载 ${formatSize(total)}${row.bundle_size ? '' : '≈'}（${row.bundle_size ? '真实包大小' : '按清单估算'}）`)
+  return lines
+}
+
+// 摘要：首条目名 + 其余计数 + 真实下载体积（bundle_size=artifacts.tar.gz 字节，无包回退清单和标≈）
+function artifactSummary(artifactPath: string, bundleSize?: number): string {
+  const arr = artifactItems(artifactPath)
+  if (!arr.length) return '—'
+  const name = arr[0].name || '?'
+  const totalBytes = bundleSize ?? arr.reduce((s: number, a: any) => s + (a.size || 0), 0)
+  const sizeStr = formatSize(totalBytes) + (bundleSize ? '' : '≈')
+  if (arr.length === 1) return `${name} (${sizeStr})`
+  return `${name} +${arr.length - 1}个 (${sizeStr})`
 }
 
 function formatSize(bytes: number): string {
@@ -676,6 +699,7 @@ onBeforeUnmount(() => { stopDraftWatch(); hidePendingMsg() })   // 卸载停流+
 .page-sub { color: var(--text3); font-size: 12.5px; margin-bottom: 18px }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px }
 .muted { color: var(--text3); font-size: 12px }
+.artifact-tip { line-height: 1.7; font-size: 12.5px; max-width: 340px }
 .term { background: #0f172a; color: #cbd5e1; border-radius: 8px; padding: 14px; font-family: monospace; font-size: 12.5px; max-height: 400px; overflow: auto; line-height: 1.7 }
 .log-line.ok { color: #4ade80 }
 .log-line.err { color: #f87171 }
