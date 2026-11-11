@@ -54,7 +54,19 @@
           </el-button>
         </el-form-item>
       </el-form>
+      <div class="login-footer">
+        登录即表示同意
+        <el-link type="primary" underline="never" @click="openDisclaimer">《使用免责声明》</el-link>
+      </div>
     </div>
+
+    <!-- 免责声明弹层：正文取自静态文件 /disclaimer.txt，改文案不动代码 -->
+    <el-dialog v-model="showDisclaimer" title="使用免责声明" width="720px" top="6vh">
+      <div class="disclaimer-body">{{ disclaimerText || '加载中…' }}</div>
+      <template #footer>
+        <el-button @click="showDisclaimer = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 注册弹窗 -->
     <el-dialog v-if="allowSelfRegister" v-model="showRegister" title="注册账号" width="400px">
@@ -109,6 +121,19 @@ const rules = {
 // 注册相关（allowSelfRegister=false 时入口与弹窗都不渲染）
 const allowSelfRegister = false
 const showRegister = ref(false)
+const showDisclaimer = ref(false)
+const disclaimerText = ref('')
+async function openDisclaimer() {
+  showDisclaimer.value = true
+  if (!disclaimerText.value) {
+    try {
+      const r = await fetch('/disclaimer.txt')
+      disclaimerText.value = r.ok ? await r.text() : '声明文件加载失败，请联系管理员'
+    } catch {
+      disclaimerText.value = '声明文件加载失败，请检查网络后重试'
+    }
+  }
+}
 const registerLoading = ref(false)
 const regFormRef = ref()
 const registerForm = reactive({
@@ -187,6 +212,20 @@ async function handleRegister() {
 </script>
 
 <style scoped>
+.login-footer {
+  text-align: center;
+  font-size: 13px;
+  color: #98a3b8;
+  margin-top: 6px;
+}
+.disclaimer-body {
+  max-height: 62vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 13.5px;
+  line-height: 1.8;
+  color: #333;
+}
 .login-container {
   min-height: 100vh;
   display: flex;

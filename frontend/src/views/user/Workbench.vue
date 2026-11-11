@@ -62,6 +62,13 @@
           </el-radio-group>
         </div>
 
+        <!-- 风险提醒（免责声明第二条核心风险的浓缩版，常驻在提交动作前） -->
+        <div class="ai-notice">
+          提示：编译由云端 AI 执行，您的源码与日志会发送给第三方大模型（通义千问 / MiniMax 等）处理。
+          涉密或含密钥的代码请谨慎提交，详见
+          <el-link type="primary" :underline="false" class="ai-notice-link" @click="showDisclaimer = true">免责声明</el-link>。
+        </div>
+
         <div style="display:flex;gap:10px">
           <el-button type="primary" @click="submitCompile" :loading="compiling">
             🚀 发起云端编译
@@ -148,6 +155,14 @@
         <el-button v-if="compileResult?.status === 'success'" type="success" @click="downloadArtifact">📦 下载全部产物 (.tar.gz)</el-button>
       </div>
     </div>
+
+    <!-- 免责声明弹层（正文取静态 /disclaimer.txt，onMounted 预取，点开秒显） -->
+    <el-dialog v-model="showDisclaimer" title="使用免责声明" width="720px" top="6vh">
+      <div class="disclaimer-body">{{ disclaimerText || '加载中…' }}</div>
+      <template #footer>
+        <el-button @click="showDisclaimer = false">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 经验草稿预览/编辑/提交 对话框 -->
     <el-dialog v-model="draftVisible" title="✨ AI 生成的经验草稿" width="780px" :close-on-click-modal="false">
@@ -400,6 +415,8 @@ async function restoreFromTaskId(taskId: string): Promise<boolean> {
 
 onMounted(async () => {
   loadSystems()
+  // 免责声明预取（不 await，纯后台）：用户点开弹层时秒显
+  fetch('/disclaimer.txt').then(r => r.ok ? r.text() : '').then(t => { if (t) disclaimerText.value = t }).catch(() => {})
   // 0) 先确保 skills 全量到位（await：restore 解析命中名单要用它做存在性校验，
   //    不 await 会竞态——availableSkills 空时所有解析结果被误过滤）
   await fetchAvailableSkills()
@@ -756,7 +773,11 @@ function downloadArtifact() {
     })
 }
 
-// ============== AI 经验草稿（手动触发）==============
+// ============ 免责声明弹层（正文 onMounted 预取，点开秒显） ============
+const showDisclaimer = ref(false)
+const disclaimerText = ref('')
+
+// ============ AI 经验草稿（手动触发）==============
 // 设计：不自动跑，按钮唤起 → 弹框预览 → 用户编辑 → 走 /experience/submit 入审核队列
 const draftVisible = ref(false)
 const generatingDraft = ref(false)
@@ -971,6 +992,25 @@ onUnmounted(() => {
 .upload-area { border: 1.5px dashed #b6c6e8; border-radius: 8px; padding: 16px; text-align: center; color: var(--text3); cursor: pointer; background: #f8faff }
 .upload-placeholder { line-height: 1.8 }
 .muted { color: var(--text3); font-size: 12px }
+.ai-notice {
+  font-size: 12.5px;
+  color: #8a6d1a;
+  background: #fdf6e3;
+  border: 1px solid #f0e2b6;
+  border-radius: 8px;
+  padding: 8px 12px;
+  line-height: 1.7;
+  margin-bottom: 12px;
+}
+.ai-notice-link { color: #b8860b; text-decoration: underline; }
+.disclaimer-body {
+  max-height: 62vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 13.5px;
+  line-height: 1.8;
+  color: #333;
+}
 .skill-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px }
 .tag-specific { margin-left: 4px }
 .steps { display: flex; gap: 0; margin: 14px 0 }
