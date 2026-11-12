@@ -4,7 +4,7 @@
          （11-04 实报：loadDisk 曾无条件打 /admin/disk 触发 403"无权访问"弹提示） -->
     <el-card v-if="isAdmin" shadow="never" class="disk-card">
       <div class="disk-row">
-        <span>磁盘已用 <b>{{ disk.root_used_pct }}%</b>（剩 {{ disk.root_free_gb }}GB，警戒线 {{ disk.warn_pct }}%）</span>
+        <span>数据盘已用 <b>{{ disk.data_used_pct }}%</b>（剩 {{ disk.data_free_gb }}GB，警戒线 {{ disk.warn_pct }}%）<span class="hint-dim" style="margin-left:6px">{{ disk.data_path }}</span></span>
         <el-divider direction="vertical" />
         <span>在架货架 <b>{{ disk.shelf_count }}</b> 件 / {{ disk.cache_mb }}MB（账本口径）</span>
         <el-tag v-if="disk.warn" type="warning" size="small" style="margin-left:10px">接近警戒线：请在本页决定去留（平台不会自动删货架）</el-tag>
@@ -241,7 +241,7 @@ const systemId = ref<number | ''>('')
 const loading = ref(false)
 const pendingCount = ref(0)
 const systems = ref<any[]>([])
-const disk = reactive<any>({ root_used_pct: '-', root_free_gb: '-', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
+const disk = reactive<any>({ data_used_pct: '-', data_free_gb: '-', data_path: '', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
 
 const cur = ref<any>(null)
 const detailVisible = ref(false)

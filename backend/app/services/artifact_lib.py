@@ -534,7 +534,11 @@ def disk_report(db) -> dict:
       且"唯一写库通道"纪律下不走通道的文件本就不算货架；不再 rglob 猜盘上实况
     artifacts 交付区汇总数字退役（中间物归 7/90 天钟与单任务逐项 size，无人依赖此数）"""
     import shutil as _sh
-    du = _sh.disk_usage("/")
+    # 11-12 修：统计对象=产物数据根所在分区，不是写死根分区——数据根配了
+    # ARTIFACTS_DIR 挪到独立盘后，警戒线须盯"数据实际在的那块盘"才不误报/漏报；
+    # 数据根未挪时二者同盘，行为不变
+    from app.config import artifacts_dir as _adir
+    du = _sh.disk_usage(str(_adir()))
     pct = round(du.used / du.total * 100, 1)
     from sqlalchemy import func
     from app.models import ArtifactIndex
@@ -544,7 +548,9 @@ def disk_report(db) -> dict:
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "").one()
     warn = int(get_cfg("artifact_cache.disk_warn_pct", 85))
-    return {"root_used_pct": pct, "root_free_gb": round(du.free / 2**30, 1),
+    # 键名 root_* → data_*（11-12 随磁盘对象正名：盯的不是"根分区"而是
+    # "数据实际所在分区"；路径一并回传，换数据盘的机器页面可自证盯对了地方）
+    return {"data_used_pct": pct, "data_free_gb": round(du.free / 2**30, 1), "data_path": str(_adir()),
             "shelf_count": int(cnt), "cache_mb": int(total) // (1024 * 1024),
             "warn": pct >= warn, "warn_pct": warn}
 
