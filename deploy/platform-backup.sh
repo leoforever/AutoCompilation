@@ -37,11 +37,14 @@ BACKUP_DIR="${BACKUP_DIR:-/root}"
 # 货架=产物根的同级 cache（后端 cache_root() 语义：artifacts_dir().parent/"cache"）
 ART_DIR="${ARTIFACTS_DIR:-}"
 if [ -z "$ART_DIR" ] && [ -f "$ENV_FILE" ]; then
+    # ||true 必需：无 ARTIFACTS_DIR 行时 grep 退出 1，set -e 会当场处死脚本
+    # （11-12 实案：.209 执行"没反映"=秒退——凡未换数据根的机器全中招；
+    #  此前模拟测只测抽出的解析段、不带 set -e，漏网）
     ART_DIR=$(grep -E '^(export )?ARTIFACTS_DIR=' "$ENV_FILE" | tail -1 \
-              | sed -E 's/^(export )?ARTIFACTS_DIR=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')
+              | sed -E 's/^(export )?ARTIFACTS_DIR=//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' || true)
 fi
 if [ -z "$ART_DIR" ]; then
-    ART_DIR=$(awk '/compile:/{f=1;next} f&&/artifact_dir:/{print $2;exit}' "$ROOT/backend/config.yaml" 2>/dev/null)
+    ART_DIR=$(awk '/compile:/{f=1;next} f&&/artifact_dir:/{print $2;exit}' "$ROOT/backend/config.yaml" 2>/dev/null || true)
 fi
 ART_DIR="${ART_DIR:-./artifacts}"
 case "$ART_DIR" in /*) : ;; *) ART_DIR="$ROOT/${ART_DIR#./}" ;; esac
@@ -99,10 +102,13 @@ do_backup() {
     } > "$STAGE/state/meta.txt"
 
     # 3) 数据库整库（pg_dump 走 env 口令，口令不出屏）
-    echo "== 导出数据库 $DB_NAME_ACT …"
+    # 大库时此步可拖数分钟且原生无进度（11-12 .209 报"没反映"实为 pg_dump 静默运行）——
+    # -v 让进度进日志文件，屏幕报路径，等得起也查得着
+    local DBLOG="$OUTDIR/backup-dump-$TS.log"
+    echo "== 导出数据库 $DB_NAME_ACT（大库需数分钟，进度见 $DBLOG）…"
     set -a; source "$ENV_FILE"; set +a
     if PGPASSWORD="${DB_PASSWORD:-}" pg_dump -h "$DB_HOST_ACT" -U "$DB_USER_ACT" -d "$DB_NAME_ACT" \
-         --no-owner --no-privileges -f "$STAGE/state/db.sql"; then
+         --no-owner --no-privileges -v -f "$STAGE/state/db.sql" 2>"$DBLOG"; then
         echo "   db.sql $(du -h "$STAGE/state/db.sql" | cut -f1)"
     else
         rm -f "$STAGE/state/db.sql"
