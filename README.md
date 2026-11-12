@@ -32,7 +32,9 @@ ADMIN_INIT_PASSWORD='***' bash setup.sh install
 #    AI_API_KEY / AI_BASE_URL / AI_MODEL —— 模板见 .env.compile.example
 
 # 4. 访问
-#    前端 https://<host>:8443/    （8443 自签 CA 签发的证书：首次访问或 API 校验需导入
+#    前端 https://<host>:8443/    （默认自签 CA 签发证书：首次访问或 API 校验需导入
+#    （真实部署机有正式域名证书时：.env.compile 配 SSL_CERT/SSL_KEY 指向证书即可，
+#     无需装 CA；两台机器各用各的证书互不覆盖，详见 setup.sh install_nginx_conf）
 #    /etc/nginx/ssl/platform-ca.crt——浏览器直接访问 https://<host>:8443/platform-ca.crt 下载，
 #    Windows：双击→安装证书→受信任的根证书颁发机构；
 #    麒麟/openEuler：拷至 /etc/pki/ca-trust/source/anchors/ 后 sudo update-ca-trust）

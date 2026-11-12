@@ -204,6 +204,16 @@ install_nginx_conf() {
     fi
     sudo cp "$srv_src" /etc/nginx/compile-platform-servers.conf
     sudo cp "$loc_src" /etc/nginx/compile-platform-locations.conf
+    # 证书引用=机器差异项（11-12 双证书）：模板恒为自签默认；.env.compile 配了
+    # SSL_CERT/SSL_KEY 的机器（真实部署用正式域名证书）渲染进运行时 conf——
+    # git 不养机器差异，pull/install 不再互相覆盖（同 DB_PASSWORD/AI 三件套一个哲学）
+    if [ -f "$ENV_FILE" ] && grep -qE '^(export )?SSL_CERT=' "$ENV_FILE"; then
+        set -a; source "$ENV_FILE"; set +a
+        if [ -n "${SSL_CERT:-}" ] && [ -n "${SSL_KEY:-}" ]; then
+            sudo sed -i "s|ssl_certificate .*|ssl_certificate     ${SSL_CERT};|; s|ssl_certificate_key .*|ssl_certificate_key ${SSL_KEY};|" /etc/nginx/compile-platform-servers.conf
+            info "nginx 证书引用 → 外部证书 ${SSL_CERT}（gen-certs 将跳过自签）"
+        fi
+    fi
     # 证书两段式（CA 存在即复用=客户端信任不失效；叶子按当前 IP 每次重签，SAN 含 127.0.0.1
     # ——首切实测教训：缺 IP:127.0.0.1 时本机严格校验失败）
     bash "$PROJECT_DIR/deploy/gen-certs.sh" || warn "证书生成失败——8443 块将过不了 nginx -t"
