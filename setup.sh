@@ -236,7 +236,7 @@ install_nginx_conf() {
     fi
     sudo mkdir -p /srv/compile-platform
     sudo systemctl enable nginx >/dev/null 2>&1 || true
-    info "nginx 前端就绪：正式入口 https://<ip>:8443；$FRONTEND_PORT 已收口 301→https（仅 CA 分发留明文）"
+    info "nginx 前端就绪：正式入口 https://<ip>:8443（8080 已 301 收口；3000 明文过渡口 11-12 拆除）"
 }
 
 # ========== 安装（一次性） ==========
@@ -754,7 +754,7 @@ do_start() {
         main_ip="localhost"
     fi
     if [ -f "/etc/nginx/compile-platform-servers.conf" ]; then
-        info "  前端: https://$main_ip:8443/   （$FRONTEND_PORT 已 301 收口）"
+        info "  前端: https://$main_ip:8443/   （8080 已 301 收口；3000 过渡口已拆除）"
     else
         info "  前端: http://$main_ip:$FRONTEND_PORT/"
     fi

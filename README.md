@@ -38,7 +38,9 @@ ADMIN_INIT_PASSWORD='***' bash setup.sh install
 #    /etc/nginx/ssl/platform-ca.crt——浏览器直接访问 https://<host>:8443/platform-ca.crt 下载，
 #    Windows：双击→安装证书→受信任的根证书颁发机构；
 #    麒麟/openEuler：拷至 /etc/pki/ca-trust/source/anchors/ 后 sudo update-ca-trust）
-#    3000/8080 均已 301 收口到 8443（3000 仅留 /platform-ca.crt 明文下载）    API 直连 http://<host>:8000/docs
+#    8080 已 301 收口到 8443；3000 明文过渡口 11-12 已拆除——正式证书机器无需装 CA；
+#    自签机器经 8443 红牌页"继续访问"仍可下载 /platform-ca.crt（内网段限制不变）。
+#    API 直连 http://<host>:8000/docs
 ```
 
 **编译沙箱前置**：stage3 需要龙芯构建镜像。`loongnix-build:23.2` 为自制镜像（无公共源，需 `docker load` 迁移包或按镜像文档重建）；openEuler 系镜像走 lcr.loongnix.cn 公共 pull。新环境先 `docker images` 确认，缺镜像时任务会失败在阶段 3。
