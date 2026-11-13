@@ -30,6 +30,10 @@ ENV_FILE="$BACKEND_DIR/.env.compile"
 CONFIG_FILE="$BACKEND_DIR/config.yaml"
 BACKEND_PORT=8000
 FRONTEND_PORT=3000
+# nginx 正式入口端口：机器差异项，.env.compile 可覆盖（如 443 配正式域名证书）；
+# 默认 8443。set -u 下 :- 兜底必需（env 未 export 时引用不炸）。权威落点在
+# install 渲染：listen/301 随此值改，探测与文案读同一变量——单点。
+NGINX_HTTPS_PORT="${NGINX_HTTPS_PORT:-8443}"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -204,6 +208,20 @@ install_nginx_conf() {
     fi
     sudo cp "$srv_src" /etc/nginx/compile-platform-servers.conf
     sudo cp "$loc_src" /etc/nginx/compile-platform-locations.conf
+    # 端口渲染（11-13）：模板默认 8443；.env.compile 配 NGINX_HTTPS_PORT 则运行时
+    # listen/301 随之改。301 规则：443 是 https 默认端口不拼 :443（拼了丑且多余），
+    # 其余端口必拼
+    if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
+    NGINX_HTTPS_PORT="${NGINX_HTTPS_PORT:-8443}"
+    if [ "$NGINX_HTTPS_PORT" != "8443" ]; then
+        sudo sed -i "s|listen 8443 ssl|listen ${NGINX_HTTPS_PORT} ssl|" /etc/nginx/compile-platform-servers.conf
+        if [ "$NGINX_HTTPS_PORT" = "443" ]; then
+            sudo sed -i "s|https://\$host:8443|https://\$host|" /etc/nginx/compile-platform-servers.conf
+        else
+            sudo sed -i "s|:8443|:${NGINX_HTTPS_PORT}|g" /etc/nginx/compile-platform-servers.conf
+        fi
+        info "nginx 端口渲染：8443 → ${NGINX_HTTPS_PORT}（listen+301 已随 env 改）"
+    fi
     # 证书引用=机器差异项（11-12 双证书）：模板恒为自签默认；.env.compile 配了
     # SSL_CERT/SSL_KEY 的机器（真实部署用正式域名证书）渲染进运行时 conf——
     # git 不养机器差异，pull/install 不再互相覆盖（同 DB_PASSWORD/AI 三件套一个哲学）
@@ -216,7 +234,7 @@ install_nginx_conf() {
     fi
     # 证书两段式（CA 存在即复用=客户端信任不失效；叶子按当前 IP 每次重签，SAN 含 127.0.0.1
     # ——首切实测教训：缺 IP:127.0.0.1 时本机严格校验失败）
-    bash "$PROJECT_DIR/deploy/gen-certs.sh" || warn "证书生成失败——8443 块将过不了 nginx -t"
+    bash "$PROJECT_DIR/deploy/gen-certs.sh" || warn "证书生成失败——${NGINX_HTTPS_PORT} ssl 块将过不了 nginx -t"
 
     # 主 conf include：存量旧行迁移 / 全新注入单行（判据都用 include 行本身——比标记
     # 注释不易错位；只注入单行，openEuler 主 conf 不通配 conf.d：openclaw-https.conf
@@ -236,7 +254,7 @@ install_nginx_conf() {
     fi
     sudo mkdir -p /srv/compile-platform
     sudo systemctl enable nginx >/dev/null 2>&1 || true
-    info "nginx 前端就绪：正式入口 https://<ip>:8443（8080 已 301 收口；3000 明文过渡口 11-12 拆除）"
+    info "nginx 前端就绪：正式入口 https://<ip>:${NGINX_HTTPS_PORT}"
 }
 
 # ========== 安装（一次性） ==========
@@ -727,16 +745,18 @@ do_start() {
                     >> "$LOG_DIR/frontend.log" 2>&1 9>&- &   # B-2 setsid   # C5修：fd9 不继承
             fi
         fi
-        disown || true
+        # 前端就绪探测口：nginx 托管=8443（3000 过渡口 11-12 已拆，再探它必假报
+        # "未就绪"——.209 首踩回归）；仅 vite preview 回退模式才探 3000
+        local fe_probe_url="https://localhost:$NGINX_HTTPS_PORT/"
+        [ -f "/etc/nginx/compile-platform-servers.conf" ] || fe_probe_url="http://localhost:$FRONTEND_PORT/"
         for i in 1 2 3 4 5 6 7 8 9 10; do
             sleep 1
-            if [ -n "$(port_pid "$FRONTEND_PORT" || true)" ] \
-                && http_alive "http://localhost:$FRONTEND_PORT/"; then
-                info "前端启动成功"
+            if curl -sk -o /dev/null --max-time 3 "$fe_probe_url"; then
+                info "前端启动成功（$fe_probe_url）"
                 break
             fi
             if [ "$i" = "10" ]; then
-                warn "前端未在 10 秒内就绪，请看 $LOG_DIR/frontend.log"
+                warn "前端未在 10 秒内就绪，请看 $LOG_DIR/frontend.log 与 sudo systemctl status nginx"
             fi
         done
     fi
@@ -754,13 +774,12 @@ do_start() {
         main_ip="localhost"
     fi
     if [ -f "/etc/nginx/compile-platform-servers.conf" ]; then
-        info "  前端: https://$main_ip:8443/   （8080 已 301 收口；3000 过渡口已拆除）"
+        info "  前端: https://$main_ip:${NGINX_HTTPS_PORT}/"
     else
         info "  前端: http://$main_ip:$FRONTEND_PORT/"
     fi
     info "  API:  http://$main_ip:$BACKEND_PORT/docs"
     info "  默认账号: admin（密码为 init 时 ADMIN_INIT_PASSWORD 传入值，勿用默认弱口令）"
-    info "  提示：其他网卡 IP 可手动拼接 http://<ip>:$FRONTEND_PORT/"
 }
 
 # ========== 卸载（数据级重置，清数据留骨架） ==========
@@ -1065,7 +1084,7 @@ do_status() {
     fi
     echo ""
     echo "=== 监听端口 ==="
-    ss -tlnp 2>/dev/null | grep -E ":($BACKEND_PORT|$FRONTEND_PORT|8443|5432)\b" | awk '{printf "  %-30s %s\n", $4, $6}'
+    ss -tlnp 2>/dev/null | grep -E ":($BACKEND_PORT|$FRONTEND_PORT|$NGINX_HTTPS_PORT|5432)\b" | awk '{printf "  %-30s %s\n", $4, $6}'
 }
 
 # ========== 主入口 ==========

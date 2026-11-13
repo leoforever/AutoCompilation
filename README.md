@@ -32,14 +32,13 @@ ADMIN_INIT_PASSWORD='***' bash setup.sh install
 #    AI_API_KEY / AI_BASE_URL / AI_MODEL —— 模板见 .env.compile.example
 
 # 4. 访问
-#    前端 https://<host>:8443/    （默认自签 CA 签发证书：首次访问或 API 校验需导入
-#    （真实部署机有正式域名证书时：.env.compile 配 SSL_CERT/SSL_KEY 指向证书即可，
-#     无需装 CA；两台机器各用各的证书互不覆盖，详见 setup.sh install_nginx_conf）
-#    /etc/nginx/ssl/platform-ca.crt——浏览器直接访问 https://<host>:8443/platform-ca.crt 下载，
-#    Windows：双击→安装证书→受信任的根证书颁发机构；
-#    麒麟/openEuler：拷至 /etc/pki/ca-trust/source/anchors/ 后 sudo update-ca-trust）
-#    8080 已 301 收口到 8443；3000 明文过渡口 11-12 已拆除——正式证书机器无需装 CA；
-#    自签机器经 8443 红牌页"继续访问"仍可下载 /platform-ca.crt（内网段限制不变）。
+#    前端 https://<host>:8443/    （8443 可用 backend/.env.compile 的
+#    NGINX_HTTPS_PORT 改端口——如正式证书机器配 443，install 自动渲染 nginx）
+#    证书两态：默认自签——首次访问需装 CA（下载 https://<host>:8443/platform-ca.crt，
+#    Windows 双击装"受信任的根"；麒麟/openEuler 拷 /etc/pki/ca-trust/source/anchors/
+#    后 sudo update-ca-trust）；正式域名证书——.env.compile 配 SSL_CERT/SSL_KEY 即可，
+#    无需装 CA（两台机器各用各的，互不覆盖，机制见 setup.sh install_nginx_conf）
+#    8080 已 301 收口到正式入口；3000 明文过渡口 11-12 已拆除。
 #    API 直连 http://<host>:8000/docs
 ```
 
