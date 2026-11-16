@@ -202,6 +202,14 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import api from '@/utils/request'
 import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
+
+// 从 Content-Disposition 取后端拼好的下载名（11-16：命名单源在后端，前端不再自拼）
+function dlName(r: Response, fallback: string): string {
+  const cd = r.headers.get('content-disposition') || ''
+  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
+  return m ? decodeURIComponent(m[1]) : fallback
+}
+
 import { Loading } from '@element-plus/icons-vue'
 
 // ============== 表单状态 ==============
@@ -755,13 +763,14 @@ function downloadArtifact() {
         try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 错体保留状态码 */ }
         throw new Error(msg)
       }
-      return r.blob()
+      const fname = dlName(r, `${taskId}-artifacts.tar.gz`)
+      return r.blob().then(b => [b, fname] as const)
     })
-    .then(blob => {
+    .then(([blob, fname]) => {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `${taskId}-artifacts.tar.gz`
+      a.download = fname
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)

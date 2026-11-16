@@ -22,7 +22,7 @@ from app.dependencies import get_current_user
 from app.services.audit import log_audit
 from app.models import User
 
-from app.models import get_db, CompileTask, TaskStatus, TargetSystem, Skill
+from app.models import get_db, CompileTask, TaskStatus, TargetSystem, Skill, ArtifactIndex
 from app.schemas import (
     CompileTaskCreate, CompileTaskResponse, CompileTaskListResponse,
     ApiResponse
@@ -459,6 +459,32 @@ async def download_compile_log(
     )
 
 
+def _bundle_filename(task, task_id: str, db) -> str:
+    """下载展示名 = 软件名-版本-T日期-短id.tar.gz（11-16 拍板：只改 filename，
+    盘上物理名恒 artifacts.tar.gz——下载/清单/对账/备份三方共用那个事实源不动）。
+    版本经货架账 source_task_key 反查（approved 优先），查不到省略版本段，降级不报错。
+    软件名消毒：保留 [A-Za-z0-9._-] 其余折叠为连字符（自由文本进文件名/HTTP 头的
+    注入面，同 upload original_name 清洗一个口径）。"""
+    import re
+    raw = (task.software_name or "artifacts").strip()
+    safe = re.sub(r"\.{2,}", ".", re.sub(r"[^A-Za-z0-9._-]+", "-", raw)).strip("-.") or "artifacts"
+    ver = ""
+    try:
+        # 不过滤软删行：版本只用于展示命名，已下架/清除的历史账同样是"这单编过什么版本"
+        # 的事实源（11-16 实案：typstyle 三单账在架后被撤，硬过滤 deleted 会莫名丢版本段）
+        row = db.query(ArtifactIndex).filter(
+            ArtifactIndex.source_task_key == task_id,
+        ).order_by((ArtifactIndex.status == "approved").desc(), ArtifactIndex.id.desc()).first()
+        if row and (row.version or "").strip():
+            ver = re.sub(r"[^A-Za-z0-9._-]+", "-", row.version.strip()).strip("-.")
+    except Exception:
+        ver = ""  # 版本是增益信息，账本异常绝不拦下载
+    # T-20261109114747-996D1D → 日期 8 位 + 短 id（全量 14 位时分秒无增益，砍掉）
+    m = re.match(r"T-(\d{8})\d{6}-([0-9A-Za-z]{4,8})$", task_id)
+    tid = f"{m.group(1)}-{m.group(2)}" if m else task_id
+    return f"{safe}-{ver}-{tid}.tar.gz" if ver else f"{safe}-{tid}.tar.gz"
+
+
 @router.get("/tasks/{task_id}/artifacts/download")
 async def download_artifacts_bundle(
     task_id: str,
@@ -512,7 +538,7 @@ async def download_artifacts_bundle(
     return FileResponse(
         path=str(bundle_path),
         media_type="application/gzip",
-        filename=f"{task_id}-artifacts.tar.gz",
+        filename=_bundle_filename(task, task_id, db),
     )
 
 
