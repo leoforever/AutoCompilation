@@ -34,13 +34,13 @@
         <!-- 上传源码 -->
         <div v-if="form.sourceType === 'upload'" class="field">
           <div class="upload-area" @click="triggerUpload">
-            <input ref="fileInput" type="file" accept=".tar.gz,.zip,.tgz" style="display:none" @change="handleFileChange" />
+            <input ref="fileInput" type="file" accept=".tar.gz,.zip,.tgz,.tar.xz,.txz,.xz" style="display:none" @change="handleFileChange" />
             <div v-if="uploadedFile" class="notice ok">
               📦 已选择 <b>{{ uploadedFile.name }}</b>（{{ (uploadedFile.size / 1024 / 1024).toFixed(1) }} MB）
               <span class="muted" v-if="!uploadingFile">（点击 "发起云端编译" 上传并提交）</span>
             </div>
             <div v-else class="upload-placeholder">
-              点击或拖拽上传源码包（.tar.gz / .zip）<br>
+              点击或拖拽上传源码包（.tar.gz / .zip / .tar.xz）<br>
               <span class="muted">支持最大 2 GB</span>
             </div>
           </div>
@@ -152,7 +152,7 @@
         <el-button type="primary" :loading="generatingDraft" @click="onGenerateDraft">
           ✨ AI 生成经验草稿
         </el-button>
-        <el-button v-if="compileResult?.status === 'success'" type="success" @click="downloadArtifact">📦 下载全部产物 (.tar.gz)</el-button>
+        <el-button v-if="compileResult?.status === 'success'" type="success" :loading="dlPct !== undefined" @click="downloadArtifact">{{ dlPct === undefined ? '📦 下载全部产物 (.tar.gz)' : dlPct > 0 ? '📦 下载中 ' + dlPct + '%' : '📦 准备中…' }}</el-button>
       </div>
     </div>
 
@@ -202,13 +202,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import api from '@/utils/request'
 import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
-
-// 从 Content-Disposition 取后端拼好的下载名（11-16：命名单源在后端，前端不再自拼）
-function dlName(r: Response, fallback: string): string {
-  const cd = r.headers.get('content-disposition') || ''
-  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
-  return m ? decodeURIComponent(m[1]) : fallback
-}
+import { fetchArtifactDownload } from '@/utils/download'
 
 import { Loading } from '@element-plus/icons-vue'
 
@@ -744,42 +738,34 @@ function cleanup() {
 
 // reportTicket 空壳已摘（2026-10-27）：只弹提示不提交，误导用户；上报入口收敛到 Tasks 列表
 
-function downloadArtifact() {
+// 下载单源化（11-16）：utils/download.ts 流式进度 + 后端展示名；按钮文案随 pct 变
+const dlPct = ref<number | undefined>(undefined)
+
+async function downloadArtifact() {
   const taskId = compileResult.value?.task_id
   if (!taskId) {
     ElMessage.warning('无 task_id')
     return
   }
-  // 用浏览器原生下载（带 Authorization header 需 fetch+blob，简化用 a 标签）
-  const token = localStorage.getItem('token') || ''
-  // 浏览器 a 标签 download 无法加 header — 走 fetch + blob 方案
-  fetch(`/api/compile/tasks/${taskId}/artifacts/download`, {
-    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
-  })
-    .then(async r => {
-      if (!r.ok) {
-        // A3：后端人话（410 历史清理/404 无产物）透传，别只剩 "HTTP 410" 天书
-        let msg = `HTTP ${r.status}`
-        try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 错体保留状态码 */ }
-        throw new Error(msg)
-      }
-      const fname = dlName(r, `${taskId}-artifacts.tar.gz`)
-      return r.blob().then(b => [b, fname] as const)
-    })
-    .then(([blob, fname]) => {
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = fname
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      ElMessage.success('下载已开始')
-    })
-    .catch(err => {
-      ElMessage.error('下载失败：' + (err?.message || err))
-    })
+  dlPct.value = 0
+  try {
+    const { blob, name } = await fetchArtifactDownload(
+      `/api/compile/tasks/${taskId}/artifacts/download`, `${taskId}-artifacts.tar.gz`,
+      (p) => { dlPct.value = p },
+    )
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  } catch (err: any) {
+    ElMessage.error('下载失败：' + (err?.message || err))
+  } finally {
+    dlPct.value = undefined
+  }
 }
 
 // ============ 免责声明弹层（正文 onMounted 预取，点开秒显） ============

@@ -63,10 +63,11 @@
         <el-table-column label="操作" width="340">
           <template #default="{ row }">
             <el-button size="small" @click="viewLog(row)">日志</el-button>
-            <el-button v-if="row.status === 'success'" size="small" @click="downloadArtifact(row)">下载</el-button>
+            <el-button v-if="row.status === 'success'" size="small" :loading="dlPct[row.task_id] !== undefined" @click="downloadArtifact(row)">{{ dlPct[row.task_id] === undefined ? '下载' : dlPct[row.task_id] > 0 ? '下载中 ' + dlPct[row.task_id] + '%' : '准备中…' }}</el-button>
             <el-button v-if="row.artifact_partial" size="small" type="warning"
+              :loading="dlPct[row.task_id] !== undefined"
               title="编译已完成但验证未通过/中断；产物已保留，仅供排查，可能不可用"
-              @click="downloadArtifact(row)">下载（未验证产物）</el-button>
+              @click="downloadArtifact(row)">{{ dlPct[row.task_id] === undefined ? '下载（未验证产物）' : '下载中 ' + dlPct[row.task_id] + '%' }}</el-button>
             <el-button
               v-if="row.status === 'failed'"
               size="small"
@@ -190,13 +191,7 @@ import { useRoute } from 'vue-router'
 import api from '@/utils/request'
 import { parseServerDate } from '@/utils/datetime'
 import { ElMessage, ElMessageBox } from 'element-plus'
-
-// 从 Content-Disposition 取后端拼好的下载名（11-16：命名单源在后端，前端不再自拼）
-function dlName(r: Response, fallback: string): string {
-  const cd = r.headers.get('content-disposition') || ''
-  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
-  return m ? decodeURIComponent(m[1]) : fallback
-}
+import { fetchArtifactDownload } from '@/utils/download'
 
 import { useAuthStore } from '@/stores/auth'
 
@@ -319,41 +314,34 @@ function mapLevel(level: string): string {
   }
 }
 
-function downloadArtifact(task: any) {
+const dlPct = ref<Record<string, number>>({})
+
+async function downloadArtifact(task: any) {
   const taskId = task.task_id
   if (!taskId) {
     ElMessage.warning('无 task_id')
     return
   }
-  // 与 Workbench.vue 同样的 fetch+blob 下载流程
-  const token = localStorage.getItem('token') || ''
-  fetch(`/api/compile/tasks/${taskId}/artifacts/download`, {
-    headers: token ? { 'Authorization': `Bearer ${token}` } : {},
-  })
-    .then(async r => {
-      if (!r.ok) {
-        // A3：后端人话（410 历史清理/404 无产物）透传，别只剩 "HTTP 410" 天书
-        let msg = `HTTP ${r.status}`
-        try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 错体保留状态码 */ }
-        throw new Error(msg)
-      }
-      const fname = dlName(r, `${taskId}-artifacts.tar.gz`)
-      return r.blob().then(b => [b, fname] as const)
-    })
-    .then(([blob, fname]) => {
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = fname
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      ElMessage.success('下载已开始')
-    })
-    .catch(err => {
-      ElMessage.error('下载失败：' + (err?.message || err))
-    })
+  // 下载单源 fetchArtifactDownload（utils/download.ts：流式进度 + 后端展示名 + A3 人话透传）
+  dlPct.value[taskId] = 0
+  try {
+    const { blob, name } = await fetchArtifactDownload(
+      `/api/compile/tasks/${taskId}/artifacts/download`, `${taskId}-artifacts.tar.gz`,
+      (p) => { dlPct.value[taskId] = p },
+    )
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  } catch (err: any) {
+    ElMessage.error('下载失败：' + (err?.message || err))
+  } finally {
+    delete dlPct.value[taskId]
+  }
 }
 
 const ticketDraftVisible = ref(false)

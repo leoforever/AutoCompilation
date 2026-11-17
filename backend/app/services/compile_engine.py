@@ -515,17 +515,19 @@ def _extract_archive_safely(
     on_log: Optional[LogCallback],
     state: TaskState,
 ) -> None:
-    """解压 .tar.gz / .zip / .tgz 到 dst_dir —— 委托 services/safe_extract（批3 3b：
+    """解压 .tar.gz / .tar.xz / .zip / .tgz / .txz 到 dst_dir —— 委托 services/safe_extract（批3 3b：
     commonpath 边界 + 拒 symlink/hardlink/设备成员 + 数量/体积双上限）"""
     from app.services import safe_extract
     name = archive_path.name.lower()
     prog = (lambda n: _log(state, "info", f"[阶段4a] 解压中... {n} 文件", on_log)) if on_log else None
-    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+    # xz 三形态：.tar.xz / .txz 原样；上传存储归一只留末缀 .xz（T-xxx.xz）——
+    # tarfile.open 内容嗅探自动选 xz 解码器，safe_extract 护栏格式无关
+    if name.endswith((".tar.gz", ".tgz", ".tar.xz", ".txz", ".xz")):
         safe_extract.safe_extract_tar(archive_path, dst_dir, on_progress=prog)
     elif name.endswith(".zip"):
         safe_extract.safe_extract_zip(archive_path, dst_dir, on_progress=prog)
     else:
-        raise RuntimeError(f"不支持的源码包格式：{name}（仅 .tar.gz / .zip / .tgz）")
+        raise RuntimeError(f"不支持的源码包格式：{name}（仅 .tar.gz / .zip / .tgz / .tar.xz / .txz）")
 
 
 # ==================== 阶段 4 ====================

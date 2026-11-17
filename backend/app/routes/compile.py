@@ -35,7 +35,7 @@ router = APIRouter()
 
 # 上传源码包允许的扩展名（白名单）
 _ALLOWED_EXT = {".tar.gz", ".zip", ".tgz"}
-_ALLOWED_NAME_RE = re.compile(r"^[\w\-. ]+\.(tar\.gz|zip|tgz)$", re.IGNORECASE)
+_ALLOWED_NAME_RE = re.compile(r"^[\w\-. ]+\.(tar\.gz|zip|tgz|tar\.xz|txz)$", re.IGNORECASE)
 
 
 def _system_names_for_tasks(db: Session, system_ids: list[int]) -> dict[int, str]:
@@ -159,7 +159,7 @@ async def upload_and_submit(
     if not _ALLOWED_NAME_RE.match(original_name):
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的源码包格式：{original_name}（仅接受 .tar.gz / .zip / .tgz）",
+            detail=f"不支持的源码包格式：{original_name}（仅接受 .tar.gz / .zip / .tgz / .tar.xz / .txz）",
         )
 
     # 2. 校验目标系统
@@ -193,6 +193,10 @@ async def upload_and_submit(
         suffix = ".tar.gz"
     elif name_lower.endswith(".tgz"):
         suffix = ".tar.gz"  # 内部统一存为 .tar.gz
+    elif name_lower.endswith(".tar.xz"):
+        suffix = ".tar.xz"
+    elif name_lower.endswith(".txz"):
+        suffix = ".tar.xz"  # 归一全写；解包端 tarfile 按内容嗅探，扩展名仅人读
     else:
         suffix = Path(original_name).suffix.lower()  # .zip 等
     stored_name = f"{task_id}{suffix}"
@@ -531,8 +535,12 @@ async def download_artifacts_bundle(
                 detail=f"产物不存在（任务 {task_id} 未成功或产物已被清理）",
             )
         import tarfile
-        with tarfile.open(bundle_path, "w:gz") as tar:
-            tar.add(tree, arcname=tree.name)
+
+        def _pack_now():  # 同步压缩不占事件循环（D1；gzip 200MB 实测≈8s，大树窗口真存在）
+            with tarfile.open(bundle_path, "w:gz") as t:
+                t.add(tree, arcname=tree.name)
+
+        await asyncio.to_thread(_pack_now)
 
     # 读型交付不记审计（同上，11-02 拍板废除下载留痕）
     return FileResponse(
