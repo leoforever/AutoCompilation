@@ -159,6 +159,7 @@ class ArtifactIndex(Base):
     cache_path = Column(String(400), default="")        # approved 后相对 cache 根；pending 空
     size_bytes = Column(BigInteger, default=0)
     glibc_requires = Column(String(20), default="")   # 运行需求下限（入库时 objdump 机提，不信自报；公共池配给判据）
+    runtime_env = Column(Text, default="")            # meta.runtime_libs JSON（运行期共享库需求，RUN.md 同源；货架展示+复用预检）
     hits = Column(Integer, default=0)
     views = Column(Integer, default=0)               # 查阅计数（cat/ls/tar -t；与 hits=消费分开，11-04 拍板）
     last_used_at = Column(DateTime, nullable=True)
@@ -425,6 +426,8 @@ def ensure_artifact_identity_columns():
     # 公共池三层闸（11-05 用户指出"SP2 产物老 Loongnix 跑不了"后的配给设计）
     _safe_add_column("target_systems", "glibc_version", "VARCHAR(20) DEFAULT ''")
     _safe_add_column("artifact_index", "glibc_requires", "VARCHAR(20) DEFAULT ''")
+    # RUN.md 运行依赖（一期二期）：meta.runtime_libs 落库，与 toolchain 分列各表语义
+    _safe_add_column("artifact_index", "runtime_env", "TEXT DEFAULT ''")
 
 
 def ensure_stage5_phase_columns():

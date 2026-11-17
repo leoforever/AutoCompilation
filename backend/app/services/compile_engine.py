@@ -705,13 +705,17 @@ archive:包指纹）是出身硬证：复用前对一下来源与版本——git
 meta 内容照抄这个完整例子改值
 （python3 -c 或 write_file 都行；**toolchain 为空的 meta 必被平台拒收**）：
   {{"name": "软件名", "version": "1.1.0", "kind": "tgz",
-   "toolchain": {{"node": "v24.22.1", "gcc": "12.3.1", "glibc": "2.38"}}}}
+   "toolchain": {{"node": "v24.22.1", "gcc": "12.3.1", "glibc": "2.38"}},
+   "runtime_libs": ["libssl.so.3", "liblua5.4.so.0"]}}
 kind 取 whl/tgz/rpm/binary/node_binding/so/a 之一；toolchain 至少填一项且必须是
 **本机实测值**（node -v / python3 -V / gcc --version / ldd --version 一行抄）——
 这是后续任务判断 ABI/兼容性的唯一依据，编造或留空等于白交。
 产物链接了主版本敏感底库（numpy/protobuf/openssl 等）的，toolchain 里**必须加记构建
 时所用底库版本**（如 "numpy": "1.26.5"）——漏记，下游就会撞 torch(编于 numpy1.x)×
-numpy2.x 桥接瘫痪这类坑（2500D1 实证）。只放成品，
+numpy2.x 桥接瘫痪这类坑（2500D1 实证）。
+runtime_libs 可选：ELF 类产物（binary/so/rpm/tgz 内裸 ELF）从产物机 ldd 实测抄录其
+动态依赖的 .so 名（如 "liblua5.4.so.0"），供复用者判断目标机要不要补装运行库——
+**必须是 ldd 真实输出、不许凭记忆填**；whl/node 类自带依赖声明可不填。只放成品，
 验证临时物/日志/脚本不放。平台在任务成功后核对门禁并提交管理员审批，通过才上架。
 
 【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
@@ -733,8 +737,21 @@ numpy2.x 桥接瘫痪这类坑（2500D1 实证）。只放成品，
 
 【验证产物隔离】（平台会把 /work/output 打包交付给用户）
 - 验证过程的临时物（venv、pip/npm 缓存、测试输出、验证脚本）一律放 /work/verify/，不要放 /work/output；
-- /work/output 只放**最终交付物**（包、库、可执行文件）+ BUILD_NOTES.md；
+- /work/output 只放**最终交付物**（包、库、可执行文件）+ BUILD_NOTES.md + RUN.md；
 - 若已把临时物放进 /work/output，收尾前 mv 到 /work/verify/ 即可。
+
+【运行说明书 RUN.md（交付物·面向使用者）】
+产物落 /work/output 后写一份 RUN.md（与 BUILD_NOTES 并列进包，BUILD_NOTES 给编译者、
+RUN.md 给拿到包要跑起来的人）。内容**全部来自实测命令，不许凭记忆编**：
+① 安装/放置：解包后怎么用（是否需要 --prefix 安装、数据文件目录、环境变量如 NMAPDIR）
+② 运行期共享库：对主二进制跑 `ldd <bin> | grep "not found"` 与 `objdump -p <bin> | grep NEEDED`
+   实测抄录；每个库给出目标机安装命令（dnf 系如 lua-libs，apt 系如 liblua5.4-0；
+   不确定确切包名就只写库名 + "缺它则 ldd 报 not found"，宁缺勿错猜）
+③ 版本/架构要求：glibc 下限、目标架构（objdump/ldd 实测）
+④ 运行前自检一条命令（ldd grep not found，能排掉"cannot open shared object file"类多数报错）
+⑤ 最小可跑验证命令（与三件套验证同源，贴就能用）
+⑥ 可选功能诚实分级（如缺 lua 只禁 NSE 脚本引擎、不影响扫描主体）
+whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so/rpm/tgz）必写。
 
 【PASS 即终局（硬约束）】
 ① 验证脚本必须输出一行机读结果：`RESULT pass=<N> fail=<M>`。首次 fail=0 = 验证通过，

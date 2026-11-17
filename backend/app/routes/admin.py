@@ -2661,6 +2661,7 @@ async def list_artifacts(
         "image": r.image, "cache_path": r.cache_path, "size_bytes": r.size_bytes,
         "hits": r.hits, "views": r.views, "source_commit": r.source_commit,
         "glibc_requires": r.glibc_requires, "sha256": r.sha256,
+        "runtime_env": r.runtime_env,
         "last_used_at": r.last_used_at, "note": r.note,
         "created_at": r.created_at, "deleted_at": r.deleted_at,
     } for r in rows]})

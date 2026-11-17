@@ -65,6 +65,7 @@ async def public_list_artifacts(
         "build_env": r.build_env, "image": r.image, "size_bytes": r.size_bytes,
         "hits": r.hits, "views": r.views, "source_commit": r.source_commit,
         "glibc_requires": r.glibc_requires,   # 11-05 公共池需求（系统0 行=通用件）
+        "runtime_env": r.runtime_env,          # RUN.md 运行依赖（一期二期，前端展示）
         "sha256": (r.sha256 or "")[:16], "created_at": r.created_at,
     } for r in rows]})
 

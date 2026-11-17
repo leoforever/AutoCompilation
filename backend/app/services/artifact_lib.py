@@ -248,6 +248,7 @@ def collect_promotables(cache_out: Path, system_id: int) -> tuple[list[dict], li
         out.append({"file": f, "meta": meta, "toolchain": tc, "kind": kind, "size": size,
                     "name": shelf, "name_norm": norm.strip().lower() or name_norm_of(f.name),
                     "version": meta.get("version", "") if isinstance(meta, dict) else "",
+                    "runtime_libs": (meta.get("runtime_libs") if isinstance(meta, dict) else None) or [],
                     "system_id": system_id, "renamed": renamed, "sha256": it_sha})
     return out, rejects
 
@@ -886,6 +887,7 @@ def extract_promotions(db, task, state: dict, art_root) -> tuple[list, list]:
             system_id=it["system_id"], kind=it["kind"], origin="task", status="pending",
             source_task_id=task.id, source_task_key=task.task_id,
             build_env=json.dumps(it.get("toolchain") or {}, ensure_ascii=False),
+            runtime_env=json.dumps(it.get("runtime_libs") or [], ensure_ascii=False),
             image=state.get("docker_image") or "", size_bytes=it["size"],
             source_commit=_source_identity(task, state)[:64],
             sha256=it.get("sha256") or "")

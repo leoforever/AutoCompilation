@@ -120,6 +120,7 @@
         <el-descriptions-item label="构建上下文(ABI 依据)">{{ fmtEnv(cur.build_env, true) }}</el-descriptions-item>
         <el-descriptions-item label="身份钉(晋升时平台自验)">源码 commit {{ cur.source_commit || '-' }} · sha256 {{ (cur.sha256 || '').slice(0, 16) }}{{ cur.sha256 ? '…' : '' }}</el-descriptions-item>
         <el-descriptions-item label="运行需求(glibc 机提)">{{ cur.glibc_requires || '未检出/非ELF类' }}<template v-if="cur.system_id === 0"> · 按各系统基线自动配给</template></el-descriptions-item>
+        <el-descriptions-item label="运行依赖库(ldd 实测)">{{ fmtLibs(cur.runtime_env) }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="复用次数 / 最近使用">{{ cur.hits }} / {{ cur.last_used_at || '-' }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="货架路径">{{ cur.cache_path || '（未上架）' }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="备注">{{ cur.note || '-' }}</el-descriptions-item>
@@ -324,6 +325,13 @@ function fmtEnv(raw: string, full = false) {
     const kv = Object.entries(o).map(([k, v]) => `${k}=${v}`)
     return full ? kv.join('  ') : kv.slice(0, 3).join(' ')
   } catch { return raw.slice(0, 60) }
+}
+function fmtLibs(raw: string) {
+  if (!raw || raw === '[]') return '未记录（whl/node 类可省）'
+  try {
+    const a = JSON.parse(raw)
+    return Array.isArray(a) && a.length ? a.join('  ') : '未记录（whl/node 类可省）'
+  } catch { return raw.slice(0, 80) }
 }
 function showDetail(row: any) { cur.value = row; detailVisible.value = true }
 
