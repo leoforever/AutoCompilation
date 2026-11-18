@@ -65,7 +65,8 @@ def _guard_active_quota(db: Session, user_id: int, current_user, request, action
                   request=request, details=f"active={active} cap={cap}{action_suffix}")
         db.commit()
         raise HTTPException(status_code=400,
-                            detail=f"你已有 {active} 个进行中任务（上限 {cap}），请等待收工后再提交")
+                            detail=f"你已有 {active} 个进行中任务（每人上限 {cap}，管理员可在配置调整）——"
+                                   "可等待收工，或到「编译任务管理」页查看在途任务进度")
 
 
 @router.post("/submit", response_model=ApiResponse)
@@ -330,6 +331,7 @@ def _bundle_size_for(task_id: str) -> int | None:
 async def list_compile_tasks(
     status: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
+    mine: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -340,12 +342,15 @@ async def list_compile_tasks(
 
     - status: 状态筛选（submitted/compiling/success/failed）
     - search: 搜索软件名或任务 ID
-    - 权限：非 admin 只能看自己名下的任务；admin 看全部
+    - mine: 只看自己名下（11-19 Workbench 接管查询用——admin 看全部是列表页语义，
+      "接管我自己的在途任务"对 admin 也必须限自己，否则 admin 进新建页会
+      认领别人的任务、表单被顶掉无法新建；任务管理页不传=行为不变）
+    - 权限：非 admin 只能看自己名下的任务；admin 看全部（mine=true 除外）
     """
     query = db.query(CompileTask).filter(CompileTask.deleted_at.is_(None))  # 软删不可见（2026-10-30 删除功能）
 
-    # 用户隔离：非 admin 强制 user_id 过滤
-    if current_user.role != "admin":
+    # 用户隔离：非 admin 强制 user_id 过滤；mine=true 对 admin 同样限自己
+    if current_user.role != "admin" or mine:
         query = query.filter(CompileTask.user_id == current_user.user_id)
 
     if status:

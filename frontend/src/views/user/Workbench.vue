@@ -127,6 +127,7 @@
           {{ compileResult?.status === 'success' ? '已完成' : compileResult?.status === 'failed' ? '失败' : '编译中' }}
         </el-tag>
         <span v-if="compileResult?.task_id" class="muted" style="margin-left:8px">task_id: {{ compileResult.task_id }}</span>
+        <el-button size="small" style="float:right" @click="backToNewForm">＋ 新建编译</el-button>
       </h3>
 
       <!-- 阶段进度（七段；编译/验证两段来自 2026-11-02 子阶段判定） -->
@@ -334,6 +335,23 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 const TASK_STORAGE_KEY = 'workbench:task_id'
 
 // ============== 页面挂载：恢复上次任务 ==============
+// 回表单（11-19 B1 拍板）：视图复位≠任务终止——在途后台照跑，随时可从
+// 任务管理页回看；配额>1 的用户由此获得第二个提交入口
+function backToNewForm() {
+  if (ws) { try { ws.close() } catch {} ws = null }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  sessionStorage.removeItem(TASK_STORAGE_KEY)
+  compiling.value = false
+  compileResult.value = null
+  logLines.value = []
+  matchedSkills.value = []
+  availableSkills.value = []
+  matchStatus.text = '待匹配'          // 与初始值同词（478 行），别留空串
+  matchStatus.type = 'info'
+  fetchAvailableSkills()               // 技能区回空白态，防上一任务的命中列表误导
+  ElMessage.info('已回到新建表单；刚才的任务仍在后台运行，可在「编译任务管理」查看进度')
+}
+
 // 抽函数：sessionStorage 恢复路径 + onMounted 主动接管 都用
 async function restoreFromTaskId(taskId: string): Promise<boolean> {
   // 返回 true = 接管成功（继续显示该任务）
@@ -430,8 +448,10 @@ onMounted(async () => {
     // 失败 → 清掉 + 继续走第 2 步
   }
   // 2) 查"我名下"是否有 running 任务（覆盖：A 浏览器提交 → 关 A → 开 B → 进 Workbench 接管）
+  //    mine=1 必须带（11-19）：该接口 admin 语义是"看全部"——不带则 admin 进新建页
+  //    会接管别人的在途任务、表单被顶掉无法新建（admin 症状病根）
   try {
-    const r: any = await api.get('/compile/tasks?status=compiling&page_size=5')
+    const r: any = await api.get('/compile/tasks?status=compiling&page_size=5&mine=1')
     // /compile/tasks 直接返 {total, tasks}，不走 ApiResponse
     const running = r?.tasks || []
     if (running.length) {
@@ -439,7 +459,7 @@ onMounted(async () => {
       if (ok) return
     }
     // submitted 也接管（刚提交没 worker 抢）
-    const sub: any = await api.get('/compile/tasks?status=submitted&page_size=5')
+    const sub: any = await api.get('/compile/tasks?status=submitted&page_size=5&mine=1')
     const subs = sub?.tasks || []
     if (subs.length) {
       const ok = await restoreFromTaskId(subs[0].task_id)
