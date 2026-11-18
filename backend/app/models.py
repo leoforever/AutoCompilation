@@ -177,6 +177,7 @@ class TargetSystem(Base):
     name = Column(String(100), unique=True, nullable=False)  # 如：openEuler 24.03 LTS
     base_image = Column(String(255), nullable=False)  # Docker/Podman 镜像（不含 tag）
     glibc_version = Column(String(20), default="")    # 系统 glibc 基线（11-05 公共池配给闸：SP2=2.38 等，管理员填）
+    pkg_format = Column(String(10), default="")       # 包格式 rpm/deb（11-17 交付矩阵：货架格式过滤+AI 产包指向；空=未知不过滤）
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -428,6 +429,8 @@ def ensure_artifact_identity_columns():
     _safe_add_column("artifact_index", "glibc_requires", "VARCHAR(20) DEFAULT ''")
     # RUN.md 运行依赖（一期二期）：meta.runtime_libs 落库，与 toolchain 分列各表语义
     _safe_add_column("artifact_index", "runtime_env", "TEXT DEFAULT ''")
+    # 交付矩阵（11-17）：目标系统包格式登记（rpm/deb），空=未知=按现行行为不过滤
+    _safe_add_column("target_systems", "pkg_format", "VARCHAR(10) DEFAULT ''")
 
 
 def ensure_stage5_phase_columns():

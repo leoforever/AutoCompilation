@@ -62,6 +62,7 @@ class TaskState(TypedDict, total=False):
     commit_hash: str
     system_id: str
     system_name: str
+    pkg_format: str  # 11-17 交付矩阵：stage2 从 TargetSystem.pkg_format 读入（rpm/deb/空）
     # stage2 从 DB TargetSystem.base_image 读取的完整镜像名（含 tag）
     docker_image: str
     container_id: str
@@ -219,6 +220,7 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             _log(state, "error", state["last_error"], on_log)
             return state
         state["system_name"] = sys_rec.name
+        state["pkg_format"] = (getattr(sys_rec, "pkg_format", "") or "").strip()  # 11-17 交付矩阵
         # base_image 是 admin 配置的完整镜像名（含 tag）
         state["docker_image"] = (sys_rec.base_image or DEFAULT_BASE_IMAGE).strip()
         _log(state, "info", f"[阶段2] 环境匹配: {sys_rec.name} (image={state['docker_image']})", on_log)
@@ -586,7 +588,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 - 软件: {state['software_name']}
 - 源码: {src_dir}
 - 输出: {output_dir}
-- 系统: {state.get('system_id', '')}
+- 系统: {state.get('system_id', '')}（包格式: {state.get('pkg_format', '') or '未登记'}）
 
 ## 你能调用的工具
 - ls/read_file/write_file/edit_file/grep/glob — 文件操作
@@ -687,6 +689,14 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
 ②出现网络故障（挂起/断流/0字节/反复超时，两次即判）→ **立刻转③查货架**，别继续耗网络。
 公共源只可单次传参借道（npm --registry / pip --index-url），禁 config set 改全局。
 
+【交付形态规范（11-17 交付矩阵）】按"系统:"行的包格式决定最终交付形态：
+- 包格式=deb：C/C++ 类产物优先产 .deb（上游有 debian/ 规则用之；没有则装树后
+  dpkg-deb --build，或留给平台兜底产——但 Depends 运行库你要在 meta.runtime_libs 记全）；
+- 包格式=rpm：同理产 .rpm（spec 前缀听上游软件自己的默认，别自行挪 /usr/local）；
+- Python 产物=wheel、Node=npm tgz、Go/Rust=单文件（ldd 实测无外部依赖才许叫单文件，
+  有依赖按 ELF 对待、RUN.md 列明）——这三类**不要**画蛇添足包成 deb/rpm；
+- 无论哪类，散装 install 树（bin/lib/share 平铺）不算完成交付：要么打成系统包，
+  要么在 RUN.md 写清一键安装命令（cp -a 到哪个前缀、要不要 ldconfig/软链）。
 【产物复用】（货架=③层；路径一律用绝对 /work/cache/… 书写）
 /work/cache 是本目标系统已验证产物的货架（只读），全表 /work/cache/INDEX.md。
 开工探测阶段先 cat 它备着（专源失败时可秒转）；命中即用 cp 直取，跳过编译与下载，并在
@@ -743,7 +753,9 @@ runtime_libs 可选：ELF 类产物（binary/so/rpm/tgz 内裸 ELF）从产物�
 【运行说明书 RUN.md（交付物·面向使用者）】
 产物落 /work/output 后写一份 RUN.md（与 BUILD_NOTES 并列进包，BUILD_NOTES 给编译者、
 RUN.md 给拿到包要跑起来的人）。内容**全部来自实测命令，不许凭记忆编**：
-① 安装/放置：解包后怎么用（是否需要 --prefix 安装、数据文件目录、环境变量如 NMAPDIR）
+① 安装/放置：解包后怎么用（是否需要 --prefix 安装、数据文件目录、环境变量如
+   NMAPDIR）；有 .deb/.rpm 成品时首行就给 dpkg -i / rpm -ivh 命令；PACKAGE.json
+   已自动写入包内，勿与它内容矛盾
 ② 运行期共享库：对主二进制跑 `ldd <bin> | grep "not found"` 与 `objdump -p <bin> | grep NEEDED`
    实测抄录；每个库给出目标机安装命令（dnf 系如 lua-libs，apt 系如 liblua5.4-0；
    不确定确切包名就只写库名 + "缺它则 ldd 报 not found"，宁缺勿错猜）
@@ -1171,6 +1183,103 @@ def _archive_partial_artifacts(state: TaskState, container, on_log=None) -> bool
         return False
 
 
+def _pkg_identity_from_tree(out_dir: Path):
+    """从产物文件名猜 (name, version) 供兜底产包：deb/rpm 不许无名无版（宁缺勿造）。
+    取 output 树里最像'包'的文件名解析：<name>-<ver> 或 <name>_<ver> 前缀。"""
+    import re as _re
+    cand = [p.name for p in out_dir.rglob("*") if p.is_file()
+            and p.suffix in (".deb", ".rpm", ".so", ".tgz", ".gz", ".xz")
+            and not p.name.endswith(".meta.json")]
+    for n in cand:
+        stem = n
+        for suf in (".tar.gz", ".tar.xz", ".tgz", ".deb", ".rpm", ".so"):
+            if stem.endswith(suf):
+                stem = stem[: -len(suf)]
+                break
+        m = _re.match(r"^([A-Za-z][A-Za-z0-9._+-]*?)[-_](\d+[.\d][A-Za-z0-9.~+-]*)$", stem)
+        if m and len(m.group(1)) >= 2:
+            return m.group(1).lower(), m.group(2)
+    return "", ""
+
+
+def _write_package_json(state: TaskState, artifacts_dir: Path, on_log=None) -> None:
+    """PACKAGE.json 身份卡进 output 顶层（交付矩阵·一期4）：治"历史包自证不了身份"
+    （jd 案：过俩月没人知这坨是给哪个系统编的）。异常静默——可观测增益不伤交付。"""
+    try:
+        import json as _json
+        sys_name, sys_fmt, sys_glibc = state.get("system_name", ""), "", ""
+        from app.models import SessionLocal, TargetSystem
+        db = SessionLocal()
+        try:
+            row = db.query(TargetSystem).filter(TargetSystem.system_id == state.get("system_id")).first()
+            if row:
+                sys_fmt = (row.pkg_format or "").strip()
+                sys_glibc = (row.glibc_version or "").strip()
+                sys_name = row.name
+        finally:
+            db.close()
+        out_dir = artifacts_dir / "output"
+        payload = {
+            "software": state.get("software_name", ""),
+            "target_system": sys_name,
+            "pkg_format": sys_fmt or "unknown",
+            "glibc_baseline": sys_glibc,
+            "image": state.get("docker_image", ""),
+            "task_id": state.get("task_id") or str(artifacts_dir.parent.name),
+            "built_at": datetime.utcnow().isoformat() + "Z",
+            "deliverables": [x.get("name") for x in (state.get("artifacts") or [])][:20],
+            "install_hint": ("dpkg -i *.deb" if sys_fmt == "deb"
+                             else "rpm -ivh *.rpm 或 yum localinstall" if sys_fmt == "rpm"
+                             else "解包目录内含 RUN.md（安装与运行说明）"),
+        }
+        (out_dir / "PACKAGE.json").write_text(
+            _json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        _log(state, "info", "[阶段6] PACKAGE.json 身份卡已写入 output", on_log)
+    except Exception as e:
+        _log(state, "debug", f"[阶段6] PACKAGE.json 跳过: {type(e).__name__}", on_log)
+
+
+def _fallback_system_pkg(state: TaskState, artifacts_dir: Path, on_log=None) -> None:
+    """兜底产系统包（交付矩阵·二期，默认开）：AI 未产 .deb/.rpm 且 output 是散装
+    install 树时，宿主 dpkg-deb/rpmbuild 补产一个进 output（随 bundle 进下载包）。
+    不注入晋升 cache_out——货架口径保持"AI 自愿申报+人审"，平台自动产物不进审批流
+    （11-17 设计定稿）。失败只 warn；config pkg_fallback.enabled=false 可整体关。"""
+    try:
+        from app.config import get_cfg
+        if not get_cfg("artifact_cache.pkg_fallback.enabled", True, env_alias="PKG_FALLBACK"):
+            return
+        from app.services import pkg_build
+        from app.models import SessionLocal, TargetSystem
+        db = SessionLocal()
+        try:
+            row = db.query(TargetSystem).filter(TargetSystem.system_id == state.get("system_id")).first()
+            fmt = (row.pkg_format or "").strip().lower() if row else ""
+        finally:
+            db.close()
+        out_dir = artifacts_dir / "output"
+        if not pkg_build.needs_fallback_pack(out_dir, fmt):
+            return
+        name, version = _pkg_identity_from_tree(out_dir)
+        if not name or not version:
+            _log(state, "info", f"[阶段6] 兜底产{fmt}跳过：产物名解析不出 name/version（宁缺勿造）", on_log)
+            return
+        # runtime_libs 尽力取：output 树里 AI 留的 meta 带就用（Depends 更准），无则空
+        libs = []
+        try:
+            import json as _json
+            for mp in out_dir.rglob("*.meta.json"):
+                libs = _json.loads(mp.read_text(encoding="utf-8")).get("runtime_libs") or []
+                if libs:
+                    break
+        except Exception:
+            pass
+        p, msg = pkg_build.pack_tree(out_dir, fmt, name, version, libs)
+        _log(state, "info" if p else "warn",
+             f"[阶段6] 兜底产包: {p.name if p else msg}", on_log)
+    except Exception as e:
+        _log(state, "warn", f"[阶段6] 兜底产包异常跳过: {type(e).__name__}: {str(e)[:120]}", on_log)
+
+
 def _rescue_build_notes(state: TaskState, container, on_log=None) -> None:
     """BUILD_NOTES 落定到任务目录固定路径（与 build.log 同级，供工单/经验流消费）。
     成功任务：从 stage6 归档产物树拷；失败任务：容器将删，单独 get_archive 抢救。
@@ -1240,6 +1349,12 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
             _log(state, "success", f"[阶段6] 产物归档: {artifacts_dir}", on_log)
+
+            # 交付矩阵（11-17）：打包前先补两样进 output——① PACKAGE.json 身份卡
+            # ② 兜底系统包（AI 未产 .deb/.rpm 且产物是散装 install 树时，宿主产包）。
+            # 均在 tar 之前落盘，随 bundle 一起进交付包。任何异常只 warn（宁缺勿造）
+            _write_package_json(state, artifacts_dir, on_log)
+            _fallback_system_pkg(state, artifacts_dir, on_log)
 
             # 顺便打一份 tar.gz 整体包（用户点"下载全部产物"时直接返这个文件，避免每次都重打）
             bundle_path = artifacts_dir.parent / f"{artifacts_dir.name}.tar.gz"

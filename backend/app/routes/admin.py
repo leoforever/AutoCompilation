@@ -1005,6 +1005,9 @@ async def create_system(
     system = TargetSystem(
         name=system_data.name,
         base_image=system_data.base_image.strip(),   # 11-04 事故根治：带空格=invalid reference format
+        # 11-17 修既有缺口：这两项此前只 update 支持、create 漏传（新建系统填了不生效）
+        glibc_version=(system_data.glibc_version or "").strip(),
+        pkg_format=(system_data.pkg_format or "").strip(),
     )
     db.add(system)
     try:
@@ -1047,6 +1050,8 @@ async def update_system(
         system.base_image = system_data.base_image.strip()   # 11-04 事故根治：手滑带空格=invalid reference format
     if system_data.glibc_version is not None:
         system.glibc_version = system_data.glibc_version.strip()   # 11-05 配给基线
+    if system_data.pkg_format is not None:
+        system.pkg_format = system_data.pkg_format.strip()         # 11-17 交付矩阵 rpm/deb
     if system_data.is_active is not None:
         system.is_active = system_data.is_active
 

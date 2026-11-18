@@ -42,7 +42,10 @@ _EXT_TAILS = [".tar.zst", ".tar.gz", ".tgz", ".tar.xz", ".whl", ".rpm", ".deb",
 # kind 归类：扩展名 → 账本 kind（白名单晋升比对口径同源）
 _KIND_BY_EXT = {".whl": "whl", ".tgz": "tgz", ".tar.gz": "tgz", ".tar.xz": "tool",
                 ".tar.zst": "tool", ".xz": "tool", ".zip": "tool", ".rpm": "rpm",
-                ".deb": "rpm", ".so": "so", ".a": "a", ".node": "node_binding"}
+                # deb 独立 kind（11-17 交付矩阵）：此前 ".deb"→rpm 系误归，货架/视图
+                # 无法按格式过滤。⚠ 必须与 config.yaml promote_kinds 的 deb 同笔生效
+                # （只改一边=deb 晋升被白名单拒），201/.209 同 commit 落地
+                ".deb": "deb", ".so": "so", ".a": "a", ".node": "node_binding"}
 
 
 def kind_of(filename: str) -> str:
@@ -92,7 +95,7 @@ _TC_BY_KIND = {
     "whl": ["python"],
     "node_binding": ["node"],
     "so": ["gcc", "glibc"], "a": ["gcc", "glibc"], "binary": ["glibc", "gcc"],
-    "rpm": ["glibc"], "tgz": ["node", "python", "gcc"], "tool": ["version_any"],
+    "rpm": ["glibc"], "deb": ["glibc"], "tgz": ["node", "python", "gcc"], "tool": ["version_any"],
 }
 
 
@@ -579,6 +582,28 @@ def extract_glibc_requires(path) -> str:
             magic = f.read(4)
         if magic == b"\x7fELF":
             return _max_glibc_sym([p])
+        if p.suffix in (".deb", ".rpm"):
+            # 交付矩阵（11-17）：系统包=归档套归档（deb=ar→data.tar.*；rpm=cpio.gz），
+            # 现有两跳都没走 → 机提恒空、配给闸对 deb/rpm 形同虚设（nmap/lua 案根因之一）
+            with _tf.TemporaryDirectory(prefix="hermes-glibc-") as td:
+                tdp = Path(td)
+                if p.suffix == ".deb":
+                    r = _sp.run(["ar", "x", str(p)], cwd=td, capture_output=True, timeout=60)
+                    if r.returncode != 0:
+                        return ""
+                    data = next((f for f in tdp.glob("data.tar.*") if f.is_file()), None)
+                    if not data:
+                        return ""
+                    r = _sp.run(["tar", "-xf", str(data), "-C", str(tdp)],
+                                capture_output=True, timeout=120)
+                else:
+                    with open(p, "rb") as fin, open(tdp / "x.cpio", "wb") as fout:
+                        _sp.run(["rpm2cpio"], stdin=fin, stdout=fout, timeout=120, check=False)
+                    r = _sp.run(["cpio", "-idm", "--quiet", "-F", str(tdp / "x.cpio")],
+                                cwd=td, capture_output=True, timeout=120)
+                if r.returncode != 0:
+                    return ""
+                return _max_glibc_sym(_elf_members(tdp))
         if p.suffix in (".whl", ".zip") or p.name.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar.zst")):
             with _tf.TemporaryDirectory(prefix="hermes-glibc-") as td:
                 tdp = Path(td)
@@ -592,21 +617,26 @@ def extract_glibc_requires(path) -> str:
                                 capture_output=True, timeout=120)
                     if r.returncode != 0:
                         return ""
-                el = []
-                for f in sorted(tdp.rglob("*")):
-                    if len(el) >= 300:
-                        break
-                    if f.is_file() and not f.name.endswith(".meta.json"):
-                        try:
-                            with open(f, "rb") as fh:
-                                if fh.read(4) == b"\x7fELF":
-                                    el.append(f)
-                        except OSError:
-                            pass
-                return _max_glibc_sym(el)
+                return _max_glibc_sym(_elf_members(tdp))
     except Exception:
         return ""
     return ""
+
+
+def _elf_members(root: Path):
+    """归档解出树里收 ELF 成员（上限 300，防解包炸弹；跳过 meta）。"""
+    el = []
+    for f in sorted(Path(root).rglob("*")):
+        if len(el) >= 300:
+            break
+        if f.is_file() and not f.name.endswith(".meta.json"):
+            try:
+                with open(f, "rb") as fh:
+                    if fh.read(4) == b"\x7fELF":
+                        el.append(f)
+            except OSError:
+                pass
+    return el
 
 
 def _max_glibc_sym(files) -> str:
@@ -651,7 +681,32 @@ def _common_passes(row, baseline: str) -> bool:
     return ver_tuple(req) <= ver_tuple(baseline)
 
 
-def _link_pool_into_view(db, pool_id: int, view: Path, baseline: str = "") -> int:
+# 交付矩阵（11-17）：件格式 = 强绑定 kind（rpm/deb 只对同格式系统有意义），
+# 其余 kind（tgz/whl/binary/so/a/node_binding/tool）生态自管安装=中性件两边可见
+_FMT_BOUND = {"rpm": "rpm", "deb": "deb"}
+
+
+def system_pkg_format(db, system_id: int) -> str:
+    """目标系统登记的包格式（rpm/deb；空=未知=不过滤，老行为）。"""
+    try:
+        from app.models import TargetSystem
+        row = db.query(TargetSystem.pkg_format).filter(
+            TargetSystem.system_id == int(system_id)).first()
+        return (row[0] or "").strip().lower() if row else ""
+    except Exception:
+        return ""
+
+
+def _format_passes(row, fmt: str) -> bool:
+    """货架格式闸：系统未登记格式=全放行；件非强绑定 kind=中性放行；
+    强绑定件（rpm/deb）仅同格式系统可见——rpm 装不进 apt 机器，反之亦然。"""
+    if not fmt:
+        return True
+    bound = _FMT_BOUND.get((row.kind or "").strip().lower())
+    return bound is None or bound == fmt
+
+
+def _link_pool_into_view(db, pool_id: int, view: Path, baseline: str = "", fmt: str = "") -> int:
     """把某池（pool_id 含 COMMON=0）在架件硬链接进合并视图，保留 <norm>/<file> 相对结构。
     硬链接而非软链：容器内软链指向宿主机绝对路径=挂载面外死链；同盘 inode 跨 bind 有效。
     账本口径与 regenerate_index 一致（approved∪存量"" ∧未软删∧cache_path 非空）。
@@ -666,6 +721,8 @@ def _link_pool_into_view(db, pool_id: int, view: Path, baseline: str = "") -> in
     ).all()
     if pool_id == COMMON_SYSTEM_ID:
         rows = [r for r in rows if _common_passes(r, baseline)]   # 三层闸·配给过滤
+    if fmt:
+        rows = [r for r in rows if _format_passes(r, fmt)]        # 交付矩阵·格式闸
     for r in rows:
         src = cache_root() / r.cache_path
         if not src.is_file():
@@ -695,12 +752,13 @@ def build_shelf_view(db, system_id: int, container_work) -> Path:
     container_work 下随 stage6/7 天清扫自然消亡，不养垃圾。异常由调用方兜退化。"""
     from app.models import ArtifactIndex
     baseline = system_baseline(db, system_id)     # 11-05 配给基线（空=不过滤）
+    fmt = system_pkg_format(db, system_id)        # 11-17 交付矩阵格式闸（空=不过滤）
     view = Path(container_work) / "cache_view"
     if view.is_dir():
         shutil.rmtree(view, ignore_errors=True)
     view.mkdir(parents=True, exist_ok=True)
-    _link_pool_into_view(db, COMMON_SYSTEM_ID, view, baseline)
-    _link_pool_into_view(db, int(system_id), view, baseline)
+    _link_pool_into_view(db, COMMON_SYSTEM_ID, view, baseline, fmt)
+    _link_pool_into_view(db, int(system_id), view, baseline, fmt)
     rows = db.query(ArtifactIndex).filter(
         ArtifactIndex.system_id.in_((COMMON_SYSTEM_ID, int(system_id))),
         ArtifactIndex.deleted_at.is_(None),
@@ -708,6 +766,7 @@ def build_shelf_view(db, system_id: int, container_work) -> Path:
         ArtifactIndex.cache_path != "",
     ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     rows = [r for r in rows if r.system_id != COMMON_SYSTEM_ID or _common_passes(r, baseline)]
+    rows = [r for r in rows if _format_passes(r, fmt)]   # INDEX 与硬链接视图同闸（口径一致）
     lines = ["# 复用库货架（平台自动生成，勿手改；缺依赖先查此表）",
              "# 行首带『通用』= 所有系统可用的工具母包（公共池）；其余为本系统已验证产物",
              f"# 共 {len(rows)} 件，按复用次数排列（同次数新件在前）；行多时工具可能截断显示，"

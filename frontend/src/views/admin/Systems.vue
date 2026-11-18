@@ -22,6 +22,9 @@
                 <el-table-column label="glibc 基线" width="100">
           <template #default="{ row }">{{ row.glibc_version || '—' }}</template>
         </el-table-column>
+        <el-table-column label="包格式" width="90">
+          <template #default="{ row }">{{ row.pkg_format || '未登记' }}</template>
+        </el-table-column>
 <el-table-column label="编译镜像" min-width="280">
           <template #default="{ row }">
             <code class="img-code">{{ row.base_image }}</code>
@@ -65,6 +68,14 @@
         <el-form-item label="glibc 基线">
           <el-input v-model="form.glibc_version" placeholder="如：2.38（公共池配给判据，可留空）" />
         </el-form-item>
+        <el-form-item label="包格式">
+          <el-select v-model="form.pkg_format" placeholder="未登记（不过滤）" style="width: 100%">
+            <el-option label="未登记（不做格式过滤）" value="" />
+            <el-option label="rpm（openEuler / Loongnix-server 系）" value="rpm" />
+            <el-option label="deb（Debian / Loongnix 25 系）" value="deb" />
+          </el-select>
+          <div class="form-hint">决定货架格式过滤与产物打包指向（dpkg -i / rpm -ivh）</div>
+        </el-form-item>
         <el-form-item label="编译镜像" prop="base_image">
           <el-input v-model="form.base_image" placeholder="如：loongnix-build:23.2" />
           <div class="form-hint">完整镜像名（含 tag）。worker 会 docker pull 这个镜像</div>
@@ -101,6 +112,7 @@ const form = ref({
   name: '',
   base_image: '',
   glibc_version: '',
+  pkg_format: '',
   is_active: true,
 })
 
@@ -142,6 +154,7 @@ function editSystem(s: any) {
     name: s.name,
     base_image: s.base_image,
     glibc_version: s.glibc_version || '',
+    pkg_format: s.pkg_format || '',
     is_active: s.is_active,
   }
   dialogVisible.value = true
@@ -153,6 +166,7 @@ function resetForm() {
     name: '',
     base_image: '',
     glibc_version: '',
+    pkg_format: '',
     is_active: true,
   }
   formRef.value?.clearValidate()

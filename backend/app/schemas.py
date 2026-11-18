@@ -68,12 +68,14 @@ class TargetSystemCreate(BaseModel):
     # 默认值给老数据迁移兜底（init_db seed 走老 path 时不写也会用默认）
     base_image: str = Field(default="loongnix-build:23.2", min_length=1)
     glibc_version: str = Field(default="", max_length=20)   # 11-05 公共池配给基线（SP2=2.38）
+    pkg_format: str = Field(default="", pattern="^(|rpm|deb)$")  # 11-17 交付矩阵（空=未知不过滤）
 
 
 class TargetSystemUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     base_image: Optional[str] = Field(None, min_length=1)
     glibc_version: Optional[str] = Field(None, max_length=20)   # 空串=显式清空基线
+    pkg_format: Optional[str] = Field(None, pattern="^(|rpm|deb)$")  # 11-17 交付矩阵
     is_active: Optional[bool]
 
 
@@ -90,6 +92,7 @@ class TargetSystemResponse(BaseModel):
     name: str
     base_image: str
     glibc_version: str = ""
+    pkg_format: str = ""     # 11-17 交付矩阵 rpm/deb/空
     is_active: bool
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

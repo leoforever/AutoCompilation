@@ -463,6 +463,22 @@ async def download_compile_log(
     )
 
 
+def _sys_tag(system_id, db) -> str:
+    """系统短代号：loongnix-25→loongnix25、openEuler-24.03-LTS-SP2→openeuler2403
+    （只取字母数字、去 LTS/-server 类噪声词、截 20）。查不到=空串省略该段。"""
+    import re
+    try:
+        from app.models import TargetSystem
+        row = db.query(TargetSystem.name).filter(TargetSystem.system_id == system_id).first()
+        if not row or not row[0]:
+            return ""
+        toks = [t for t in re.split(r"[^A-Za-z0-9]+", row[0]) if t and t.lower() not in ("lts", "server", "sp", "build")]
+        tag = re.sub(r"[^a-z0-9]", "", "-".join(toks).lower())
+        return tag[:20]
+    except Exception:
+        return ""
+
+
 def _bundle_filename(task, task_id: str, db) -> str:
     """下载展示名 = 软件名-版本-T日期-短id.tar.gz（11-16 拍板：只改 filename，
     盘上物理名恒 artifacts.tar.gz——下载/清单/对账/备份三方共用那个事实源不动）。
@@ -486,7 +502,10 @@ def _bundle_filename(task, task_id: str, db) -> str:
     # T-20261109114747-996D1D → 日期 8 位 + 短 id（全量 14 位时分秒无增益，砍掉）
     m = re.match(r"T-(\d{8})\d{6}-([0-9A-Za-z]{4,8})$", task_id)
     tid = f"{m.group(1)}-{m.group(2)}" if m else task_id
-    return f"{safe}-{ver}-{tid}.tar.gz" if ver else f"{safe}-{tid}.tar.gz"
+    # 系统段（11-17 拍板①）：治"历史包看不出给谁编的"（jd 案）；未登记系统=省略段
+    seg = _sys_tag(task.system_id, db)
+    mid = "-".join(x for x in (ver, seg, tid) if x)
+    return f"{safe}-{mid}.tar.gz"
 
 
 @router.get("/tasks/{task_id}/artifacts/download")
