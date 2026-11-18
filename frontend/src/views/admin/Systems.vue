@@ -185,6 +185,7 @@ async function saveSystem() {
         name: form.value.name,
         base_image: form.value.base_image,
         glibc_version: form.value.glibc_version || '',   // 每次显式带（空串=清空基线）
+        pkg_format: form.value.pkg_format || '',          // 同上，空=未登记不过滤
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已更新')
@@ -193,6 +194,7 @@ async function saveSystem() {
         name: form.value.name,
         base_image: form.value.base_image,
         glibc_version: form.value.glibc_version || '',
+        pkg_format: form.value.pkg_format || '',
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已创建')
