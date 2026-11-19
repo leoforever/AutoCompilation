@@ -6,6 +6,7 @@ description: |
   mono 6.13.0 在龙芯 Loongnix 25.1-rc1 上的构建、deb 打包与验证记录。编译 mono、mono-runtime deb、mcs/csc、Loongnix 25.1-rc1、monolite 引导、BoringSSL Unknown target CPU、mcontext_t __fpregs 时读这条。
 ---
 
+> 通用件指针：apt/deb 见 `generic/debian-packaging`。本篇只留 monolite/GUID/cross 特有坑。
 ## 简要场景
 
 - 软件：mono 6.13.0（源码树 `configure.ac` 中 `AC_INIT(mono,[6.13.0])`）

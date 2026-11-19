@@ -6,6 +6,7 @@ description: |
   ILSpy 与 ilspycmd 在龙芯 loongnix-25.1-rc1 上的 .NET 构建、self-contained 发布与 deb 打包流程。编译 ILSpy、ilspycmd、dotnet publish、生成 deb 时读这条。
 ---
 
+> 通用件指针：deb 构造见 `generic/debian-packaging`。本篇只留 dotnet publish/self-contained 特有流程。
 ## 简要场景
 
 - 软件：ILSpy 11.3.0，源码 commit `5b269993`

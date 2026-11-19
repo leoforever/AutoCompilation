@@ -6,6 +6,7 @@ description: |
   Metasploit Framework Ruby 应用 deb 构建与验证流程。在龙芯 Loongnix 25.1-rc1 / loongnix-stable loong64 上编译 metasploit-framework、bundle install、sqlite3/nokogiri native gem、deb 解包验证时读这条。
 ---
 
+> 通用件指针：deb 组树/Depends 见 `generic/debian-packaging`。本篇只留 ruby native gem 与 bundler 特有坑。
 ## 简要场景
 
 - 软件：metasploit-framework 6.5.11-dev（git HEAD `4f30a91e`），Ruby 应用框架。

@@ -3,9 +3,10 @@ name: mitmproxy-loongnix-25-1-rc1
 type: layer2-build
 allowed-tools: [execute, read_file]
 description: |
-  mitmproxy 13.0.0.dev 的 loongarch64 wheel 构建与离线交付记录。龙芯 Loongnix 25.1-rc1、编译 mitmproxy、mitmdump、mitmweb、mitmproxy_rs、mitmproxy_linux、maturin、brotli、cryptography、tornado、urwid、eBPF、lpypi。
+  mitmproxy 13.0.0.dev 的 loongarch64 wheel 构建与离线交付记录。龙芯 Loongnix 25.1-rc1、编译 mitmproxy、mitmdump、mitmweb、mitmproxy_rs、mitmproxy_linux、maturin、brotli、tornado pin 冲突、eBPF 时读这条。
 ---
 
+> 通用件指针：pip 专源/sdist 回退见 `generic/python-package`；apt/deb 见 `generic/debian-packaging`。本篇只留 mitmproxy 特有坑。
 ## 简要场景
 - 软件：mitmproxy 13.0.0.dev，源码 `https://github.com/mitmproxy/mitmproxy`（branch 未记录）；`mitmproxy/version.py` 为 `VERSION = "13.0.0.dev"`，wheel 版本为 `13.0.0.dev0`。
 - 系统：Loongnix GNU/Linux 25 / `loongnix-25.1-rc1`，deb/apt 系，内核 `Linux 6.6.52-1.7.lns23.loongarch64`，架构 loongarch64。

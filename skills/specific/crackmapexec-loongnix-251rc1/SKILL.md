@@ -6,6 +6,7 @@ description: |
   CrackMapExec 6.1.0 在龙芯 Loongnix 25.1-rc1（loongnix-stable）loongarch64 上的 Python wheel、依赖安装与 shiv zipapp 构建记录。编译 CrackMapExec、安装 cme/cmedb、处理 Python C/Rust 依赖时读这条。
 ---
 
+> 通用件指针：pip 专源与 venv 姿势见 `generic/python-package`；apt 装包/deb 见 `generic/debian-packaging`。本篇只留 CrackMapExec 特有知识。
 ## 简要场景
 
 - 软件：CrackMapExec 6.1.0

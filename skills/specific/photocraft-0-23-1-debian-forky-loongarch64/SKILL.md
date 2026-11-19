@@ -6,6 +6,7 @@ description: |
   PhotoCraft 0.23.1（Rust 图像编辑器 GUI/CLI）在龙芯 Debian forky/sid、Python 3.12 环境中的构建与打包步骤（cargo 1.99.0、apt -dev 依赖、craft-i18n 快照、lld 链接）。编译 PhotoCraft、photocraft-cli、生成 deb/tar.gz、或撞到 R_LARCH_B26 overflow 时读这条。
 ---
 
+> 通用件指针：apt/deb 见 `generic/debian-packaging`。本篇只留 R_LARCH_B26/lld/craft-i18n 特有坑。
 ## 简要场景
 
 - 软件：PhotoCraft 0.23.1，纯 Rust 图像编辑器；GUI 使用 egui/eframe + wgpu，另有 headless CLI。

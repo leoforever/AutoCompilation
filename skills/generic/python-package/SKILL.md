@@ -12,6 +12,13 @@ allowed-tools: [execute, read_file]
 - 带 C/C++ 扩展的项目（如 psycopg2、cryptography、numpy）
 - 需要 cross-compile 到 LoongArch 的项目
 
+## pip 源（龙芯专源，单一权威）
+- 主: `https://lpypi.loongnix.cn/loongson/pypi/+simple`
+- 备: `https://mirrors.aliyun.com/pypi/simple` / `https://pypi.tuna.tsinghua.edu.cn/simple`
+- 用法：`pip install -i https://lpypi.loongnix.cn/loongson/pypi/+simple <pkg>`（或 venv 内
+  `pip config set global.index-url ...`）；专源只有 sdist 的包回退源码编译是正常路径。
+- ⚠ 不要把 cmake/ninja 等构建工具放进 pip 依赖列表（sdist 现编白烧时间，见 generic/cmake-cpp）。
+
 ## 环境检查（必做）
 
 ```bash

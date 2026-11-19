@@ -33,7 +33,10 @@ def test_skill_loader_count():
     assert len(md) >= 5, f"got {len(md)}: {md}"
     # 只校验 generic 工具链类（平台基建，稳定）；specific 随审批流增删改名，进名单必碎
     # （2026-10-21 教训：ollama/llama-cpp 被审批删除、pytorch 重命名后本测试即挂）
-    for k in ("go-toolchain", "nodejs-toolchain", "python-environment", "python-package"):
+    # 11-19 经验重组：python-environment 并入 python-package（薄篇同源分裂）；
+    # 新增 debian-packaging / autotools-cross-loongarch / cmake-cpp 三篇基建入锁
+    for k in ("go-toolchain", "nodejs-toolchain", "python-package",
+              "debian-packaging", "autotools-cross-loongarch", "cmake-cpp"):
         assert k in names, f"缺失 skill: {k}"
 
 

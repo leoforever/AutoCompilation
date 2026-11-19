@@ -6,6 +6,7 @@ description: |
   lintian 2.144.1 在龙芯 Loongnix 25.1-rc1 上构建 deb 包的步骤与验证。编译 lintian、打包 lintian、dpkg-buildpackage、fakeroot、chmod EPERM、man 页缺失、libdistro-info-perl get_all_series 时读这条。
 ---
 
+> 通用件指针：dpkg-buildpackage/compat 降级见 `generic/debian-packaging`。本篇只留 lintian 环依赖与 perl 模块坑。
 ## 简要场景
 
 - 软件：lintian 2.144.1，Debian package checker，纯 Perl 项目，`Architecture: all`。

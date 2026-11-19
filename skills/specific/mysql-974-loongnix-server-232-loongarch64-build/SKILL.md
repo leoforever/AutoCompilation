@@ -6,6 +6,7 @@ description: |
   MySQL 9.7.4 源码构建与 RPM 打包流程：龙芯 Loongnix Server 23.2、loongarch64。编译 mysql-9.7.4、cmake configure、ninja install、rpmbuild、缺 rpcgen/systemd-devel/libudev 时读这条。
 ---
 
+> 通用件指针：configure/config.guess 类先查 `generic/autotools-cross-loongarch`；cmake 见 `generic/cmake-cpp`。本篇只留 mysql 布局与 rpmbuild 参数。
 ## 简要场景
 
 - 软件：MySQL 9.7.4，源码分支 `mysql-9.7.4`，`MYSQL_VERSION` 为 `9.7.4`，Maturity 为 `LTS`。
