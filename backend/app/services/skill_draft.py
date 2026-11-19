@@ -348,7 +348,7 @@ description 字段（检索命中关键，按 system 规则）：{software} 在�
 def _llm_generate_ticket_draft(db: Session, ticket: Ticket, task: CompileTask, system_name: str) -> Optional[str]:
     """工单经验 LLM 草稿：与 experience_generator 同一套校验/剥壳/重试，prompt 加工单增强"""
     from app.services.experience_generator import (
-        _SYSTEM_PROMPT, _call_llm, _strip_wrapping, _validate_draft,
+        _SYSTEM_PROMPT, _call_llm, _strip_wrapping, _validate_draft, build_system_prompt,
     )
 
     ev = _collect_ticket_evidence(db, ticket, task)
@@ -378,7 +378,7 @@ def _llm_generate_ticket_draft(db: Session, ticket: Ticket, task: CompileTask, s
     for attempt in (1, 2):
         try:
             # 8192：思考型模型 reasoning 吃输出预算，2048 写长攻略会 content 为空（实测）
-            raw = _call_llm(_SYSTEM_PROMPT, user_prompt, temperature=0.3, max_tokens=8192)
+            raw = _call_llm(build_system_prompt(db), user_prompt, temperature=0.3, max_tokens=8192)
             cleaned = _strip_wrapping(raw)
             ok, reason = _validate_draft(cleaned)
             if ok:

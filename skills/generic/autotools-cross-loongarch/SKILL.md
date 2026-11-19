@@ -18,7 +18,22 @@ configure: error: <triplet>: unknown host/cpu/vendor
 根因九成是：**源码里内嵌的 config.guess / config.sub 太老，不认 loongarch64**
 （GNU 官方 2021+ 版本才加入支持；2015-2019 的源码树普遍没有）。
 
-## 通用处置（按序试）
+## 先分物种：autoconf 生成 vs 手写 configure（处置完全不同）
+```bash
+ls config.guess config.sub 2>/dev/null   # 有 → autoconf 系，走下面通用处置
+                                         # 无 → 手写 sh configure，走本节"补 case 表"
+```
+**手写 configure（无 config.guess 可换）：补架构 case 表就是正解**。
+这类脚本用 `case "$ARCH"` 硬列架构，加 loongarch64 分支即可：
+```sh
+loongarch64)  ARCH_CFLAGS="-march=la64v1.0" ;;   # 先保 configure 通过
+```
+⚠ 若代码含 SIMD intrinsic（__m128i/__m256i/__lsx_*/__lasx_*），只给 -march
+会报 `unknown type name '__m256i'`——龙芯 gcc 的 lasx/lsx 内建由宏门控，
+**必须补 `-mlsx -mlasx`**（lsx-missing-flag 案最小复现实证，非猜测）。
+此情形下"别 patch configure"的红线不适用：没有探测件可换，case 表就是机制本身。
+
+## 通用处置（autoconf 系，按序试）
 1. **显式传 build/host 双保险**（最快，先试这个）：
    ```bash
    ./configure --build=loongarch64-unknown-linux-gnu [其它项目参数]

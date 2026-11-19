@@ -122,6 +122,46 @@ description 不写"怎么修"或"怎么用"——那是正文干的活。
 """
 
 
+# 11-19 经验重组（lsx 案反思）：生成器此前看不见库内已有 generic 篇，逐单独立
+# 成篇导致通用坑被反复抄进专用篇（lpypi 六处复述、rpm 镜像坑锁在 demo 篇里）。
+# 治本=生成时注入现有 generic 目录 + 避让规则；LLM 不必"记得查 wiki"。
+_AVOIDANCE_RULE = """
+
+# 与现有通用篇查重（避让规则，优先级高于"写全"）
+下面是平台当前已有的 generic 攻略目录。整理经验时：
+1. 本次踩的坑若主题已被某 generic 篇覆盖（如 deb/rpm 打包、pip 专源、
+   autotools/configure、cmake、go/node 工具链），正文**只写一行指针**
+   （"通用步骤见 generic/<名>"），不复述其步骤与命令；
+2. 若坑明显属通用知识但目录中没有对应篇：照常写进本篇保命，并在草稿
+   最末尾单独加一段 `## 建议沉淀为通用篇`，一句话说明该沉淀什么主题；
+3. 单软件特有的报错、参数、补丁——照写专用篇正文，这是本篇的主体价值。
+
+现有 generic 目录：
+"""
+
+
+def build_system_prompt(db) -> str:
+    """_SYSTEM_PROMPT + 实时 generic 目录（每篇 name + description 首行摘要）。"""
+    lines = []
+    try:
+        from app.models import Skill
+        rows = (db.query(Skill)
+                .filter(Skill.type == "generic", Skill.is_active == True)  # noqa: E712
+                .order_by(Skill.name).all())
+        for r in rows:
+            first = ""
+            for ln in (r.description or "").splitlines():
+                if ln.strip():
+                    first = ln.strip()[:70]
+                    break
+            lines.append(f"- generic/{r.name}: {first}")
+    except Exception:
+        pass  # 目录缺失不拦生成（退化为旧行为）
+    if not lines:
+        lines = ["- （目录读取失败——按保守写全本篇，末尾建议沉淀段照常）"]
+    return _SYSTEM_PROMPT + _AVOIDANCE_RULE + "\n".join(lines)
+
+
 def _sample_log_material(log: str, budget: int = _LOG_TRUNCATE_CHARS) -> str:
     """长日志智能采样（替代纯尾截断）。
 
@@ -411,7 +451,7 @@ def generate_draft(db: "Session", task_id: int) -> dict:
     draft = None
     for attempt in (1, 2):
         try:
-            raw = _call_llm(_SYSTEM_PROMPT, user_prompt, temperature=0.3)
+            raw = _call_llm(build_system_prompt(db), user_prompt, temperature=0.3)
             cleaned = _strip_wrapping(raw)
             ok, reason = _validate_draft(cleaned)
             if ok:
