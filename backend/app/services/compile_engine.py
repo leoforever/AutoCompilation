@@ -747,6 +747,11 @@ runtime_libs 可选：ELF 类产物（binary/so/rpm/tgz 内裸 ELF）从产物�
 
 【验证产物隔离】（平台会把 /work/output 打包交付给用户）
 - 验证过程的临时物（venv、pip/npm 缓存、测试输出、验证脚本）一律放 /work/verify/，不要放 /work/output；
+【源码修改必须记述】（平台 stage6 会自动导出 source-changes.patch 进包，但补丁只说明
+"改了什么"，为什么只有你能写）：凡改过 /work/src 里的源码/构建脚本（含 configure、
+Makefile、spec、patch 文件），BUILD_NOTES 的"踩坑与修复"或"步骤"节必须逐个列出
+**改了哪个文件、原报错是什么、为什么这样改**——这些改动别人要拿去用，缘由缺失等于废补丁。
+
 - /work/output 只放**最终交付物**（包、库、可执行文件）+ BUILD_NOTES.md + RUN.md；
 - 若已把临时物放进 /work/output，收尾前 mv 到 /work/verify/ 即可。
 
@@ -1202,6 +1207,52 @@ def _pkg_identity_from_tree(out_dir: Path):
     return "", ""
 
 
+def _gen_source_patch(state: TaskState, artifacts_dir: Path, on_log=None) -> None:
+    """git 源任务：导出 AI 对源码的修改补丁进交付包（11-19 一期，拍板：仅 git 源）。
+
+    动机：AI 为编过补的 configure/源码改动只活在 container_work（7 天清理钟），
+    一周后物理蒸发——mysql 类上游贡献场景没有通道。源码树是 bind 挂载，
+    宿主机 container_work/src 即 AI 改的那一份，stage6 在归档树里直接 git diff
+    导出，随 tar 交付（比 docker exec 少一层往返，且不依赖容器存活状态）。
+    一期只导**已跟踪文件**修改（git diff 本义）；untracked 新文件不收
+    （add -N 会把 build/.o 等构建噪音一并拖进补丁——待办：甄别式收集）。
+    任何失败只 warn：补丁是增益，绝不拦归档主流程。"""
+    try:
+        if (state.get("source_type") or "") != "git":
+            return
+        src = Path(state.get("work_dir", "")) / "container_work" / "src"
+        if not (src / ".git").is_dir():
+            _log(state, "info", "[阶段6] 源码补丁跳过：源码树无 .git（非 git 源或已清理）", on_log)
+            return
+        import subprocess as _sp
+        base = _sp.run(["git", "-c", "safe.directory=*", "-C", str(src), "rev-parse", "HEAD"],
+                       capture_output=True, text=True, timeout=30).stdout.strip()
+        if len(base) < 7:
+            _log(state, "info", "[阶段6] 源码补丁跳过：基线 commit 读取失败", on_log)
+            return
+        d = _sp.run(["git", "-c", "safe.directory=*", "-C", str(src), "diff", "HEAD"],
+                    capture_output=True, text=True, timeout=120)
+        if d.returncode != 0:
+            _log(state, "warn", f"[阶段6] 源码补丁跳过：git diff 失败 {d.stderr[:100]}", on_log)
+            return
+        diff = d.stdout
+        out = artifacts_dir / "output" / "source-changes.patch"
+        out.write_text(
+            f"# 源码修改补丁  任务 {state.get('task_id')}  软件 {state.get('software_name')}\n"
+            f"# 基线 commit: {base}\n"
+            f"# 生成: compile-platform stage6 自动导出（git 已跟踪文件的工作区修改）\n"
+            f"# 用法: 在基线 commit 的干净源码树上  git apply source-changes.patch\n"
+            f"# 注意: AI 新建的未跟踪文件不在本补丁内；改动缘由见同包 BUILD_NOTES.md\n\n"
+            + diff, encoding="utf-8")
+        n = sum(1 for ln in diff.splitlines() if ln.startswith("diff --git"))
+        _log(state, "info",
+             f"[阶段6] 源码补丁已导出: source-changes.patch（{n} 个文件，基线 {base[:8]}）"
+             if diff.strip() else
+             "[阶段6] 源码补丁：本次未改动已跟踪源码（空 diff，留文件为证）", on_log)
+    except Exception as e:
+        _log(state, "warn", f"[阶段6] 源码补丁异常跳过: {type(e).__name__}: {str(e)[:120]}", on_log)
+
+
 def _write_package_json(state: TaskState, artifacts_dir: Path, on_log=None) -> None:
     """PACKAGE.json 身份卡进 output 顶层（交付矩阵·一期4）：治"历史包自证不了身份"
     （jd 案：过俩月没人知这坨是给哪个系统编的）。异常静默——可观测增益不伤交付。"""
@@ -1354,6 +1405,7 @@ def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState
             # ② 兜底系统包（AI 未产 .deb/.rpm 且产物是散装 install 树时，宿主产包）。
             # 均在 tar 之前落盘，随 bundle 一起进交付包。任何异常只 warn（宁缺勿造）
             _write_package_json(state, artifacts_dir, on_log)
+            _gen_source_patch(state, artifacts_dir, on_log)
             _fallback_system_pkg(state, artifacts_dir, on_log)
 
             # 顺便打一份 tar.gz 整体包（用户点"下载全部产物"时直接返这个文件，避免每次都重打）
