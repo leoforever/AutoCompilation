@@ -172,6 +172,40 @@
       </template>
     </el-dialog>
   </div>
+    <el-dialog v-model="retryDlg" title="重试编译任务（可修改后重试）" width="520px">
+      <div v-if="retryTarget">
+        <p style="margin:0 0 10px;color:var(--el-text-color-secondary);font-size:13px">
+          源任务 {{ retryTarget.task_id }} —— 新任务将按下表创建，原任务记录不动。
+        </p>
+        <el-form label-width="90px">
+          <el-form-item label="软件名称">
+            <el-input v-model="retryForm.software_name" maxlength="100" />
+          </el-form-item>
+          <template v-if="retryTarget.source_type === 'git'">
+            <el-form-item label="Git 地址">
+              <el-input v-model="retryForm.git_url" placeholder="https:// 或 git://" />
+            </el-form-item>
+            <el-form-item label="分支">
+              <el-input v-model="retryForm.git_branch" placeholder="main" />
+            </el-form-item>
+          </template>
+          <template v-else>
+            <el-form-item label="源码包">
+              <el-input :model-value="(retryTarget.source_path || '').split('/').pop() || '—'" readonly />
+              <div style="font-size:12px;color:var(--el-text-color-secondary)">重试复用原上传包；要换新包请走"新建编译"上传。</div>
+            </el-form-item>
+          </template>
+          <el-form-item label="目标系统">
+            <span style="color:var(--el-text-color-regular)">{{ retryTarget.system_name || retryTarget.system_id }}</span>
+            <span style="font-size:12px;color:var(--el-text-color-secondary);margin-left:8px">换系统请走新建</span>
+          </el-form-item>
+        </el-form>
+      </div>
+      <template #footer>
+        <el-button @click="retryDlg = false">取消</el-button>
+        <el-button type="primary" :loading="retrying" @click="doRetry">确定重试</el-button>
+      </template>
+    </el-dialog>
     <el-dialog v-model="delDlg" title="删除编译任务" width="440px">
       <div v-if="delTarget">
         <p>任务 <b>{{ delTarget.task_id }}</b>（{{ delTarget.software_name }}，{{ delTarget.status }}）</p>
@@ -436,25 +470,43 @@ async function cancelTask(task: any) {
 }
 
 async function retryTask(task: any) {
-  try {
-    await ElMessageBox.confirm(
-      `确认重试任务 #${task.task_id}？\n将创建新任务（参数同原任务），worker 会重新跑一遍。`,
-      '重试编译任务',
-      { confirmButtonText: '确认重试', cancelButtonText: '不重试', type: 'info' }
-    )
-  } catch {
-    return
+  // 11-20 设计 B：预填可编辑弹框（不改任何字段直接确定 = 旧行为逐字等价）
+  retryTarget.value = task
+  retryForm.software_name = task.software_name || ''
+  retryForm.git_url = task.git_url || ''
+  retryForm.git_branch = task.git_branch || 'main'
+  retryDlg.value = true
+}
+
+const retryDlg = ref(false)
+const retryTarget = ref<any>(null)
+const retryForm = reactive({ software_name: '', git_url: '', git_branch: '' })
+const retrying = ref(false)
+
+async function doRetry() {
+  const t = retryTarget.value
+  if (!t) return
+  // 只把"改过的"字段放进载荷——后端审计据此写"改动了 xxx"，全量提交会虚报改动
+  const body: any = {}
+  if (retryForm.software_name !== (t.software_name || '')) body.software_name = retryForm.software_name
+  if (t.source_type === 'git') {
+    if (retryForm.git_url !== (t.git_url || '')) body.git_url = retryForm.git_url
+    if (retryForm.git_branch !== (t.git_branch || '')) body.git_branch = retryForm.git_branch
   }
+  retrying.value = true
   try {
-    const r: any = await api.post(`/compile/tasks/${task.task_id}/retry`)
+    const r: any = await api.post(`/compile/tasks/${t.task_id}/retry`, Object.keys(body).length ? body : undefined)
     if (r?.code === 200) {
       ElMessage.success(`已创建新任务：${r.data.new_task_id}`)
-      loadTasks()  // 刷新列表
+      retryDlg.value = false
+      loadTasks()
     } else {
       ElMessage.error(r?.message || '重试失败')
     }
   } catch (e: any) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '重试失败')
+  } finally {
+    retrying.value = false
   }
 }
 

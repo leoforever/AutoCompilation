@@ -24,7 +24,7 @@ from app.models import User
 
 from app.models import get_db, CompileTask, TaskStatus, TargetSystem, Skill, ArtifactIndex
 from app.schemas import (
-    CompileTaskCreate, CompileTaskResponse, CompileTaskListResponse,
+    CompileTaskCreate, CompileTaskRetry, CompileTaskResponse, CompileTaskListResponse,
     ApiResponse
 )
 from app.services import task_queue
@@ -643,15 +643,18 @@ async def cancel_compile_task(
 async def retry_compile_task(
     task_id: str,
     request: Request,
+    body: Optional[CompileTaskRetry] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """重试编译任务
+    """重试编译任务（11-20 设计 B：可编辑重试）
 
-    - 复制原任务（git_url / branch / system_id / build_args / source_type / mode）的 payload
-    - 生成新 task_id（保持原 owner）
-    - 状态校验：仅终态（success / failed / cancelled）可重试
-    - 权限：非 admin 必须是任务拥有者
+    - 默认（body=None）行为与旧版逐字等价：复制原任务 payload 建新任务
+    - body 携带字段=覆盖复制值（软件名/git 地址/分支），校验与首次提交同口径
+    - upload 任务：源码包指向原文件（sources/ 永久保留）；建任务前预检包在盘，
+      不在就 400——把失败从 stage4a 提前到点击瞬间。换包请走上传新建，不走重试。
+    - git 任务的 git_url/git_branch 可覆盖；upload 任务覆盖这两项无意义，忽略。
+    - 权限：非 admin 必须是任务拥有者；仅终态可重试
     """
     src = db.query(CompileTask).filter(CompileTask.task_id == task_id, CompileTask.deleted_at.is_(None)).first()
     if not src:
@@ -666,26 +669,54 @@ async def retry_compile_task(
             detail=f"任务状态为 {src.status}，无法重试（只能重试 success / failed / cancelled）"
         )
 
-    # 生成新 task_id + 复用 payload
+    # upload 预检：包不在盘就别排队了（stage6 不清 sources/，此为异常兜底）
+    if src.source_type == "upload":
+        _pkg = Path(src.source_path) if src.source_path else None
+        if not _pkg or not _pkg.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="原上传源码包已不在平台，请重新上传源码包新建任务（重试只复用原包）",
+            )
+
+    # 覆盖合并（只收显式非空值；upload 任务忽略 git 两项覆盖）
+    overrides: dict = {}
+    software_name = src.software_name
+    git_url, git_branch = src.git_url, src.git_branch
+    if body is not None:
+        if body.software_name:
+            software_name = body.software_name
+            overrides["software_name"] = 1
+        if src.source_type == "git":
+            if body.git_url is not None:
+                if not body.git_url:
+                    raise HTTPException(status_code=400, detail="git 任务 git_url 不能清空")
+                git_url = body.git_url
+                overrides["git_url"] = 1
+            if body.git_branch:
+                git_branch = body.git_branch
+                overrides["git_branch"] = 1
+
+    # 生成新 task_id + 复用 payload（或按上面覆盖）
     new_task_id = f"T-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
     new_task = CompileTask(
         task_id=new_task_id,
         user_id=src.user_id,  # 保持原 owner
         system_id=src.system_id,
-        software_name=src.software_name,
+        software_name=software_name,
         source_type=src.source_type,
         source_path=src.source_path,
-        git_url=src.git_url,
-        git_branch=src.git_branch,
+        git_url=git_url,
+        git_branch=git_branch,
         build_args=src.build_args,
         compile_mode=src.compile_mode,
         status=TaskStatus.SUBMITTED.value,
     )
     db.add(new_task)
     db.flush()   # 拿主键（T10：add 前 id=None）
+    changed = "，改动了：" + "、".join(overrides) if overrides else ""
     log_audit(db, user_id=current_user.user_id, action="task_retry", target_type="compile_task",
               target_id=new_task.id, target_key=new_task_id, request=request,
-              details=f"from={task_id} software={src.software_name}")
+              details=f"from={task_id} software={software_name}{changed}")
     db.commit()
     db.refresh(new_task)
 

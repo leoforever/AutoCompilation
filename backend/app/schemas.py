@@ -146,6 +146,24 @@ class CompileTaskCreate(BaseModel):
     compile_mode: CompileMode = CompileMode.CONTAINER
 
 
+class CompileTaskRetry(BaseModel):
+    """重试可编辑弹框载荷（11-20 设计 B）：全部可选，收到才覆盖、没收到沿用原值。
+    source_path 不在覆盖面——换源码包=走上传端点新建任务，retry 只复用原包。"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    software_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    git_url: Optional[str] = None
+    git_branch: Optional[str] = Field(default=None, max_length=100)
+
+    @field_validator("git_url")
+    @classmethod
+    def _git_url_scheme(cls, v):
+        # 与 CompileTaskCreate/3f 同口径：重试不得绕过协议白名单
+        import re as _re
+        if v and not _re.match(r"^(https?|git)://", v):
+            raise ValueError("git_url 仅支持 http(s):// 或 git:// 协议")
+        return v
+
+
 class CompileTaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
