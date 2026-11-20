@@ -48,7 +48,7 @@ _KIND_BY_EXT = {".whl": "whl", ".tgz": "tgz", ".tar.gz": "tgz", ".tar.xz": "tool
                 ".deb": "deb", ".so": "so", ".a": "a", ".node": "node_binding"}
 
 
-def kind_of(filename: str) -> str:
+def kind_of(filename: str, file_path: "str | None" = None) -> str:
     f = filename.lower()
     for ext, k in _KIND_BY_EXT.items():
         if f.endswith(ext):
@@ -56,6 +56,16 @@ def kind_of(filename: str) -> str:
     if "." not in f[1:] or f.endswith((".bin", ".elf")):
         # 裸可执行（无扩展名风格）归 binary——有扩展名但不认识的归 other（不轻易放行）
         return "binary"
+    # 11-20（protoc-31.0.0 被拒案）：文件名带点号尾巴（版本号段）走到"不认识"分支
+    # 并不一定不是可执行件——扩展名判据失效时用文件头说话：真 ELF magic 归 binary。
+    # 无 file_path（如手工上传只有文件名）维持保守 other，宁漏勿误不误放行。
+    if file_path:
+        try:
+            with open(file_path, "rb") as fh:
+                if fh.read(4) == b"\x7fELF":
+                    return "binary"
+        except OSError:
+            pass
     return "other"
 
 
@@ -226,7 +236,7 @@ def collect_promotables(cache_out: Path, system_id: int) -> tuple[list[dict], li
         if not f.is_file() or f.name.endswith(".meta.json"):
             continue
         rel = str(f.relative_to(cache_out))          # 相对路径：平铺件=原名，子目录件=dir/name
-        kind = kind_of(f.name)
+        kind = kind_of(f.name, str(f))
         size = f.stat().st_size
         if kind not in kinds:
             rejects.append(f"{rel}: kind={kind} 不在白名单")
@@ -455,7 +465,7 @@ def reindex(db) -> dict:
                 row = ArtifactIndex(source_task_id=t.id, source_task_key=t.task_id,
                                     name=nm, name_norm=name_norm_of(f.name),
                                     version="" if is_dir else version_of(f.name),
-                                    kind="dir" if is_dir else kind_of(f.name),
+                                    kind="dir" if is_dir else kind_of(f.name, str(f)),
                                     origin="task", status="",
                                     size_bytes=0 if is_dir else f.stat().st_size,
                                     system_id=t.system_id,

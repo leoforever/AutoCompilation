@@ -207,6 +207,15 @@ class DockerBackend(SandboxBackendProtocol):
         )
 
     def write(self, file_path: str, content: str, **kwargs) -> "WriteResult":
+        # 11-20（ghidra T-...DCCDEB 实锤 3 次）：网关会静默截断超长工具调用参数，
+        # 截断标记 "(argument truncated)" 会混进 content——旧行为是照写不误并报成功，
+        # AI 拿到 43 字节的"半个脚本"浑然不觉，后面整轮 debug 烧在假象上。
+        # 修法：见标记即拒写（把静默腐坏变成响亮报错），并给出绕行路径。
+        if "(argument truncated)" in content:
+            return WriteResult(error=(
+                "write_file 参数在到达前已被截断（内容含 '(argument truncated)' 标记，"
+                "已拒写避免落半个文件）。改用 execute() heredoc 分块写入："
+                "cat > 文件 <<'EOF' ... EOF；或先写骨架再用 edit_file 分段补全。"))
         import base64
         b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
         rel_q = shlex.quote(file_path)
