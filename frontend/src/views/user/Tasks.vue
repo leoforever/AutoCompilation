@@ -474,7 +474,7 @@ async function retryTask(task: any) {
   retryTarget.value = task
   retryForm.software_name = task.software_name || ''
   retryForm.git_url = task.git_url || ''
-  retryForm.git_branch = task.git_branch || 'main'
+  retryForm.git_branch = task.git_branch || ''
   retryDlg.value = true
 }
 
