@@ -186,7 +186,7 @@
               <el-input v-model="retryForm.git_url" placeholder="https:// 或 git://" />
             </el-form-item>
             <el-form-item label="分支">
-              <el-input v-model="retryForm.git_branch" placeholder="main" />
+              <el-input v-model="retryForm.git_branch" placeholder="留空用远端默认分支（如 main / master）" />
             </el-form-item>
           </template>
           <template v-else>
