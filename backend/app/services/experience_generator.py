@@ -37,11 +37,8 @@ logger = logging.getLogger(__name__)
 _LOG_TRUNCATE_CHARS = 12000
 
 # 单次 LLM 输出上限
-# 思考型模型（qwen3.8-flash 等）reasoning 计入 max_completion_tokens 预算：
-# 2048 实测 finish=length、content=0（写长文档必空）→ 默认给足（2026-10-21 复现实验：
-# 同 prompt 2048→content_len=0 / 8192→14102）。skill_draft 早已显式 8192，这里补齐默认值。
-# 2026-10-21 用户拍板 8192*8=65536：长攻略+大思考量场景留足头寸（API 实测接受 65536）。
-_MAX_TOKENS = 65536
+# （11-20 统一口径）原 _MAX_TOKENS=*** 兜底已拆除：调用方不传=请求体不带
+# max_completion_tokens，真吃网关默认；当年 2048 空输出教训留给显式传值的调用方自查。
 
 
 # ==================== Prompt ====================
@@ -322,9 +319,11 @@ def _call_llm(system: str, user: str, temperature: float = 0.3,
         raise RuntimeError("AI_API_KEY 未配置（请检查后端环境变量）")
 
     # call_site 可区分调用方（QA 传 qa.ask，草稿传 exp.draft）——限流审计用
+    # 11-20 拍板：调用方不传=请求体真·不带 max_completion_tokens（吃网关默认），
+    # 不再用 _MAX_TOKENS 兜底把"没传"变回"传大数"；要显式档位的调用方自带参数
     llm = make_llm(
         temperature=temperature,
-        max_tokens=max_tokens or _MAX_TOKENS,
+        max_tokens=max_tokens,
         call_site=call_site or "exp.draft",
     )
     # response_json：JSON mode（OpenAI 兼容协议专有 kwarg，11-03 实测 MiniMax/Qwen

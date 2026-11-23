@@ -25,11 +25,11 @@ _URL_USERINFO = re.compile(r'://([^/\s:@]+):([^/\s@]+)@')
 MAX_DETAILS = 2048
 
 
-def sanitize_details(text: str) -> str:
+def sanitize_details(text: str, max_len: int = MAX_DETAILS) -> str:
     t = _CRED_RE.sub(r'\1\2[REDACTED]\4', str(text))
     t = _CRED_LOOSE.sub(r'\1=[REDACTED]', t)
     t = _URL_USERINFO.sub(r'://\1:[REDACTED]@', t)
-    return t[:MAX_DETAILS]
+    return t[:max_len]
 
 
 def client_ip(request) -> str | None:

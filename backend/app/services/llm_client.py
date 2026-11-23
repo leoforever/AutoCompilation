@@ -169,7 +169,7 @@ class ModelSlot:
 
     def __init__(self, slot_id: str, provider: str, model: str, base_url: str, api_key: str,
                  priority: int = 1, enabled: bool = True, max_concurrent: int = 2,
-                 min_interval_ms: int = 1500):
+                 min_interval_ms: int = 1500, max_input_tokens: "int | None" = None):
         self.id = slot_id
         self.provider = provider
         self.model = model
@@ -177,6 +177,11 @@ class ModelSlot:
         self.api_key = api_key
         self.priority = priority
         self.enabled = enabled
+        # 11-23 deepagents 上下文压缩口径：模型窗口（token）。配了才给 ChatOpenAI
+        # 传 profile={"max_input_tokens":N} → deepagents 摘要阈值走 fraction 分支
+        # (0.85×窗口触发)；不配=profile None → 保守 170K token 硬阈值。
+        # 注意这是"告诉库窗口多大"的声明值，不是网关参数——填模型真实窗口。
+        self.max_input_tokens = max_input_tokens
         self.throttle = LlmThrottle(max_concurrent, min_interval_ms / 1000.0)
         self.stats = {"calls": 0, "throttled_429": 0, "waited_total": 0.0, "failures": 0}
         self._fail_streak = 0
@@ -214,7 +219,7 @@ def build_base_llm(slot: ModelSlot, *, temperature: float, max_tokens: Optional[
     provider = (slot.provider or "openai_compatible").lower()
     if provider in ("openai_compatible", "openai", "compatible"):
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        kwargs: dict = dict(
             model=slot.model, api_key=slot.api_key, base_url=slot.base_url or None,
             temperature=temperature,
             # 思考型模型（MiniMax M3 / Qwen3.8）reasoning 计入输出预算：
@@ -222,18 +227,26 @@ def build_base_llm(slot: ModelSlot, *, temperature: float, max_tokens: Optional[
             max_completion_tokens=max_tokens,
             max_retries=0,          # 不变式③：SDK 自带重试关掉，我们独管
         )
+        # 11-23 窗口声明（每 slot 独立配置）：配了 max_input_tokens 才传 profile，
+        # deepagents 摘要阈值即从保守 170K 硬阈值切到 fraction(0.85×窗口)；
+        # 不配 = profile None = 维持旧行为，零波及
+        if getattr(slot, "max_input_tokens", None):
+            kwargs["profile"] = {"max_input_tokens": int(slot.max_input_tokens)}
+        return ChatOpenAI(**kwargs)
     if provider in ("anthropic", "claude"):
         from langchain_anthropic import ChatAnthropic
+        # 11-23 统一口径：不传=不发送该参数、吃网关默认（与 openai 分支同语义；
+        # 原 `or 4096` 会把"没传"变成"传小值"，正是当天拆掉 65536 兜底的同病）
         return ChatAnthropic(
             model=slot.model, api_key=slot.api_key,
             base_url=slot.base_url or None, temperature=temperature,
-            max_tokens=max_tokens or 4096, max_retries=0,
+            max_tokens=max_tokens, max_retries=0,
         )
     if provider in ("google_genai", "gemini", "google"):
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
             model=slot.model, google_api_key=slot.api_key, temperature=temperature,
-            max_output_tokens=max_tokens or 4096, max_retries=0,
+            max_output_tokens=max_tokens, max_retries=0,
         )
     raise ValueError(f"不支持的 provider 协议: {provider}")
 
@@ -509,6 +522,7 @@ def load_model_slots() -> list:
                     enabled=bool(m.get("enabled", True)),
                     max_concurrent=int(m.get("max_concurrent") or get_cfg("llm.max_concurrent", 2)),
                     min_interval_ms=int(m.get("min_interval_ms") or get_cfg("llm.min_interval_ms", 1500)),
+                    max_input_tokens=int(v) if (v := m.get("max_input_tokens")) else None,
                 ))
         if not slots:
             from app.config import ai_model, ai_api_key, ai_base_url
@@ -519,6 +533,8 @@ def load_model_slots() -> list:
                     base_url=ai_base_url(), api_key=key, priority=1, enabled=True,
                     max_concurrent=int(get_cfg("llm.max_concurrent", 2)),
                     min_interval_ms=int(get_cfg("llm.min_interval_ms", 1500)),
+                    max_input_tokens=int(os.environ["AI_MAX_INPUT_TOKENS"])
+                    if os.environ.get("AI_MAX_INPUT_TOKENS", "").isdigit() else None,
                 ))
         slots.sort(key=lambda s: s.priority)
         _slots_cache = slots

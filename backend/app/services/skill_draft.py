@@ -378,7 +378,7 @@ def _llm_generate_ticket_draft(db: Session, ticket: Ticket, task: CompileTask, s
     for attempt in (1, 2):
         try:
             # 8192：思考型模型 reasoning 吃输出预算，2048 写长攻略会 content 为空（实测）
-            raw = _call_llm(build_system_prompt(db), user_prompt, temperature=0.3, max_tokens=8192)
+            raw = _call_llm(build_system_prompt(db), user_prompt, temperature=0.3)
             cleaned = _strip_wrapping(raw)
             ok, reason = _validate_draft(cleaned)
             if ok:
