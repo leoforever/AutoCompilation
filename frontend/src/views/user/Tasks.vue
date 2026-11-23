@@ -12,6 +12,10 @@
           <el-option label="失败" value="failed" />
         </el-select>
         <el-input v-model="searchText" placeholder="搜索软件名 / 任务ID…" style="width:200px" />
+        <!-- 提交人筛选：仅 admin（普通用户本就只见自己，无此需求） -->
+        <el-select v-if="auth.isAdmin" v-model="filterUser" placeholder="全部提交人" clearable style="width:150px">
+          <el-option v-for="u in userOptions" :key="u" :label="u" :value="u" />
+        </el-select>
         <el-button @click="loadTasks">🔍 查询</el-button>
         <el-button type="primary" @click="$router.push('/workbench')">+ 新建编译</el-button>
       </div>
@@ -20,6 +24,7 @@
         <el-table-column prop="task_id" label="ID" width="120" />
         <el-table-column prop="software_name" label="软件" min-width="120" />
         <el-table-column prop="system_name" label="系统" min-width="140" show-overflow-tooltip />
+        <el-table-column v-if="auth.isAdmin" prop="username" label="提交人" width="100" show-overflow-tooltip />
         <el-table-column label="模式" width="80">
           <template #default="{ row }">
             <el-tag :type="row.compile_mode === 'container' ? 'primary' : 'warning'" size="small">
@@ -233,6 +238,8 @@ import { useAuthStore } from '@/stores/auth'
 const tasks = ref<any[]>([])
 const filterStatus = ref('')
 const searchText = ref('')
+const filterUser = ref('')      // 11-23 admin 按提交人筛选
+const userOptions = ref<string[]>([])
 const logDialogVisible = ref(false)
 const currentTask = ref<any>(null)
 const llmStatsLine = ref('')   // 11-23 日志弹窗头部 LLM 用量摘要
@@ -247,6 +254,7 @@ async function loadTasks() {
   }
   if (filterStatus.value) params.status = filterStatus.value
   if (searchText.value) params.search = searchText.value
+  if (filterUser.value) params.user = filterUser.value
   
   const res: any = await api.get('/compile/tasks', { params })
   // /compile/tasks 直接返 {total, tasks}（没包 ApiResponse）—— 与单 task 接口不同
@@ -739,8 +747,19 @@ async function doDeleteTask() {
     ElMessage.error(e?.message || '删除失败')
   } finally { deleting.value = false }
 }
+async function loadUserOptions() {
+  // 提交人下拉=真实提交过任务的人（去重），而非全体用户——筛了必有所得
+  if (!auth.isAdmin) return
+  try {
+    const res: any = await api.get('/compile/tasks', { params: { page: 1, page_size: 100 } })
+    const seen = new Set<string>()
+    for (const t of (res.tasks || [])) if (t.username) seen.add(t.username)
+    userOptions.value = [...seen].sort()
+  } catch { /* 拉不到就留空下拉，不炸页面 */ }
+}
 onMounted(async () => {
   await loadTasks()
+  loadUserOptions()
   loadExistingTickets()
   // T12 通知深链：/tasks?focus=<task_id> 自动打开该任务日志（消费后即清参数，防刷新重弹）
   const f = route.query.focus as string

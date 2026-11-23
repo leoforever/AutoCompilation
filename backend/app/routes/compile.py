@@ -327,11 +327,22 @@ def _bundle_size_for(task_id: str) -> int | None:
         return None
 
 
+def _usernames_for_tasks(db: Session, user_ids: list[int]) -> dict[int, str]:
+    """批量取 user_id → username（一次查询防 N+1，与 _system_names 同款）"""
+    if not user_ids:
+        return {}
+    rows = db.query(User.user_id, User.username).filter(
+        User.user_id.in_(set(user_ids))
+    ).all()
+    return {uid: name for uid, name in rows}
+
+
 @router.get("/tasks", response_model=CompileTaskListResponse)
 async def list_compile_tasks(
     status: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     mine: bool = Query(default=False),
+    user: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -342,6 +353,7 @@ async def list_compile_tasks(
 
     - status: 状态筛选（submitted/compiling/success/failed）
     - search: 搜索软件名或任务 ID
+    - user: 按提交人用户名精确筛选（仅 admin 生效，11-23 任务管理加列配套）
     - mine: 只看自己名下（11-19 Workbench 接管查询用——admin 看全部是列表页语义，
       "接管我自己的在途任务"对 admin 也必须限自己，否则 admin 进新建页会
       认领别人的任务、表单被顶掉无法新建；任务管理页不传=行为不变）
@@ -352,6 +364,10 @@ async def list_compile_tasks(
     # 用户隔离：非 admin 强制 user_id 过滤；mine=true 对 admin 同样限自己
     if current_user.role != "admin" or mine:
         query = query.filter(CompileTask.user_id == current_user.user_id)
+    # admin 按人筛选：用户名精确命中（非 admin 传了也无效——本来就只见自己）
+    if user and current_user.role == "admin":
+        _uids = db.query(User.user_id).filter(User.username == user).all()
+        query = query.filter(CompileTask.user_id.in_([u[0] for u in _uids]))
 
     if status:
         query = query.filter(CompileTask.status == TaskStatus(status))
@@ -368,13 +384,15 @@ async def list_compile_tasks(
 
     # 批量取 system_name（一次 join 查所有 task 的 system_id 对应的 name）
     sys_names = _system_names_for_tasks(db, [t.system_id for t in tasks])
+    unames = _usernames_for_tasks(db, [t.user_id for t in tasks])
 
     return CompileTaskListResponse(
         total=total,
         tasks=[
             CompileTaskResponse(
                 system_name=sys_names.get(t.system_id),
-                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name", "bundle_size"}),
+                username=unames.get(t.user_id),
+                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name", "bundle_size", "username"}),
                 bundle_size=_bundle_size_for(t.task_id),
             )
             for t in tasks

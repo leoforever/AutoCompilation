@@ -206,6 +206,7 @@ class CompileTaskResponse(BaseModel):
     verified_ok: bool = False
     artifact_partial: bool = False
     phase_state: Optional[str]
+    username: Optional[str] = None   # 11-23 任务管理"提交人"列（列表端点批量注入）
     llm_stats: List["LlmStatRow"] = []   # 11-23 任务 LLM 用量账（无账=空列表）
 
     @field_validator("depend_tree", mode="before")
