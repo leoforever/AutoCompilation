@@ -397,10 +397,18 @@ async def get_compile_task(
         raise HTTPException(status_code=403, detail="无权访问该任务")
 
     sys_names = _system_names_for_tasks(db, [task.system_id])
+    # 11-23 用量账：任务详情带 LLM 消耗（按 model 分行的数组，无账=空）
+    from app.models import TaskLlmStats
+    stats = db.query(TaskLlmStats).filter(TaskLlmStats.task_id == task.id).all()
     return ApiResponse(data=CompileTaskResponse(
         system_name=sys_names.get(task.system_id),
-        **CompileTaskResponse.model_validate(task).model_dump(exclude={"system_name", "bundle_size"}),
+        **CompileTaskResponse.model_validate(task).model_dump(exclude={"system_name", "bundle_size", "llm_stats"}),
         bundle_size=_bundle_size_for(task.task_id),
+        llm_stats=[dict(model=s.model, calls=s.calls, input=s.input_tokens,
+                        output=s.output_tokens, reasoning=s.reasoning_tokens,
+                        cache_read=s.cache_read_tokens, seconds=s.llm_seconds,
+                        wait_s=s.llm_wait_s, usage_missing=bool(s.usage_missing))
+                   for s in stats],
     ).model_dump())
 
 

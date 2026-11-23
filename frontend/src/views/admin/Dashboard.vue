@@ -10,40 +10,72 @@
       <!-- 核心指标（全部来自 /admin/stats/overview 真实聚合） -->
       <div class="grid g4">
         <div class="stat">
-          <div class="num" :style="{ color: kpi.month_success_rate >= 80 ? 'var(--success)' : 'var(--warning)' }">
-            {{ kpi.month_has_data ? kpi.month_success_rate + '%' : '—' }}
+          <div class="stat-head">
+            <span class="lbl">编译任务</span>
+            <span class="llm-tabs mini">
+              <button v-for="t in TASK_TABS" :key="t.k" :class="{ on: taskTab === t.k }" @click="taskTab = t.k">{{ t.label }}</button>
+            </span>
           </div>
-          <div class="lbl">本月编译成功率</div>
-          <div v-if="kpi.month_has_data" class="delta" :class="kpi.month_delta >= 0 ? 'up' : 'down'">
-            {{ kpi.month_delta >= 0 ? '↑' : '↓' }} {{ Math.abs(kpi.month_delta) }}% vs 上月
-          </div>
-          <div v-else class="delta muted">本月暂无任务</div>
-        </div>
-        <div class="stat">
-          <div class="num">{{ kpi.total_tasks }}</div>
-          <div class="lbl">编译任务总数</div>
-          <div class="delta up">本周新增 {{ kpi.week_new_tasks }}</div>
+          <div class="num">{{ kpiTask.total }}</div>
+          <div class="delta up">成功 {{ kpiTask.success }}<span v-if="kpiTask.total"> ({{ Math.round(kpiTask.success / kpiTask.total * 100) }}%)</span></div>
         </div>
         <div class="stat clickable" @click="goTickets">
           <div class="num">{{ kpi.ticket_solve_rate }}%</div>
           <div class="lbl">工单解决率（共 {{ kpi.ticket_total }}）</div>
           <div class="delta muted">平均解决时长 {{ kpi.ticket_avg_solve_hours != null ? kpi.ticket_avg_solve_hours + ' 小时' : '—' }}</div>
         </div>
-        <div class="stat" :class="{ clickable: kpi.pending_experiences > 0 }" @click="goReview">
-          <div class="num" :style="{ color: kpi.pending_experiences > 0 ? 'var(--warning)' : 'var(--success)' }">
-            {{ kpi.pending_experiences }}
-          </div>
-          <div class="lbl">待审经验</div>
-          <div class="delta muted">{{ kpi.pending_experiences > 0 ? '点击直达审批页 →' : '暂无积压' }}</div>
-        </div>
-        <div class="stat">
-          <div class="num">{{ kpi.agent_msgs_week }}</div>
-          <div class="lbl">Agent 对话（本周）</div>
-          <div class="delta muted">含流式 + 同步轮次</div>
-        </div>
         <div class="stat">
           <div class="num">{{ kpi.active_users }}</div>
           <div class="lbl">活跃用户（7 天）</div>
+        </div>
+      </div>
+
+      <!-- LLM 用量账（11-23 全档）：总量 KPI + 近7天走势 + 按软件 TOP5 + 最近明细 -->
+      <div class="card mb16">
+        <h3>🧮 LLM 用量
+          <span class="llm-tabs">
+            <button v-for="t in LLM_TABS" :key="t.k" :class="{ on: llmTab === t.k }" @click="llmTab = t.k">{{ t.label }}</button>
+          </span>
+          <span v-if="llmShown.usage_missing_rows" class="muted small"> · {{ llmShown.usage_missing_rows }} 行网关未回账</span>
+        </h3>
+        <div class="llm-kpi-row">
+          <div><b>{{ llmShown.calls }}</b><span>调用次数</span></div>
+          <div><b>{{ fmtTok(llmShown.input) }}</b><span>输入 tokens</span></div>
+          <div><b>{{ fmtTok(llmShown.output) }}</b><span>输出 tokens<span class="muted small">（思考 {{ fmtTok(llmShown.reasoning) }}）</span></span></div>
+          <div><b>{{ llmShown.cache_pct }}%</b><span>输入缓存命中率<span class="muted small">（省 {{ fmtTok(llmShown.cache_read) }}）</span></span></div>
+          <div><b>{{ fmtDur(llmShown.seconds) }}</b><span>LLM 累计时长</span></div>
+        </div>
+        <div v-if="llmTrend.length" class="llm-trend">
+          <div v-for="t in llmTrend" :key="t.date" class="llm-day" :title="`${t.date}: ${t.calls} 次 · 输入 ${fmtTok(t.input)} · 输出 ${fmtTok(t.output)}`">
+            <div class="llm-day-bar" :style="{ height: dayBarH(t) + 'px' }"></div>
+            <span>{{ t.date.slice(3) }}</span>
+          </div>
+        </div>
+        <div v-else class="empty-hint">暂无用量数据 —— 部署后新跑的任务自动入账</div>
+        <div v-if="llmTop.length || llmRecent.length" class="grid g2" style="margin-top:12px">
+          <div>
+            <h4 class="sub-h">按软件 TOP{{ llmTop.length }}（输入量排序）</h4>
+            <el-table v-if="llmTop.length" :data="llmTop" size="small" stripe>
+              <el-table-column prop="software" label="软件" show-overflow-tooltip />
+              <el-table-column label="调用" width="60"><template #default="{ row }">{{ row.calls }}</template></el-table-column>
+              <el-table-column label="输入" width="80"><template #default="{ row }">{{ fmtTok(row.input) }}</template></el-table-column>
+              <el-table-column label="输出" width="72"><template #default="{ row }">{{ fmtTok(row.output) }}</template></el-table-column>
+              <el-table-column label="LLM时长" width="84"><template #default="{ row }">{{ fmtDur(row.seconds) }}</template></el-table-column>
+            </el-table>
+            <div v-else class="empty-hint muted">积累中</div>
+          </div>
+          <div>
+            <h4 class="sub-h">最近明细（≤10 单）</h4>
+            <el-table v-if="llmRecent.length" :data="llmRecent" size="small" stripe>
+              <el-table-column prop="software" label="软件" show-overflow-tooltip />
+              <el-table-column label="状态" width="76"><template #default="{ row }">{{ row.status }}</template></el-table-column>
+              <el-table-column label="调用" width="56"><template #default="{ row }">{{ row.calls }}</template></el-table-column>
+              <el-table-column label="输入" width="80"><template #default="{ row }">{{ fmtTok(row.input) }}<span v-if="row.missing" title="网关未回账"> ⚠</span></template></el-table-column>
+              <el-table-column label="输出" width="72"><template #default="{ row }">{{ fmtTok(row.output) }}</template></el-table-column>
+              <el-table-column label="时长" width="76"><template #default="{ row }">{{ fmtDur(row.seconds) }}</template></el-table-column>
+            </el-table>
+            <div v-else class="empty-hint muted">积累中</div>
+          </div>
         </div>
       </div>
 
@@ -109,7 +141,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '@/utils/request'
 
@@ -119,16 +151,48 @@ const loadError = ref('')
 const generatedAt = ref('')
 
 const kpi = ref<Record<string, any>>({
-  month_success_rate: 0, month_delta: 0, month_has_data: false,
-  total_tasks: 0, week_new_tasks: 0,
+  task_windows: { all: { total: 0, success: 0 }, week: { total: 0, success: 0 }, month: { total: 0, success: 0 } },
   ticket_solve_rate: 0, ticket_total: 0, ticket_avg_solve_hours: null,
-  pending_experiences: 0, agent_msgs_week: 0, active_users: 0,
+  active_users: 0,
 })
 const trend = ref<any[]>([])
 const topErrors = ref<any[]>([])
 const failedSamples = ref(0)
 const pipeline = ref<any[]>([])
 const funnel = ref<any[]>([])
+
+// LLM 用量账（11-23）
+const ZERO_USAGE = { calls: 0, input: 0, output: 0, reasoning: 0, cache_read: 0, cache_pct: 0, seconds: 0, usage_missing_rows: 0 }
+const llmUsageAll = ref<Record<string, any>>({ ...ZERO_USAGE })
+const llmUsageWeek = ref<Record<string, any>>({ ...ZERO_USAGE })
+const llmUsageMonth = ref<Record<string, any>>({ ...ZERO_USAGE })
+const llmTab = ref<'all' | 'week' | 'month'>('all')
+// 任务卡三窗口（与 LLM 用量卡同构；口径=窗口内创建，成功=其中 success）
+const taskTab = ref<'all' | 'week' | 'month'>('all')
+const TASK_TABS = [{ k: 'all', label: '全部' }, { k: 'week', label: '本周' }, { k: 'month', label: '本月' }] as const
+const kpiTask = computed(() => (kpi.value.task_windows || {})[taskTab.value] || { total: 0, success: 0 })
+const LLM_TABS = [{ k: 'all', label: '全部' }, { k: 'week', label: '本周' }, { k: 'month', label: '本月' }] as const
+const llmShown = computed(() =>
+  llmTab.value === 'week' ? llmUsageWeek.value : llmTab.value === 'month' ? llmUsageMonth.value : llmUsageAll.value)
+const llmTrend = ref<any[]>([])
+const llmTop = ref<any[]>([])
+const llmRecent = ref<any[]>([])
+function fmtTok(n: number) {
+  n = n || 0
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
+  return String(n)
+}
+function fmtDur(s: number) {
+  s = s || 0
+  if (s >= 3600) return (s / 3600).toFixed(1) + ' 小时'
+  if (s >= 60) return Math.round(s / 60) + ' 分钟'
+  return s + ' 秒'
+}
+function dayBarH(t: any) {
+  const max = Math.max(...llmTrend.value.map(x => x.input), 1)
+  return Math.max(Math.round((t.input / max) * 46), 3)
+}
 
 const PIPE_LABEL: Record<string, string> = { pending: '待接单', processing: '处理中', resolved: '已解决', closed: '已关闭' }
 const PIPE_COLOR: Record<string, string> = { pending: 'var(--warning)', processing: 'var(--primary)', resolved: 'var(--success)', closed: 'var(--text3)' }
@@ -147,7 +211,6 @@ function fmtTime(iso: string) {
   const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'))
   return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
-function goReview() { if (kpi.value.pending_experiences > 0) router.push('/admin/review') }
 function goTickets() { router.push('/admin/tickets') }
 
 async function loadStats() {
@@ -162,6 +225,12 @@ async function loadStats() {
     failedSamples.value = d.failed_samples ?? 0
     pipeline.value = d.ticket_pipeline || []
     funnel.value = d.experience_funnel || []
+    llmUsageAll.value = { ...llmUsageAll.value, ...(d.llm_usage || {}) }
+    llmUsageWeek.value = { ...llmUsageWeek.value, ...(d.llm_usage_week || {}) }
+    llmUsageMonth.value = { ...llmUsageMonth.value, ...(d.llm_usage_month || {}) }
+    llmTrend.value = d.llm_trend || []
+    llmTop.value = d.llm_top_software || []
+    llmRecent.value = d.llm_recent || []
     generatedAt.value = d.generated_at || ''
   } catch (e: any) {
     // 失败只留占位，不渲染任何假数据
@@ -175,6 +244,20 @@ onMounted(loadStats)
 </script>
 
 <style scoped>
+.stat-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:2px }
+.stat-head .lbl { margin:0 }
+.llm-tabs { display:inline-flex; gap:4px; margin-left:10px; vertical-align:middle }
+.llm-tabs button { border:1px solid var(--border); background:var(--card); color:var(--text2); font-size:11.5px; padding:2px 10px; border-radius:99px; cursor:pointer }
+.llm-tabs button.on { background:var(--primary); border-color:var(--primary); color:#fff }
+.llm-tabs.mini { display:flex; gap:3px; margin:6px 0 0 }
+.llm-tabs.mini button { font-size:10.5px; padding:1px 8px }
+.llm-kpi-row { display:flex; flex-wrap:wrap; gap:26px; margin:6px 0 14px }
+.llm-kpi-row b { display:block; font-size:21px; font-weight:700 }
+.llm-kpi-row span { display:block; font-size:12px; color:var(--text3); margin-top:2px }
+.llm-trend { display:flex; align-items:flex-end; gap:14px; height:64px; padding:6px 4px 0 }
+.llm-day { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:11px; color:var(--text3) }
+.llm-day-bar { width:26px; background:var(--primary); border-radius:4px 4px 0 0; min-height:3px; opacity:.85 }
+.sub-h { font-size:13px; font-weight:600; margin:0 0 8px }
 .page-title { font-size: 18px; font-weight: 600; margin-bottom: 4px }
 .page-sub { color: var(--text3); font-size: 12.5px; margin-bottom: 18px }
 .gen-time { font-size: 11.5px }

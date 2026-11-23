@@ -65,7 +65,17 @@ async def get_stats_overview(db: Session = Depends(get_db)):
     m_rate, p_rate = _rate(m_total, m_succ), _rate(p_total, p_succ)
 
     total_tasks = db.query(CompileTask).filter(CompileTask.deleted_at.is_(None)).count()
-    week_new_tasks = db.query(CompileTask).filter(CompileTask.created_at >= week_start, CompileTask.deleted_at.is_(None)).count()
+    # ---- 任务卡三窗口（11-23 拍板：全部/本周/本月 切换，与 LLM 用量卡同构）----
+    # 口径统一：新增=窗口内创建，成功=窗口内创建且 success（"这个窗口干了几单成几单"）；
+    # 全部窗口=建库至今累计。软删任务一律不计。
+    task_windows = {}
+    for _wk, _lo in (("all", None), ("week", week_start), ("month", month_start)):
+        _tq = db.query(CompileTask)
+        if _lo is not None:
+            _tq = _tq.filter(CompileTask.created_at >= _lo)
+        _tot = _tq.filter(CompileTask.deleted_at.is_(None)).count()
+        _suc = _tq.filter(CompileTask.deleted_at.is_(None), CompileTask.status == "success").count()
+        task_windows[_wk] = {"total": _tot, "success": _suc}
 
     # ---- 工单 ----
     t_counts = {str(k): int(v) for k, v in db.query(Ticket.status, _f.count(Ticket.ticket_id)).filter(Ticket.deleted_at.is_(None)).group_by(Ticket.status).all()}
@@ -83,10 +93,7 @@ async def get_stats_overview(db: Session = Depends(get_db)):
     from app.services.skill_loader import SKILLS_DIR_HOST
     disk_specific = len([d for d in (_P(SKILLS_DIR_HOST) / "specific").iterdir() if d.is_dir()]) if (_P(SKILLS_DIR_HOST) / "specific").is_dir() else 0
 
-    # ---- Agent 活跃度（本周对话轮次 = 两条审计 action 之和）----
-    agent_msgs_week = db.query(AuditLog).filter(AuditLog.created_at >= week_start,
-                                                AuditLog.action.in_(["ticket_agent_message", "ticket_agent_message_stream"])).count()
-
+    # ---- 活跃用户（7 天）----
     active_users = db.query(User).filter(User.last_active >= week_start, User.is_active == True).count()  # noqa: E712
 
     # ---- 近 7 天趋势：1 次 group by（date_trunc 用 UTC 与 created_at 存储一致）----
@@ -123,6 +130,79 @@ async def get_stats_overview(db: Session = Depends(get_db)):
         [{"error_type": k, "count": v, "percentage": round(v / n_failed * 100, 1)} for k, v in bucket.items()],
         key=lambda x: -x["count"])[:5] if n_failed else []
 
+    # ---- LLM 用量账（11-23 全档）：总量/本周/本月 / 近7天走势 / 按软件 TOP5 / 最近明细 ----
+    # 口径：只统计未软删任务（账随任务行走，按任务 created_at 归周/月）；
+    # 思考与缓存都是既有列的加法。周=近7天滚动（与任务卡 week_start 同界）。
+    from app.models import TaskLlmStats
+    from sqlalchemy import case as _case_f
+
+    def _usage_agg(lo=None):
+        """一段范围的用量聚合；lo=None=全量。join 任务按 created_at 卡下界。"""
+        q = db.query(
+            _f.coalesce(_f.sum(TaskLlmStats.calls), 0),
+            _f.coalesce(_f.sum(TaskLlmStats.input_tokens), 0),
+            _f.coalesce(_f.sum(TaskLlmStats.output_tokens), 0),
+            _f.coalesce(_f.sum(TaskLlmStats.reasoning_tokens), 0),
+            _f.coalesce(_f.sum(TaskLlmStats.cache_read_tokens), 0),
+            _f.coalesce(_f.sum(TaskLlmStats.llm_seconds), 0.0),
+            _f.coalesce(_f.sum(_case_f((TaskLlmStats.usage_missing.is_(True), 1), else_=0)), 0),
+        ).join(CompileTask, CompileTask.id == TaskLlmStats.task_id).filter(
+            CompileTask.deleted_at.is_(None))
+        if lo is not None:
+            q = q.filter(CompileTask.created_at >= lo)
+        c, i, o, rea, cache, sec, miss = q.one()
+        return {"calls": int(c), "input": int(i), "output": int(o),
+                "reasoning": int(rea), "cache_read": int(cache),
+                "cache_pct": round(cache / i * 100, 1) if i else 0.0,
+                "seconds": round(float(sec)), "usage_missing_rows": int(miss)}
+
+    llm_usage = _usage_agg()            # 全部累计
+    llm_usage_week = _usage_agg(week_start)
+    llm_usage_month = _usage_agg(month_start)
+    _lt = _f.date_trunc("day", CompileTask.created_at).label("d")
+    llm_trend = [{
+        "date": r.d.strftime("%m-%d"), "calls": int(r.calls or 0), "input": int(r.i or 0),
+        "output": int(r.o or 0),
+    } for r in db.query(_lt, _f.sum(TaskLlmStats.calls).label("calls"),
+                        _f.sum(TaskLlmStats.input_tokens).label("i"),
+                        _f.sum(TaskLlmStats.output_tokens).label("o")
+                        ).join(CompileTask, CompileTask.id == TaskLlmStats.task_id
+                        ).filter(CompileTask.deleted_at.is_(None),
+                                 CompileTask.created_at >= (now - timedelta(days=7)).replace(hour=0, minute=0)
+                        ).group_by("d").order_by("d").all()]
+    llm_top_software = [{
+        "software": r.software_name or "-", "calls": int(r.calls or 0),
+        "input": int(r.i or 0), "output": int(r.o or 0), "seconds": round(float(r.sec or 0)),
+    } for r in db.query(CompileTask.software_name,
+                        _f.sum(TaskLlmStats.calls).label("calls"),
+                        _f.sum(TaskLlmStats.input_tokens).label("i"),
+                        _f.sum(TaskLlmStats.output_tokens).label("o"),
+                        _f.sum(TaskLlmStats.llm_seconds).label("sec")
+                        ).join(CompileTask, CompileTask.id == TaskLlmStats.task_id
+                        ).filter(CompileTask.deleted_at.is_(None)
+                        ).group_by(CompileTask.software_name
+                        ).order_by(_f.sum(TaskLlmStats.input_tokens).desc()).limit(5).all()]
+    llm_recent = [{
+        "task_id": r.task_id_str, "software": r.software_name, "status": r.status,
+        "calls": int(r.calls or 0), "input": int(r.i or 0), "output": int(r.o or 0),
+        "reasoning": int(r.rea or 0), "cache_read": int(r.c or 0),
+        "seconds": round(float(r.sec or 0)), "missing": bool(r.m),
+    } for r in db.query(CompileTask.task_id.label("task_id_str"), CompileTask.software_name,
+                        CompileTask.status,
+                        _f.sum(TaskLlmStats.calls).label("calls"),
+                        _f.sum(TaskLlmStats.input_tokens).label("i"),
+                        _f.sum(TaskLlmStats.output_tokens).label("o"),
+                        _f.sum(TaskLlmStats.reasoning_tokens).label("rea"),
+                        _f.sum(TaskLlmStats.cache_read_tokens).label("c"),
+                        _f.sum(TaskLlmStats.llm_seconds).label("sec"),
+                        # PG 无 max(boolean)：case 折 0/1 再 max（组内任一行未回账即标）
+                        _f.max(_case_f((TaskLlmStats.usage_missing.is_(True), 1), else_=0)).label("m")
+                        ).join(CompileTask, CompileTask.id == TaskLlmStats.task_id
+                        ).filter(CompileTask.deleted_at.is_(None)
+                        ).group_by(CompileTask.id, CompileTask.task_id,
+                                   CompileTask.software_name, CompileTask.status
+                        ).order_by(CompileTask.id.desc()).limit(10).all()]
+
     # 入库健康（Step 0）：persist 失败计数 + 上轮对账结果 + 滞留任务数 —— 消灭静默失败
     from app.services.task_writer import persist_error_stats
     from app.services.task_reconciler import last_result as _recon_last
@@ -141,15 +221,20 @@ async def get_stats_overview(db: Session = Depends(get_db)):
             "month_delta": round(m_rate - p_rate, 1),
             "month_has_data": m_total > 0,
             "total_tasks": total_tasks,
-            "week_new_tasks": week_new_tasks,
+            "task_windows": task_windows,
             "ticket_total": t_total,
             "ticket_solve_rate": _rate(t_total, t_solved),
             "ticket_avg_solve_hours": avg_solve_hours,
             "pending_experiences": pending_exp,
-            "agent_msgs_week": agent_msgs_week,
             "active_users": active_users,
         },
         "recent_success_rate_trend": trend,
+        "llm_usage": llm_usage,
+        "llm_usage_week": llm_usage_week,
+        "llm_usage_month": llm_usage_month,
+        "llm_trend": llm_trend,
+        "llm_top_software": llm_top_software,
+        "llm_recent": llm_recent,
         "top_errors": top_errors,
         "failed_samples": n_failed,  # TOP 归类样本数（<10 前端显示"样本积累中"）
         "ticket_pipeline": [{"status": s, "count": t_counts.get(s, 0)} for s in ("pending", "processing", "resolved", "closed")],

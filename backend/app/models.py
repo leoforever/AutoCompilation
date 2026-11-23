@@ -1,7 +1,7 @@
 """
 Database models for LoongArch Compile Platform
 """
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Index, BigInteger
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Index, BigInteger, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -183,6 +183,27 @@ class TargetSystem(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     compile_tasks = relationship("CompileTask", back_populates="system")
+
+
+class TaskLlmStats(Base):
+    """任务 LLM 用量账（11-23 token-stats-design.md）：一任务×一模型一行。
+
+    只存数字不存 prompt——无敏感数据入表。stage5 周期 flush + 终 flush 覆盖式
+    upsert（快照=实例全量累计，天然幂等无双计）。熔断切备用按 model 分桶两行并存。
+    """
+    __tablename__ = "task_llm_stats"
+
+    task_id = Column(Integer, ForeignKey("compile_tasks.id"), primary_key=True)
+    model = Column(String(40), primary_key=True)          # slot.id（qwen-flash/minimax-m31）
+    calls = Column(Integer, default=0)
+    input_tokens = Column(BigInteger, default=0)
+    output_tokens = Column(BigInteger, default=0)
+    reasoning_tokens = Column(BigInteger, default=0)      # 输出中的思考部分
+    cache_read_tokens = Column(BigInteger, default=0)     # 输入中的缓存命中（DEMO-4 实证字段）
+    llm_seconds = Column(Float, default=0.0)              # 含闸内等待的墙钟
+    llm_wait_s = Column(Float, default=0.0)               # 其中节流等待
+    usage_missing = Column(Boolean, default=False)        # 连续零 usage=网关不回账；防"没数"读成"没花钱"
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class CompileTask(Base):

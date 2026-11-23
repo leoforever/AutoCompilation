@@ -164,6 +164,20 @@ class CompileTaskRetry(BaseModel):
         return v
 
 
+class LlmStatRow(BaseModel):
+    """任务 LLM 用量一行（11-23 设计档 token-stats-design.md，一任务×一模型）"""
+    model_config = ConfigDict(from_attributes=True)
+    model: str
+    calls: int = 0
+    input: int = 0
+    output: int = 0
+    reasoning: int = 0        # 输出中的思考部分
+    cache_read: int = 0       # 输入中的缓存命中
+    seconds: float = 0.0
+    wait_s: float = 0.0
+    usage_missing: bool = False   # 连续零 usage=网关不回账，防"没数"读成"没花钱"
+
+
 class CompileTaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -192,6 +206,7 @@ class CompileTaskResponse(BaseModel):
     verified_ok: bool = False
     artifact_partial: bool = False
     phase_state: Optional[str]
+    llm_stats: List["LlmStatRow"] = []   # 11-23 任务 LLM 用量账（无账=空列表）
 
     @field_validator("depend_tree", mode="before")
     @classmethod
@@ -290,6 +305,7 @@ class ExperienceResponse(BaseModel):
     # 体量：单条经验 markdown 通常 < 10KB，可接受
     skill_content: Optional[str] = None
     rejection_reason: Optional[str] = None
+
 
 
 # ==================== Skill ====================

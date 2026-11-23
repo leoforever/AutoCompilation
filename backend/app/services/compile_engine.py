@@ -54,6 +54,7 @@ from app.config import artifacts_dir as _artifacts_dir
 # ==================== 状态定义 ====================
 class TaskState(TypedDict, total=False):
     task_id: str
+    task_db_id: int      # 11-23 用量账外键（compile_tasks.id）
     status: str
     software_name: str
     source_type: str
@@ -160,6 +161,7 @@ def _periodic_persist(state: TaskState):
 def stage1_init(task: CompileTask, state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
     state.update({
         "task_id": task.task_id,
+        "task_db_id": task.id,   # 11-23 用量账外键（stage5 make_llm 绑定 + flush 落库）
         "software_name": task.software_name,
         "source_type": task.source_type or "git",
         "git_url": task.git_url or "",
@@ -631,7 +633,38 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
     # LLM 统一入口（2026-11-03）：共享节流闸 + 429 阶梯退避 + 模型池兜底
     # （设计档 references/llm-multimodel-throttle-design-20261103.md）
     from app.services.llm_client import make_llm
-    llm = make_llm(temperature=0.1, call_site="compile.stage5")
+    llm = make_llm(temperature=0.1, call_site="compile.stage5",
+                   task_id=state.get("task_db_id"))   # 11-23 用量账：实例=任务
+
+    def _flush_llm_stats(_llm=llm, _state=state):
+        """任务 LLM 账落库（upsert task_llm_stats 按 model 分桶行）。
+        快照是实例累计全量 → 覆盖式写入，天然幂等无双计。
+        旁路性质：任何失败只 debug 一行——记账永不伤编译（设计档红线）。"""
+        try:
+            snap = _llm.task_stats_snapshot()
+            if not snap or _state.get("task_db_id") is None:
+                return
+            from app.models import SessionLocal as _SL, TaskLlmStats
+            s = _SL()
+            try:
+                for mid, row in snap.items():
+                    p = s.query(TaskLlmStats).filter(
+                        TaskLlmStats.task_id == _state["task_db_id"],
+                        TaskLlmStats.model == mid).first()
+                    if p is None:
+                        p = TaskLlmStats(task_id=_state["task_db_id"], model=mid)
+                        s.add(p)
+                    p.calls = row["calls"]; p.input_tokens = row["inp"]
+                    p.output_tokens = row["out"]; p.reasoning_tokens = row["rea"]
+                    p.cache_read_tokens = row["cache"]
+                    p.llm_seconds = round(row["sec"], 1)
+                    p.llm_wait_s = round(row["wait_s"], 1)
+                    p.usage_missing = row.get("zero_streak", 0) >= 5  # 连续零=网关不回账，黄标
+                s.commit()
+            finally:
+                s.close()
+        except Exception as _fe:
+            _log(_state, "debug", f"[阶段5] LLM 用量 flush 失败(旁路): {_fe}", on_log)
 
     # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
     _skills_paths = get_skills_paths()
@@ -871,6 +904,9 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
                          f"[阶段5] 💓 静默 {_gap:.0f}s 后恢复（长命令执行中，非卡死）",
                          on_log)
                 _last_chunk_ts = time.time()
+                # 11-23 用量账周期 flush：长任务中途崩溃不至于全丢（覆盖式幂等）
+                if chunk_count % 20 == 0:
+                    _flush_llm_stats()
                 # 上限检查
                 if chunk_count > _max_chunks:
                     _log(state, "error",
@@ -1016,6 +1052,8 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
         _log(state, "error", f"[阶段5] 异常: {state['last_error']}", on_log)
         import traceback
         traceback.print_exc()
+    finally:
+        _flush_llm_stats()   # 11-23 终 flush：成功/失败/提前 return 三路全收口
     return state
 
 

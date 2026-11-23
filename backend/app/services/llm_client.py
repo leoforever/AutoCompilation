@@ -269,10 +269,66 @@ class ThrottledChatModel(BaseChatModel):
     fallback_slots: list = []
     temperature: float = 0.1
     max_tokens: Optional[int] = None
+    task_id: Optional[int] = None      # 非 None=编译任务专属实例（账按 model 分桶）
+    acc: dict = {}                     # {model_id: {calls,in,out,rea,cache,sec,wait_s,zero_streak}}
+    _wait_base: dict = {}              # id(throttle)->上次 waited_total 基线（增量归属用）
 
     @property
     def _llm_type(self) -> str:
         return "throttled-chat-model"
+
+    # ── 用量账（11-23 设计档 token-stats-design.md）──────────────────
+    # 只记 task_id 实例（=compile.stage5）：qa/exp/ticket 不入账（用户拍板）。
+    # 池级聚合不在内存做——任务行都在库里，一句 SQL 的事（KISS）。
+    # 采集在四个入口成功路径；失败调用无 usage 可记（协议如此）。
+    def _record_usage(self, resp, seconds: float) -> None:
+        if self.task_id is None:
+            return
+        um = None
+        try:
+            if isinstance(resp, ChatResult) and resp.generations:
+                um = getattr(resp.generations[0].message, "usage_metadata", None)
+            elif isinstance(resp, (list, tuple)):        # consume=True 的 chunk 列表
+                for c in reversed(list(resp)):
+                    um = getattr(c, "usage_metadata", None)
+                    if um:
+                        break
+            else:
+                um = getattr(resp, "usage_metadata", None)
+        except Exception:
+            um = None
+        um = dict(um or {})
+        det = dict(um.get("output_token_details") or {})
+        ind = dict(um.get("input_token_details") or {})
+        row = dict(calls=1,
+                   inp=int(um.get("input_tokens", 0) or 0),
+                   out=int(um.get("output_tokens", 0) or 0),
+                   rea=int(det.get("reasoning", 0) or 0),
+                   cache=int(ind.get("cache_read", 0) or 0))
+        mid = getattr(self.slot, "id", "?")
+        # 节流等待：闸内 waited_total 是全局累计，任务只取"自上次记账以来的增量"
+        wait_delta = 0.0
+        try:
+            tw = float(self.slot.throttle.stats["waited_total"])
+            key = id(self.slot.throttle)
+            wait_delta = max(0.0, tw - self._wait_base.get(key, tw))
+            self._wait_base[key] = tw
+        except Exception:
+            pass
+        with _ACC_LOCK:
+            t = self.acc.setdefault(mid, dict(calls=0, inp=0, out=0, rea=0, cache=0,
+                                              sec=0.0, wait_s=0.0, zero_streak=0))
+            for k in ("calls", "inp", "out", "rea", "cache"):
+                t[k] += row[k]
+            t["sec"] += seconds
+            t["wait_s"] += max(0.0, wait_delta)
+            # 连续零 usage 计数（黄标判据：网关不回账时防"没数"被读成"没花钱"）
+            t["zero_streak"] = t["zero_streak"] + 1 if (row["inp"] == 0 and row["out"] == 0) else 0
+
+    def task_stats_snapshot(self) -> dict:
+        """引擎 flush 用：{model_id: row副本}（wait 基线已消费式更新，可重复取）"""
+        with _ACC_LOCK:
+            return {k: dict(v) for k, v in self.acc.items()}
 
     # ── 核心：过闸 + 退避 + 兜底 ──
     def _decide_after_429(self, e: Exception, slot: ModelSlot, st: dict):
@@ -313,6 +369,7 @@ class ThrottledChatModel(BaseChatModel):
         再返回（流式 429 藏在 generator 迭代里，建连阶段拦不住，11-03 T2 实测）。
         平台无 token 级 UI（log 按 node 边界整段渲染），消费完整样返回。"""
         st = {"waited": 0.0, "attempts": 0}
+        _t0 = time.monotonic()   # 用量账计时起点（含闸内等待，wait_s 另有单列）
         while True:
             slot.throttle.acquire()
             slot.stats["calls"] += 1
@@ -322,6 +379,7 @@ class ThrottledChatModel(BaseChatModel):
                     out = list(out)
                 slot.record_success()
                 slot.throttle.release()   # 成功也要释放：槽只在"在飞"期间占用
+                self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
                 if consume:
                     return iter(out)
                 return out
@@ -353,14 +411,18 @@ class ThrottledChatModel(BaseChatModel):
         """异步路径的过闸+退避（reserve 纯计算 + asyncio.sleep，绝不阻塞事件循环）。
         429 决策复用 _decide_after_429（与同步/流式同一状态机，语义不漂移）。"""
         st = {"waited": 0.0, "attempts": 0}
+        _t0 = time.monotonic()   # 用量账计时起点（异步路 caller 现无，账备而路通）
         while True:
-            slot.throttle.reserve()          # 预约放行时刻（纯计算，不阻塞）
+            wait = slot.throttle.reserve()          # 预约放行时刻（纯计算，不阻塞）
+            if wait > 0:
+                await asyncio.sleep(wait)           # A1 修复：预约了就得等，否则最小间隔形同虚设
             slot.stats["calls"] += 1
             try:
                 out = await fn()
                 if consume:
                     out = [c async for c in out]
                 slot.record_success()
+                self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
                 if consume:
                     return _aiter_list(out)
                 return out
@@ -494,6 +556,7 @@ def _run_coroutine(coro):
 # ==================== 模型池加载 ====================
 _slots_lock = threading.Lock()
 _slots_cache: Optional[list] = None
+_ACC_LOCK = threading.Lock()   # 11-23 用量账 acc 跨线程保护（并行任务/流式消费）
 
 
 def load_model_slots() -> list:
@@ -559,8 +622,11 @@ def _log(msg: str) -> None:
 # ==================== 工厂（唯一入口）====================
 def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
              call_site: str = "", prefer: Optional[str] = None,
-             model_id: Optional[str] = None) -> ThrottledChatModel:
-    """所有 LLM 调用的唯一入口：过闸 + 退避 + 池内兜底。"""
+             model_id: Optional[str] = None, task_id: Optional[int] = None) -> ThrottledChatModel:
+    """所有 LLM 调用的唯一入口：过闸 + 退避 + 池内兜底。
+
+    task_id（11-23 用量账）：仅 compile.stage5 传——实例=任务（每任务新建），
+    该实例全部成功调用的 usage 计入 per-task 账；其余调用点不传=只进池级。"""
     slots = load_model_slots()
     if not slots:
         raise RuntimeError("AI_API_KEY 未配置（请检查后端环境变量）")
@@ -586,6 +652,7 @@ def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
         throttle_backoff=backoff_schedule(),
         fallback_slots=slots,
         temperature=temperature, max_tokens=max_tokens,
+        task_id=task_id,
     )
 
 

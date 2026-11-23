@@ -103,6 +103,7 @@
 
     <!-- 日志弹窗 -->
     <el-dialog v-model="logDialogVisible" :title="`📟 编译日志 #${currentTask?.task_id}`" width="700px">
+      <div v-if="llmStatsLine" class="llm-stats-line">🧮 LLM 用量 —— {{ llmStatsLine }}</div>
       <div class="term">
         <div v-for="(line, idx) in currentLog" :key="idx" :class="['log-line', line.type]">{{ line.text }}</div>
       </div>
@@ -234,6 +235,7 @@ const filterStatus = ref('')
 const searchText = ref('')
 const logDialogVisible = ref(false)
 const currentTask = ref<any>(null)
+const llmStatsLine = ref('')   // 11-23 日志弹窗头部 LLM 用量摘要
 const currentLog = ref<any[]>([])
 
 const pagination = ref({ page: 1, pageSize: 20, total: 0 })
@@ -326,6 +328,16 @@ function formatSize(bytes: number): string {
 
 async function viewLog(task: any) {
   currentTask.value = task
+  // 11-23 用量账：日志弹窗头部一行 LLM 消耗摘要（详情接口顺带取，失败静默）
+  llmStatsLine.value = ''
+  api.get(`/compile/tasks/${task.task_id}`).then((d: any) => {
+    const arr = (d?.data?.llm_stats || d?.llm_stats || []) as any[]
+    if (!arr.length) return
+    const f = (n: number) => n >= 10000 ? (n / 1000).toFixed(1) + 'K' : String(n)
+    llmStatsLine.value = arr.map(s =>
+      `${s.model}: ${s.calls} 次 · 输入 ${f(s.input)}(缓存 ${f(s.cache_read)}) · 输出 ${f(s.output)}(思考 ${f(s.reasoning)}) · LLM ${Math.round(s.seconds)}s`
+      + (s.usage_missing ? ' ⚠网关未回账' : '')).join('；')
+  }).catch(() => {})
   const res: any = await api.get(`/compile/tasks/${task.task_id}/log`)
   // axios 拦截器已 unwrap response.data，res 直接是 {task_id, log}
   const log = res.log || res.data?.log || ''
@@ -749,6 +761,7 @@ onBeforeUnmount(() => { stopDraftWatch(); hidePendingMsg() })   // 卸载停流+
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px }
 .muted { color: var(--text3); font-size: 12px }
 .artifact-tip { line-height: 1.7; font-size: 12.5px; max-width: 340px }
+.llm-stats-line { margin: 0 0 10px; padding: 8px 12px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; font-size: 12.5px; color: #075985; line-height: 1.6 }
 .term { background: #0f172a; color: #cbd5e1; border-radius: 8px; padding: 14px; font-family: monospace; font-size: 12.5px; max-height: 400px; overflow: auto; line-height: 1.7 }
 .log-line.ok { color: #4ade80 }
 .log-line.err { color: #f87171 }
