@@ -6,6 +6,9 @@ description: |
   以下场景读这条：rpmbuild 报 Macro _install_langs has empty body、debug_package 阶段
   gdb command not found、rpm --root 验证报 libc 依赖缺失、spec 的 %changelog 日期被拒、
   CFLAGS 传不进 rpmbuild、产物 release 尾巴(.lns23)与目标系统名不一致；
+  rpmbuild 报 "Name field must be present in package"（spec 含中文注释+POSIX locale）、
+  --short-circuit 后 %files 报 Could not open filelist、brp-compress 致 man 页 File not
+  found、openEuler 找不到 audit-libs-devel；
   打包带 systemd 服务的守护进程（Type=notify、ExecStartPre 预初始化）、服务启动报
   "Failed to open the bootstrap file"、MY-010455、datadir 半成品死循环、状态目录
   属主问题——一律先看本条"服务包目录属主"节。
@@ -30,6 +33,14 @@ allowed-tools: [execute, read_file]
   spec 不要画蛇添足传 `CFLAGS=`，保持上游编译口径（引入 %optflags 反而可能带来
   -flto 与新架构 flag 交互的未知变量），记入已知限制即可。
 - 源码 tarball 名对齐 `Name-Version.tar.gz` 惯例，Source0 指它，rpmbuild -bb 走标准流。
+- **spec 全文 ASCII-only**（11-24 MySQL 案）：容器 locale 常为 `LC_CTYPE="POSIX"`，
+  rpm 4.18 解析器遇中文注释会中断 header 解析——报错极具误导性：
+  `Name field must be present in package`（像整个文件没被读）。自检法：
+  `grep -vP '[^\x00-\x7F]' spec > /tmp/t.spec` 后 `rpmspec -P` 能过即坐实；
+  处置=注释改英文并在文件头留 `NOTE: keep this file ASCII-only`。
+  同族：%changelog 正文别出现 `%` 开头的词（被当段/宏，报 `second %install`）。
+- man/info 页在 `%files` 必须带通配（`mysql.1*`）：brp-compress 在 %install 后
+  把它们就地压成 `.gz` 改名，硬写原名必报 `File not found`。
 
 ## 服务包目录属主（daemon + systemd 预初始化必读，MySQL 9.7.4 案 2026-11-23 容器实锤）
 凡打包对象是**降权运行的守护进程**（User=mysql 这类）且带首次启动自初始化
@@ -75,6 +86,18 @@ rpm -q --whatprovides 'libc.so.6(GLIBC_2.36)(64bit)'
 产物 rpm 的 release/dist 尾巴（如 `.lns23`）**跟随构建镜像**，不跟随任务标注的目标系统名。
 用 loongnix-build:23.2 镜像编 openEuler 目标任务，出包就是 `.lns23`——同 glibc 基线（都 2.38）
 时可正常安装使用，但验收/上架记录里要如实写构建镜像，别按目标名猜尾巴。
+
+## 快速迭代打包：别信 --short-circuit（11-24 MySQL 案实测）
+`rpmbuild --short-circuit -bb` 意图只跑 %files/打包，实测**连 %install 一起跳过**
+（与 --help 里 "skip straight to specified stage (only for c,i)" 的预期不符），
+症状=`%files` 报 `Could not open %files file .../filelist-*.txt` 且日志无
+`Executing(%install)`。正解=派生 smoke spec：脚本把正式 spec 的 %build 段替换成
+`ln -sfn <已建树> release`，正常 -bb——%install/%files/打包全部真实执行，只省编译。
+正式交付仍用原 spec 完整跑一遍（smoke 通过≠交付路径验证过）。
+
+## 发行版包名差异速查
+- openEuler 24.03 系：`audit-libs-devel` 不存在，包名 **`audit-devel`**
+  （Loongnix Server 23.x 用 audit-libs-devel）；dnf 报 No match 先互为镜像找一遍。
 
 ## 别做的事
 - 不为消 debuginfo 报错去装 gdb（改 spec 一行 vs 动镜像）；

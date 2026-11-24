@@ -3,7 +3,7 @@ name: mysql-974-loongnix-server-232-loongarch64-build
 type: layer2-build
 allowed-tools: [execute, read_file]
 description: |
-  MySQL 9.7.4 源码构建与 RPM 打包流程：龙芯 Loongnix Server 23.2、loongarch64。编译 mysql-9.7.4、cmake configure、ninja install、rpmbuild、缺 rpcgen/systemd-devel/libudev 时读这条。
+  MySQL 9.7.4 源码构建与 RPM 打包流程：龙芯 Loongnix Server 23.2 / openEuler SP2、loongarch64。编译 mysql-9.7.4、cmake configure、ninja install、rpmbuild、缺 rpcgen/systemd-devel/libudev 时读这条；mysqld 启动报 MY-010455/bootstrap、验证断言 user.ibd 失败、semisync INSTALL PLUGIN 报 ERROR 1127、%files 两万五文件清单、--short-circuit 跳 %install、audit-libs-devel 找不到时读"11-24 二次实测增量"节。
 ---
 
 > 通用件指针：configure/config.guess 类先查 `generic/autotools-cross-loongarch`；cmake 见 `generic/cmake-cpp`。本篇只留 mysql 布局与 rpmbuild 参数。
@@ -407,3 +407,42 @@ RESULT pass=25 fail=0
 ```text
 RESULT pass=25 fail=0
 ```
+
+## 11-24 二次实测增量（openEuler SP2 容器，success，pass=54）
+
+### 10. datadir 断言：user.ibd 不存在是正常，别断言错
+MySQL 8 起数据字典表统一进表空间 `$DD/mysql.ibd`（实测 27MB）；`mysql/`
+子目录只剩 general_log.CSM/CSV、slow_log.* 等 CSV 引擎残留。验证脚本断言
+`$DD/mysql/user.ibd` 必假失败，改断言 `mysql.ibd`。
+
+### 11. 9.7 旧式 INSTALL PLUGIN 对 semisync_* 失效（上游行为，非移植缺陷）
+`INSTALL PLUGIN semisync_source SONAME 'semisync_source.so'` →
+`ERROR 1127 Can't find symbol 'semisync_source'`。根因：objdump -T 实测该
+.so 只导出新式 `_mysql_plugin_declarations_[]`（plugin.h:157），无旧符号。
+证明"动态装载能力"改用 `INSTALL COMPONENT 'file://component_log_sink_json'`
+（实测 mysql.component 计数+1）；RUN.md 功能分级里如实标注 semisync 不可装。
+
+### 12. %files 两万五文件的正解：Source1 清单生成器（本包交付物的一部分）
+上游 spec %files 3200 行硬列不可照抄（File not found 与 unpackaged files
+双向出错）。做法：`mysql-filelist-gen.py` 作 spec Source1，%install 末尾对
+%{buildroot} 排除法分类出 7 份清单，spec 用 `%files <pkg> -f` 引用；内置
+自检"清单合计 == buildroot 文件数 - 正文声明数"（实测 25497+1=25498）。
+复用 spec 必须连脚本一起拿（Source1 已声明）。清单通配/转义细则见
+`generic/rpm-packaging`（brp-compress 段）；文件名含 `#` 在 -f 清单无需转义（本篇实测）。
+
+### 13. 服务包状态目录属主（首战已验证生效）
+%post server 三行幂等掰正（见 generic/rpm-packaging 同名节）：
+`install -d -m 0750 -o mysql -g mysql %{_localstatedir}/lib/mysql-files`
+（keyring、/run/mysqld 同款）。目标机残留 mariadb 时该目录是 root:750，
+不掰则 mysqld_pre_systemd 的 init-file 读不到 → MY-010455 → datadir
+半成品 → [ -d datadir/mysql ] 让每次启动跳过重来=死循环。11-23 容器实锤，
+11-24 本包按此处理后验证 systemd 全生命周期 PASS。
+
+### 其他实测口径（省调试时间）
+- openEuler 24.03 SP2 上开工先把 systemd-devel/rpcgen/audit-devel 装齐，
+  configure **一次过**（攻略"连败三次"教训成立但不触发）。
+- `%{?dist}` 在 openEuler 容器展开为空 → rpm 尾巴只有 `.loongarch64`，别等 .lns23。
+- 128 核机 `ninja -j 64` 全量 14.5 分钟（-j32 基线是 32 核机）。
+- 磁盘水位：编译树 23G+install 3.4G+rpmbuild 树，433G 盘峰值 88%——
+  smoke 后删 b1/image/rpmbuild 三棵大树再跑正式 -bb（它自己重建）。
+  快速迭代打包的 smoke spec 手法见 `generic/rpm-packaging`。
