@@ -30,6 +30,8 @@ ADMIN_INIT_PASSWORD='***' bash setup.sh install
 
 # 3. 编辑 backend/.env.compile 填 AI key（install 过程中会提示）
 #    AI_API_KEY / AI_BASE_URL / AI_MODEL —— 模板见 .env.compile.example
+#    模型池/上下文窗口等运维参数在 backend/config.yaml（llm.models 每槽
+#    max_input_tokens=窗口声明，deepagents 会话压缩线=0.85×它，不配走保守 170K）
 
 # 4. 访问
 #    前端 https://<host>:8443/    （8443 可用 backend/.env.compile 的
