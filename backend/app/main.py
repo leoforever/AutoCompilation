@@ -59,6 +59,8 @@ async def lifespan(app: FastAPI):
     from concurrent.futures import ThreadPoolExecutor
     from app.services import task_queue
     from app.services.compile_engine import run_task
+    from app.services import agent_compat
+    agent_compat.install()   # 11-23 网关溢出文案识别补丁（须在首个 agent 前）
 
     import uuid as _uuid
     import os as _os

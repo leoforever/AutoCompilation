@@ -269,6 +269,9 @@ class ThrottledChatModel(BaseChatModel):
     fallback_slots: list = []
     temperature: float = 0.1
     max_tokens: Optional[int] = None
+    profile: Any = None              # 11-23 断链修复：抄自 base_model.profile——
+                                     # deepagents 工厂/预算闸读的是包装层，不转发则
+                                     # max_input_tokens 配置对 agent 会话永远不可见
     task_id: Optional[int] = None      # 非 None=编译任务专属实例（账按 model 分桶）
     acc: dict = {}                     # {model_id: {calls,in,out,rea,cache,sec,wait_s,zero_streak}}
     _wait_base: dict = {}              # id(throttle)->上次 waited_total 基线（增量归属用）
@@ -465,8 +468,9 @@ class ThrottledChatModel(BaseChatModel):
         return None
 
     def _switch_slot(self, nxt: ModelSlot) -> None:
-        """切换到备用模型（重建底层客户端）。"""
+        """切换到备用模型（重建底层客户端；profile 声明随新家窗口重抄，11-23）。"""
         self.base_model = build_base_llm(nxt, temperature=self.temperature, max_tokens=self.max_tokens)
+        self.profile = getattr(self.base_model, "profile", None)
         self.slot = nxt
 
     # ── 四个入口覆写（langchain 标准接口）──
@@ -652,15 +656,18 @@ def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
         throttle_backoff=backoff_schedule(),
         fallback_slots=slots,
         temperature=temperature, max_tokens=max_tokens,
+        profile=getattr(base, "profile", None),
         task_id=task_id,
     )
 
 
 def llm_stats() -> dict:
     """池状态快照（admin /api/admin/llm/stats 用）。"""
+    from app.services import agent_compat
     slots = load_model_slots()
     return {
         "slots": [s.snapshot() for s in slots],
+        "agent_obs": agent_compat.stats(),   # 11-23 自愈事件（溢出/压缩 offload）
         "global": {
             "total_calls": sum(s.stats["calls"] for s in slots),
             "total_throttled": sum(s.stats["throttled_429"] for s in slots),
