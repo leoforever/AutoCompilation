@@ -8,7 +8,8 @@ description: |
   CFLAGS 传不进 rpmbuild、产物 release 尾巴(.lns23)与目标系统名不一致；
   rpmbuild 报 "Name field must be present in package"（spec 含中文注释+POSIX locale）、
   --short-circuit 后 %files 报 Could not open filelist、brp-compress 致 man 页 File not
-  found、openEuler 找不到 audit-libs-devel；
+  found、openEuler 找不到 audit-libs-devel、%prep 解包成功但 %install 报 chmod
+  cannot access（buildroot 被自动清空）；
   打包带 systemd 服务的守护进程（Type=notify、ExecStartPre 预初始化）、服务启动报
   "Failed to open the bootstrap file"、MY-010455、datadir 半成品死循环、状态目录
   属主问题——一律先看本条"服务包目录属主"节。
@@ -33,6 +34,12 @@ allowed-tools: [execute, read_file]
   spec 不要画蛇添足传 `CFLAGS=`，保持上游编译口径（引入 %optflags 反而可能带来
   -flto 与新架构 flag 交互的未知变量），记入已知限制即可。
 - 源码 tarball 名对齐 `Name-Version.tar.gz` 惯例，Source0 指它，rpmbuild -bb 走标准流。
+- **解包/生成 buildroot 内容只准放 %install，禁放 %prep**（11-24 nacos 案实测）：
+  rpm 4.18 在 `Executing(%install)` 脚本开头自动 `rm -rf %{buildroot}` 重建——
+  %prep 里辛苦解进 buildroot 的东西会被整个清空，症状是 %install 报
+  `chmod: cannot access '.../*.sh'` 而 %prep 日志明明解压成功。正解：%prep 只留
+  空 %setup 或干脆不解，`tar xzf %{SOURCE0} -C %{buildroot}%{destdir} --strip-components=1`
+  放 %install 开头自己执行。
 - **spec 全文 ASCII-only**（11-24 MySQL 案）：容器 locale 常为 `LC_CTYPE="POSIX"`，
   rpm 4.18 解析器遇中文注释会中断 header 解析——报错极具误导性：
   `Name field must be present in package`（像整个文件没被读）。自检法：

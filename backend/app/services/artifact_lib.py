@@ -45,7 +45,10 @@ _KIND_BY_EXT = {".whl": "whl", ".tgz": "tgz", ".tar.gz": "tgz", ".tar.xz": "tool
                 # deb 独立 kind（11-17 交付矩阵）：此前 ".deb"→rpm 系误归，货架/视图
                 # 无法按格式过滤。⚠ 必须与 config.yaml promote_kinds 的 deb 同笔生效
                 # （只改一边=deb 晋升被白名单拒），201/.209 同 commit 落地
-                ".deb": "deb", ".so": "so", ".a": "a", ".node": "node_binding"}
+                # jar=Java 归档 kind（11-24 nacos 案：loongarch 专版 rocksdbjni jar
+                # 被 kind=other 拒晋升；同 deb 教训，promote_kinds 已同笔加 jar）
+                ".deb": "deb", ".so": "so", ".a": "a", ".node": "node_binding",
+                ".jar": "jar"}   # exe 类不列：Linux ELF .exe 由下方 magic 兜底归 binary（保守正确）
 
 
 def kind_of(filename: str, file_path: "str | None" = None) -> str:

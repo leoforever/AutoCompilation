@@ -5,7 +5,9 @@ allowed-tools: [execute, read_file]
 description: |
   protoc 在龙芯 loongarch64 上的获取方式：无官方预编译件时的源码自建流程。以下场景读这条：
   protobuf 编译报缺 protoc、Maven 坐标 linux-loongarch64 不存在、apt 的 protobuf-compiler
-  版本太旧不匹配 protobuf-java、需要特定版本 protoc、grpc/.proto 工程构建。
+  版本太旧不匹配 protobuf-java、需要特定版本 protoc、grpc/.proto 工程构建、
+  cmake -S . 报 does not contain CMakeLists.txt（老版 protobuf 入口在 cmake/ 子目录）、
+  protoc-gen-grpc-java 无本架构 exe（抽 java_plugin.cpp 直链自建 .a，无需 bazel）。
 ---
 
 # loongarch64 上的 protoc 获取（实测可用）
@@ -37,9 +39,26 @@ description: |
    cmake --build pbuild --target protoc -j 24
    pbuild/protoc --version   # libprotoc 31.0
    ```
+   ⚠ 老版本（≤3.19.x，含 3.16.1）的 CMake 入口在 **`cmake/` 子目录**且是
+   out-of-source 老式写法：`cmake -S .` 在根目录报
+   `does not appear to contain CMakeLists.txt`——改
+   `cmake -S cmake -B build ...`（nacos 案 3.16.1 实测）；新版（≥22.x）才在根目录。
    两个实测细节：`-O1` 是刻意的——loongarch gcc14 对 protobuf 重模板文件 -O2/-O3
    编译极慢且吃内存，-O1 全量约 8 分钟，别按习惯抠编译优化；
    依赖走系统（zlib/abseil 由 apt 满足，见 debian-packaging 的装依赖姿势）。
+3b. **protoc-gen-grpc-java 插件同样无 loongarch 件（nacos 案实测，路子极短）**：
+   Maven `io.grpc:protoc-gen-grpc-java:<ver>:exe:<classifier>` 目录只有
+   x86/aarch64/ppc64le 等；**不需要 bazel**——取 grpc-java 同版本源码 tar 里
+   `compiler/src/java_plugin/cpp/{java_plugin,java_generator}.cpp` 三个文件，
+   直接链自建的 libprotoc.a + libprotobuf.a：
+   ```bash
+   g++ -O1 -std=c++11 java_plugin.cpp java_generator.cpp \
+       <pb>/pbuild/libprotoc.a <pb>/pbuild/libprotobuf.a -lz -lpthread \
+       -o protoc-gen-grpc-java
+   ```
+   前提：protoc 那步用 `-DBUILD_SHARED_LIBS=OFF` 已产出两个 .a；插件必须与
+   项目 pin 的 grpc-java/protobuf 版本同源匹配。摆进本地 Maven 仓的坐标方法
+   见 `generic/java-native-jni`。
 4. 项目侧接线：把 protoc 路径以项目支持的"本地文件"方式传入（Ghidra 是
    `-Dghidra.protoc.path=…`；通用做法是改依赖声明为 files(...) 本地件，
    具体看各项目构建脚本的参数）。
