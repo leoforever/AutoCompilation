@@ -33,6 +33,22 @@ THROTTLE_MSG = "AI 服务限流（配额不足），非编译问题；请稍后�
 
 
 # ==================== 异常 ====================
+class LlmStreamIdleTimeout(RuntimeError):
+    """流空闲超时（11-24）：idle 秒内没有新的**已解析 chunk**到达。
+
+    专治"网关 keep-alive 假滴字"挂相——底层 socket 每几十秒有字节（注释行/
+    padding），读超时永不触发；但这些字节在 SDK 解析层就被丢掉，永远到不了
+    业务层。所以业务计时器只被合法 chunk 重置：格式无关，任何网关通吃，
+    无需识别 padding 长什么样。按瞬时错误处理 → 切槽重发（is_transient 名单）。"""
+
+    def __init__(self, message: str, *, idle_seconds: float = 0.0,
+                 call_site: str = "", slot_id: str = ""):
+        super().__init__(message)
+        self.idle_seconds = idle_seconds
+        self.call_site = call_site
+        self.slot_id = slot_id
+
+
 class LlmThrottledError(RuntimeError):
     """LLM 限流（429/quota）退避耗尽仍未成功。与业务错误严格区分。"""
 
@@ -83,6 +99,8 @@ def is_transient_provider_error(e: Exception) -> bool:
                             "ReadTimeout", "ConnectError", "InternalServerError",
                             "ServiceUnavailableError", "BadGateway"):
         return True
+    if isinstance(e, LlmStreamIdleTimeout):
+        return True   # 11-24：假滴字挂起等同供应商抖——换槽重发整请求（consume 全量缓冲，无半截风险）
     return isinstance(e, (ConnectionError, TimeoutError))
 
 
@@ -226,6 +244,10 @@ def build_base_llm(slot: ModelSlot, *, temperature: float, max_tokens: Optional[
             # 用 max_tokens 会让 content 空（2026-10-21 实测：600 空 / 2048 正常）
             max_completion_tokens=max_tokens,
             max_retries=0,          # 不变式③：SDK 自带重试关掉，我们独管
+            # W3(11-24)：显式读超时——网关"完全不滴字"挂相（真断流/半开连接）
+            # 靠它抛 APITimeoutError 走瞬时错误切备胎；keep-alive 假滴字型
+            # 挂起它管不住，归看门狗 stall 检测兜（勿在此加大数值）
+            timeout=float(get_cfg("llm.request_timeout", 900)),
         )
         # 11-23 窗口声明（每 slot 独立配置）：配了 max_input_tokens 才传 profile，
         # deepagents 摘要阈值即从保守 170K 硬阈值切到 fraction(0.85×窗口)；
@@ -241,8 +263,10 @@ def build_base_llm(slot: ModelSlot, *, temperature: float, max_tokens: Optional[
             model=slot.model, api_key=slot.api_key,
             base_url=slot.base_url or None, temperature=temperature,
             max_tokens=max_tokens, max_retries=0,
+            timeout=float(get_cfg("llm.request_timeout", 900)),   # 同 W3 口径
         )
     if provider in ("google_genai", "gemini", "google"):
+        # 现池无调用方；timeout 透传参数名待真实接入时实测再补（11-24 注）
         from langchain_google_genai import ChatGoogleGenerativeAI
         return ChatGoogleGenerativeAI(
             model=slot.model, google_api_key=slot.api_key, temperature=temperature,
@@ -379,7 +403,12 @@ class ThrottledChatModel(BaseChatModel):
             try:
                 out = fn()
                 if consume:
-                    out = list(out)
+                    # 11-24：假滴字解药——只有已解析 chunk 重置业务计时，
+                    # 超 llm.stream_idle_seconds 无块 → LlmStreamIdleTimeout
+                    # → 下方瞬时分流自动切槽重发（consume 全量缓冲，重发无半截风险）
+                    out = consume_stream_guarded(
+                        out, float(get_cfg("llm.stream_idle_seconds", 600)),
+                        call_site=self.call_site, slot_id=slot.id)
                 slot.record_success()
                 slot.throttle.release()   # 成功也要释放：槽只在"在飞"期间占用
                 self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
@@ -423,7 +452,9 @@ class ThrottledChatModel(BaseChatModel):
             try:
                 out = await fn()
                 if consume:
-                    out = [c async for c in out]
+                    out = await consume_stream_guarded_async(
+                        out, float(get_cfg("llm.stream_idle_seconds", 600)),
+                        call_site=self.call_site, slot_id=slot.id)
                 slot.record_success()
                 self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
                 if consume:
@@ -624,6 +655,86 @@ def _log(msg: str) -> None:
 
 
 # ==================== 工厂（唯一入口）====================
+def consume_stream_guarded(it, idle_seconds: float, *, call_site: str = "", slot_id: str = "") -> list:
+    """把流迭代器消费成 list，带业务空闲超时（11-24 假滴字挂起解药）。
+
+    feeder 线程拉底层 next() → Queue(maxsize=1)；主线程 get(timeout=idle)。
+    只有能成为 chunk 的字节才重置计时；idle 秒无 chunk → LlmStreamIdleTimeout。
+    finally 置 stop + close 底层生成器，feeder 不死挂（daemon + put 带超时轮询）。
+    底层异常原样上抛（保留 openai 异常类型给 429/瞬时分流，语义不降级）。
+    """
+    import queue as _q
+    box = _q.Queue(maxsize=1)
+    stop = threading.Event()
+
+    def _feeder():
+        try:
+            for c in it:
+                while not stop.is_set():
+                    try:
+                        box.put(("c", c), timeout=0.5)
+                        break
+                    except _q.Full:
+                        pass
+                if stop.is_set():
+                    return
+            if not stop.is_set():
+                box.put(("d", None), timeout=2)
+        except BaseException as e:  # noqa: BLE001  # 底层异常交主线程原样重抛
+            if not stop.is_set():
+                try:
+                    box.put(("e", e), timeout=2)
+                except Exception:
+                    pass
+
+    th = threading.Thread(target=_feeder, daemon=True)
+    th.start()
+    out: list = []
+    try:
+        while True:
+            try:
+                kind, payload = box.get(timeout=idle_seconds)
+            except _q.Empty:
+                raise LlmStreamIdleTimeout(
+                    f"LLM 流空闲超时：{idle_seconds:.0f}s 无新 chunk（疑似网关假滴字挂起）"
+                    f" site={call_site} slot={slot_id}",
+                    idle_seconds=idle_seconds, call_site=call_site, slot_id=slot_id)
+            if kind == "d":
+                return out
+            if kind == "e":
+                raise payload
+            out.append(payload)
+    finally:
+        stop.set()
+        try:
+            it.close()   # 正常/异常收尾关流；注意：若底层正卡在 next()（假滴字本尊），
+        except Exception:  # close 抛 ValueError 被吞——feeder 随 daemon 存活到进程级回收，
+            pass         # 单次超时漏一条 socket，重试上限封顶（11-24 已知边界，如实记）
+
+
+async def consume_stream_guarded_async(ait, idle_seconds: float, *,
+                                       call_site: str = "", slot_id: str = "") -> list:
+    """异步同款：wait_for 包 __anext__（超时自动 cancel 内部挂起点）。"""
+    out: list = []
+    try:
+        while True:
+            try:
+                c = await asyncio.wait_for(ait.__anext__(), timeout=idle_seconds)
+            except asyncio.TimeoutError:
+                raise LlmStreamIdleTimeout(
+                    f"LLM 流空闲超时(异步)：{idle_seconds:.0f}s 无新 chunk"
+                    f" site={call_site} slot={slot_id}",
+                    idle_seconds=idle_seconds, call_site=call_site, slot_id=slot_id)
+            except StopAsyncIteration:
+                return out
+            out.append(c)
+    finally:
+        try:
+            await ait.aclose()
+        except Exception:
+            pass
+
+
 def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
              call_site: str = "", prefer: Optional[str] = None,
              model_id: Optional[str] = None, task_id: Optional[int] = None) -> ThrottledChatModel:

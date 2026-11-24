@@ -55,6 +55,8 @@ from app.config import artifacts_dir as _artifacts_dir
 class TaskState(TypedDict, total=False):
     task_id: str
     task_db_id: int      # 11-23 用量账外键（compile_tasks.id）
+    _chunk_count_live: int   # 11-24 W2：stage5 每 chunk 刷新，看门狗 stall 基线
+    _chunk_seen_ts: float    # 11-24 W2：最后一个 chunk 到达时刻
     status: str
     software_name: str
     source_type: str
@@ -117,6 +119,47 @@ def _log(state: TaskState, level: str, msg: str, on_log: Optional[LogCallback] =
             on_log(level, msg)
         except Exception:
             pass
+
+
+def stall_watch_tick(chunk_live, chunk_seen_ts, prev_chunk, last_warn_ts, now,
+                    stall_warn=600.0, warn_every=1800.0):
+    """W2(11-24)：看门狗 chunk 停滞早警的纯判定（可单测）。
+    输入为采样值，返回 (是否应报警, 更新后的 prev_chunk, 更新后的 last_warn_ts)。
+    只观测不判死：合法长静默与真挂起无法凭 stall 秒区分，报警仅供排障。"""
+    if chunk_live is None:
+        return False, prev_chunk, last_warn_ts
+    if chunk_live == prev_chunk and (now - chunk_seen_ts) > stall_warn \
+       and (now - last_warn_ts) > warn_every:
+        return True, prev_chunk, now
+    return False, chunk_live, last_warn_ts
+
+
+def watchdog_force_terminal(state: dict, reason: str, log_fn=None) -> bool:
+    """W1(11-24)：看门狗自落终态，不再赌"下一个 chunk 会来救场"。
+    教训 T-…63450F：卡点在 LLM HTTP 层（keep-alive 假滴字永不断流）时，
+    docker stop 惊不醒挂在网关上的线程——chunk 永不到达，
+    _external_terminal 无人读，任务成 compiling 僵尸直到人工。
+    本函数直接写 failed（仅当仍是 submitted/compiling，幂等）+ 通知；
+    agent 线程日后醒来看到旗自然退出。返回是否真的改了库。"""
+    try:
+        from app.models import SessionLocal
+        s = SessionLocal()
+        try:
+            t = s.query(CompileTask).filter(
+                CompileTask.task_id == state.get("task_id")).first()
+            if t and t.status in ("submitted", "compiling"):
+                t.status = TaskStatus.FAILED.value
+                t.error_message = reason[:2000]
+                from app.services.notify import notify_task_terminal
+                notify_task_terminal(s, t, "failed", reason)
+                s.commit()
+                return True
+            return False
+        finally:
+            s.close()
+    except Exception as we:
+        _log(state, "warn", f"[阶段5] 看门狗补写终态失败: {we}", log_fn)
+        return False
 
 
 def _periodic_persist(state: TaskState):
@@ -871,10 +914,24 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
         # _external_terminal 检查强退；顺带消灭失控进程烧 CPU 的资源泄漏。
         # 宽限 120s：让容器内 timeout（execute 硬超时 A 层）先动作，本线程只兜底。
         _guard_stop = threading.Event()
-        def _wall_guard(_st=state, _start=start_ts, _limit=_max_seconds + 120, _stop=_guard_stop):
+        def _wall_guard(_st=state, _start=start_ts, _limit=_max_seconds + 120, _stop=_guard_stop,
+                  _stall_warn=float(get_cfg("stage5.stall_warn_seconds", 600))):
+            _prev_chunk = None      # W2 stall 检测基线（chunk 流无推进秒数）
+            _last_warn_ts = 0.0
             while not _stop.wait(60):
                 if _st.get("_stage5_done"):  # 流正常收尾/各 return 前置位，看门狗随之退出
                     break
+                # W2(11-24) chunk 停滞早警：超阈值无推进→每 30min 至多提醒一次；
+                # 只观测不判死——合法长静默（大命令 300s+）与真挂起无法凭
+                # stall 秒数区分，判死权仍归墙钟与用户
+                _cur_cc = _st.get("_chunk_count_live")
+                _now = time.time()
+                _fire, _prev_chunk, _last_warn_ts = stall_watch_tick(
+                    _cur_cc, _st.get("_chunk_seen_ts", _start), _prev_chunk, _last_warn_ts,
+                    _now, _stall_warn)
+                if _fire:
+                    _log(_st, "warn", f"[阶段5] ⚠ chunk 已 {int(_now - _st.get('_chunk_seen_ts', _start))}s 无推进"
+                                      f"（当前 {_cur_cc}；合法长命令也可能如此，仅提示非判死）", on_log)
                 if time.time() - _start > _limit:
                     _st["_external_terminal"] = TaskStatus.FAILED.value
                     _st["_external_error"] = f"stage5 墙钟硬闸（看门狗线程）：超 {_limit}s 且 chunk 流停滞，已强停容器"
@@ -885,6 +942,7 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
                             _cli.containers.get(_st["container_id"]).stop(timeout=10)
                     except Exception as e:
                         _log(_st, "warn", f"[阶段5] 墙钟硬闸停容器失败: {e}", on_log)
+                    watchdog_force_terminal(_st, _st["_external_error"], on_log)   # W1：不等 chunk 救场
                     break
         threading.Thread(target=_wall_guard, daemon=True).start()
         _warned_at_80 = False
@@ -904,6 +962,8 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
                          f"[阶段5] 💓 静默 {_gap:.0f}s 后恢复（长命令执行中，非卡死）",
                          on_log)
                 _last_chunk_ts = time.time()
+                state["_chunk_count_live"] = chunk_count   # W2 看门狗 stall 基线
+                state["_chunk_seen_ts"] = _last_chunk_ts
                 # 11-23 用量账周期 flush：长任务中途崩溃不至于全丢（覆盖式幂等）
                 if chunk_count % 20 == 0:
                     _flush_llm_stats()
