@@ -381,13 +381,14 @@ class ThrottledChatModel(BaseChatModel):
     # 池级聚合不在内存做——任务行都在库里，一句 SQL 的事（KISS）。
     # 采集在四个入口成功路径；失败调用无 usage 可记（协议如此）。
     def _llm_log(self, slot: "ModelSlot", msg: str, level: str = "info") -> None:
-        """11-25 调用归因日志：[llm][T-xxx|-] site=… slot=… #枪号 事件。
-        grep 业务号一铲到底；httpx 匿名行已降 WARNING——本行是 LLM
-        流量的唯一现场记录（200/429/网格/改道/回血全在此留痕）。"""
+        """11-25 调用归因日志（定版字段序）：来源列=logger 名 app.llm，
+        消息体 [T-xxx|-] site=… slot=… #枪号 + 事件——时间戳/级别由 formatter
+        供给，[llm] 旧标记随三通道统一去重。grep 业务号一铲到底；
+        httpx/httpx2 匿名行已降 WARNING，本行是 LLM 流量唯一现场记录。"""
         import logging as _lg
         _lg.getLogger("app.llm").log(
             _lg.INFO if level == "info" else _lg.WARNING,
-            "[llm][%s] site=%s slot=%s #%d %s",
+            "[%s] site=%s slot=%s #%d %s",
             self.task_label or "-", self.call_site,
             getattr(slot, "id", "?"), self.call_seq, msg)
 

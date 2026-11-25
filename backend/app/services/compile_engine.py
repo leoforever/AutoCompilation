@@ -96,10 +96,12 @@ def _log(state: TaskState, level: str, msg: str, on_log: Optional[LogCallback] =
     msg = str(msg).replace("\x00", "")
     ts = datetime.now().strftime("%m-%d %H:%M:%S")
     line = f"[{ts}] [{level.upper()}] {msg}"
-    # 11-25 L2：仅 stdout（backend.log）带业务号前缀，grep 任务号一铲到底；
-    # build.log 文件/DB/WS 三路维持原格式——任务日志弹窗与前端解析零波及
-    _tid = state.get("task_id") or ""
-    print(f"[{_tid}] {line}" if _tid else line)
+    # 11-25 格式统一 L2/U2：仅 stdout(backend.log) 通道，字段序对齐三通道定版
+    #   "ts 级别 compile : [T-业务号] 消息"（时间第一列；logging 通道由 formatter
+    #   自带 ts/级别/来源，这里手工拼同款）。build.log 文件/DB/WS 三路维持
+    #   line 原格式——任务日志弹窗与前端解析零波及
+    _tid = state.get("task_id") or "-"
+    print(f"{ts} {level.upper():5s} compile: [{_tid}] {msg}")
     # 1) 内存累积（周期 commit 到 DB）
     state.setdefault("log_output", "")
     state["log_output"] += line + "\n"

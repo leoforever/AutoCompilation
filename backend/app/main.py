@@ -23,9 +23,13 @@ import threading
 import os
 
 
-logging.basicConfig(level=logging.INFO)
+# 11-25 格式统一（定版）：backend.log 三通道同款字段序
+#   "MM-DD HH:MM:SS 级别 来源 : [业务号|其他] 消息"——时间永远第一列
+LOG_FMT = "%(asctime)s %(levelname)-5s %(name)s: %(message)s"
+LOG_DATEFMT = "%m-%d %H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT, datefmt=LOG_DATEFMT)
 # 11-25 L1：openai SDK 底层 httpx 行只有 URL+状态码（谁发的/哪一枪全无）——
-# 降 WARNING 止刷；LLM 流量现场改由 [llm][T-xxx] 归因行提供（llm_client._llm_log）
+# 降 WARNING 止刷；LLM 流量现场改由 app.llm 归因行提供（llm_client._llm_log）
 logging.getLogger("httpx").setLevel(logging.WARNING)
 # 真弹修正(11-25)：openai 新版底层 logger 名为 httpx2，同降——两族匿名行全收编
 logging.getLogger("httpx2").setLevel(logging.WARNING)
@@ -52,6 +56,16 @@ class _SensitiveQueryFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_SensitiveQueryFilter())
 
 
+def _align_uvicorn_log_format():
+    """11-25 格式统一 U3：uvicorn access/error handler 挂同款 formatter。
+    必须运行期调（uvicorn 的 handler 在 server 装配时才挂，晚于本模块
+    import——模块级循环时 handlers 为空是假动作）；只换 formatter 不重建
+    handler，token 掩码 filter 不受影响。"""
+    for _uv_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        for _h in logging.getLogger(_uv_name).handlers:
+            _h.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATEFMT))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动时 spawn N 个 worker 后台线程；结束时发停止信号
@@ -65,6 +79,7 @@ async def lifespan(app: FastAPI):
     from app.services import task_queue
     from app.services.compile_engine import run_task
     from app.services import agent_compat
+    _align_uvicorn_log_format()   # 11-25 U3：此刻 uvicorn handler 已装配，挂同款 formatter
     agent_compat.install()   # 11-23 网关溢出文案识别补丁（须在首个 agent 前）
 
     import uuid as _uuid
