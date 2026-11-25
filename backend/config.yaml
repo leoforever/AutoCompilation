@@ -45,10 +45,12 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
   max_concurrent: 2            # 同时在飞的 LLM HTTP 请求数（worker=8 → 聚合压到 1/4）
   min_interval_ms: 1500        # 相邻请求放行最小间隔（毫秒，预约制实现）
   throttle_retries: 3          # 429 退避重放次数（不含首次）
-  throttle_backoff: "30,60,120"  # 阶梯退避秒数；与 Retry-After 取大
+  throttle_backoff: "60,90,120"  # 11-25 配额网格点位（自首枪 429 起 +60/+90/+120 探测；TPM 分钟窗语义，30s 重放必撞同窗故弃）；与 Retry-After 取大
   throttle_max_wait: 300       # 单次调用累计等待上限（秒）；超过放弃并报限流
   stream_idle_seconds: 600     # 流式业务空闲超时（秒）：keep-alive 假滴字不再续命——600s 无合法 chunk 按瞬时错误切槽重发（勿低于 300：大上下文 prefill 首块本就慢）
-  circuit_threshold: 3         # 连续 N 次限流/失败 → 熔断该模型
+  circuit_threshold: 3         # 连续 N 次硬故障(5xx/连接类) → 熔断该模型（429 不推熔断，归配额网格管，11-25）
+  quota_probe_after_exhaust: 120  # 主力网格试尽后，每 120s 开一个探测窗（真流量撞窗即探针，成功即全场回血）
+  billing_cooldown: 1800       # 402 欠费=账号级黑名单时长（充值前切过去只会送死，30min 探测一次）
   circuit_cooldown: 120        # 熔断持续秒数
   # 模型池（有序=优先级，第一个=主模型；不配则用 AI_MODEL/AI_BASE_URL/AI_API_KEY 造单模型池）
   # 2026-11-03 双模型真开：主 MiniMax（M3.1-Flash）+ 备 Qwen（qwen3.8-flash，跨厂商→配额池独立，
@@ -59,11 +61,11 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
       model: MiniMax-M3.1-Flash
       base_url: https://api.minimaxi.com/v1
       api_key_env: AI_API_KEY         # 密钥只走 env，不进 yaml
-      enabled: true
+      enabled: false
       priority: 2
       max_concurrent: 2               # 该模型自己的配额池上限（覆盖全局）
       min_interval_ms: 1500
-      max_input_tokens: 512000        # 上下文窗口声明：deepagents 会话摘要阈值=0.85×此值
+      max_input_tokens: 256000        # 上下文窗口声明：deepagents 会话摘要阈值=0.85×此值
     - id: qwen-flash
       provider: openai_compatible
       model: qwen3.8-flash
@@ -73,7 +75,7 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
       priority: 1
       max_concurrent: 2
       min_interval_ms: 1500
-      max_input_tokens: 512000
+      max_input_tokens: 256000
 
 artifact_cache:                 # 产物复用库（总设计 artifact-reuse-master-design-20261103.md）
   enabled: true                 # 关闭=停止晋升与挂载注入（账本页仍可用）
