@@ -96,7 +96,10 @@ def _log(state: TaskState, level: str, msg: str, on_log: Optional[LogCallback] =
     msg = str(msg).replace("\x00", "")
     ts = datetime.now().strftime("%m-%d %H:%M:%S")
     line = f"[{ts}] [{level.upper()}] {msg}"
-    print(line)
+    # 11-25 L2：仅 stdout（backend.log）带业务号前缀，grep 任务号一铲到底；
+    # build.log 文件/DB/WS 三路维持原格式——任务日志弹窗与前端解析零波及
+    _tid = state.get("task_id") or ""
+    print(f"[{_tid}] {line}" if _tid else line)
     # 1) 内存累积（周期 commit 到 DB）
     state.setdefault("log_output", "")
     state["log_output"] += line + "\n"
@@ -677,7 +680,8 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
     # （设计档 references/llm-multimodel-throttle-design-20261103.md）
     from app.services.llm_client import make_llm
     llm = make_llm(temperature=0.1, call_site="compile.stage5",
-                   task_id=state.get("task_db_id"))   # 11-23 用量账：实例=任务
+                   task_id=state.get("task_db_id"),   # 11-23 用量账：实例=任务
+                   task_label=state.get("task_id", ""))  # 11-25 L1：业务号进归因日志
 
     def _flush_llm_stats(_llm=llm, _state=state):
         """任务 LLM 账落库（upsert task_llm_stats 按 model 分桶行）。

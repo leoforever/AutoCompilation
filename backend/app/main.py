@@ -24,6 +24,11 @@ import os
 
 
 logging.basicConfig(level=logging.INFO)
+# 11-25 L1：openai SDK 底层 httpx 行只有 URL+状态码（谁发的/哪一枪全无）——
+# 降 WARNING 止刷；LLM 流量现场改由 [llm][T-xxx] 归因行提供（llm_client._llm_log）
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# 真弹修正(11-25)：openai 新版底层 logger 名为 httpx2，同降——两族匿名行全收编
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 

@@ -367,6 +367,8 @@ class ThrottledChatModel(BaseChatModel):
                                      # deepagents 工厂/预算闸读的是包装层，不转发则
                                      # max_input_tokens 配置对 agent 会话永远不可见
     task_id: Optional[int] = None      # 非 None=编译任务专属实例（账按 model 分桶）
+    task_label: str = ""               # 11-25 日志归因：T-xxx 业务号（""=非任务流量）
+    call_seq: int = 0                  # 本实例第几枪 LLM 调用（日志用）
     acc: dict = {}                     # {model_id: {calls,in,out,rea,cache,sec,wait_s,zero_streak}}
     _wait_base: dict = {}              # id(throttle)->上次 waited_total 基线（增量归属用）
 
@@ -378,6 +380,17 @@ class ThrottledChatModel(BaseChatModel):
     # 只记 task_id 实例（=compile.stage5）：qa/exp/ticket 不入账（用户拍板）。
     # 池级聚合不在内存做——任务行都在库里，一句 SQL 的事（KISS）。
     # 采集在四个入口成功路径；失败调用无 usage 可记（协议如此）。
+    def _llm_log(self, slot: "ModelSlot", msg: str, level: str = "info") -> None:
+        """11-25 调用归因日志：[llm][T-xxx|-] site=… slot=… #枪号 事件。
+        grep 业务号一铲到底；httpx 匿名行已降 WARNING——本行是 LLM
+        流量的唯一现场记录（200/429/网格/改道/回血全在此留痕）。"""
+        import logging as _lg
+        _lg.getLogger("app.llm").log(
+            _lg.INFO if level == "info" else _lg.WARNING,
+            "[llm][%s] site=%s slot=%s #%d %s",
+            self.task_label or "-", self.call_site,
+            getattr(slot, "id", "?"), self.call_seq, msg)
+
     def _record_usage(self, resp, seconds: float) -> None:
         if self.task_id is None:
             return
@@ -438,8 +451,19 @@ class ThrottledChatModel(BaseChatModel):
         slot.stats["throttled_429"] += 1
         slot.throttle.stats["throttled"] += 1
         slot.record_failure(counts_only=True)   # 429 不推熔断——行为归配额网格管
+        _st_before = slot.episode_state()
         slot.note_429()                          # 11-25：全池共享的探测网格
+        _st_after = slot.episode_state()
         st["attempts"] += 1
+        if not _st_before:
+            _tail = " · 网格开档 探测+60s"
+        elif _st_after == "exhausted" and _st_before != "exhausted":
+            _tail = " · 网格试尽(exhausted)"
+        elif _st_before == _st_after:
+            _tail = " · 窗内重复证据(不推档)"
+        else:
+            _tail = ""
+        self._llm_log(slot, f"→ 429 第{st['attempts']}次尝试受挫" + _tail, "warning")
         nxt = self._next_untried_slot(slot, st)
         ra = retry_after_seconds(e)
         hold = slot.hold_seconds()
@@ -449,19 +473,24 @@ class ThrottledChatModel(BaseChatModel):
             # 单请求有界（任务端点不可无限延迟）：本请求也烧满重试数时，
             # 有备胎改道、无备胎如实抛——网格管全场节奏，此账管这一枪寿命
             if nxt is not None:
+                self._llm_log(slot, f"单请求烧满 → 改道 {slot.id}→{nxt.id}", "warning")
                 return ("switch", nxt)
+            self._llm_log(slot, "单请求烧满且无备胎 → 抛限流(网格留账,后续继续探针)", "warning")
             raise LlmThrottledError(
                 THROTTLE_MSG, waited=st["waited"], attempts=st["attempts"],
                 call_site=self.call_site, slot_id=slot.id) from e
         if slot.episode_state() == "exhausted" and nxt is not None:
             # 主力试尽（anchor+120 网格走满仍 429=不是窗口抖）→ 改道备胎
+            self._llm_log(slot, f"网格试尽 → 改道 {slot.id}→{nxt.id}", "warning")
             return ("switch", nxt)
         if st["waited"] + hold > self.throttle_max_wait:
             if nxt is not None:
+                self._llm_log(slot, f"hold {hold:.0f}s 超上限 → 改道 {nxt.id}", "warning")
                 return ("switch", nxt)
             raise LlmThrottledError(
                 THROTTLE_MSG, waited=st["waited"], attempts=st["attempts"],
                 call_site=self.call_site, slot_id=slot.id) from e
+        self._llm_log(slot, f"退避：睡 {hold:.0f}s 待下个网格探测点", "warning")
         return ("sleep", hold)
 
     def _call_with_throttle(self, fn, slot: ModelSlot, consume: bool = False):
@@ -473,9 +502,15 @@ class ThrottledChatModel(BaseChatModel):
         _pre = slot.hold_seconds()   # 11-25 定版：主力 throttled 期新请求先睡到探测点
         if _pre > 0:               # （共享账，晚到的请求与在飞请求同点汇合）
             time.sleep(_pre); st["waited"] += _pre
+        _pre_logged = False
         while True:
             slot.throttle.acquire()
             slot.stats["calls"] += 1
+            self.call_seq += 1
+            if not _pre_logged:
+                _pre_logged = True
+                self._llm_log(slot, "start" if _pre <= 0 else f"start(共享网格 pre-hold {_pre:.0f}s 至探测点)")
+            _had_ep = slot.episode_state()      # 成功行要能说"探针终结了 episode"
             try:
                 out = fn()
                 if consume:
@@ -486,6 +521,8 @@ class ThrottledChatModel(BaseChatModel):
                         out, float(get_cfg("llm.stream_idle_seconds", 600)),
                         call_site=self.call_site, slot_id=slot.id)
                 slot.record_success()
+                self._llm_log(slot, f"→ 200 {time.monotonic() - _t0:.1f}s"
+                              + (" · 探针成功网格清零" if _had_ep else ""))
                 slot.throttle.release()   # 成功也要释放：槽只在"在飞"期间占用
                 self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
                 if consume:
@@ -494,8 +531,12 @@ class ThrottledChatModel(BaseChatModel):
             except Exception as e:
                 if not is_rate_limited(e):
                     slot.record_failure()
-                    if getattr(e, "status_code", None) == 402:
+                    _sc = getattr(e, "status_code", None)
+                    if _sc:
+                        self._llm_log(slot, f"→ HTTP {_sc} ({type(e).__name__})", "warning")
+                    if _sc == 402:
                         slot.note_billing()   # 11-25：欠费=账号级，30min 内不再送人头
+                        self._llm_log(slot, "402 欠费 → 该槽拉黑 30min(选槽/改道均绕开)", "warning")
                     slot.throttle.release()
                     # 11-03 用户拍板：5xx/连接/超时=瞬时错误 → 当次切备用继续；
                     # 4xx 参数/鉴权类与未知错误维持原样抛（换模型也不会更好，且防计费放大）
@@ -528,11 +569,17 @@ class ThrottledChatModel(BaseChatModel):
         _pre = slot.hold_seconds()   # 11-25 定版：主力 throttled 期新请求先睡到探测点
         if _pre > 0:               # （共享账，与在飞请求同点汇合；asyncio 不阻塞事件循环）
             await asyncio.sleep(_pre); st["waited"] += _pre
+        _pre_logged = False
         while True:
             wait = slot.throttle.reserve()          # 预约放行时刻（纯计算，不阻塞）
             if wait > 0:
                 await asyncio.sleep(wait)           # A1 修复：预约了就得等，否则最小间隔形同虚设
             slot.stats["calls"] += 1
+            self.call_seq += 1
+            if not _pre_logged:
+                _pre_logged = True
+                self._llm_log(slot, "start" if _pre <= 0 else f"start(共享网格 pre-hold {_pre:.0f}s 至探测点)")
+            _had_ep = slot.episode_state()
             try:
                 out = await fn()
                 if consume:
@@ -540,6 +587,8 @@ class ThrottledChatModel(BaseChatModel):
                         out, float(get_cfg("llm.stream_idle_seconds", 600)),
                         call_site=self.call_site, slot_id=slot.id)
                 slot.record_success()
+                self._llm_log(slot, f"→ 200 {time.monotonic() - _t0:.1f}s"
+                              + (" · 探针成功网格清零" if _had_ep else ""))
                 self._record_usage(out, time.monotonic() - _t0)   # 11-23 用量账
                 if consume:
                     return _aiter_list(out)
@@ -848,7 +897,8 @@ def _pick_slot(slots: list, *, exclude_ids: "set | None" = None,
 
 def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
              call_site: str = "", prefer: Optional[str] = None,
-             model_id: Optional[str] = None, task_id: Optional[int] = None) -> ThrottledChatModel:
+             model_id: Optional[str] = None, task_id: Optional[int] = None,
+             task_label: str = "") -> ThrottledChatModel:
     """所有 LLM 调用的唯一入口：过闸 + 退避 + 池内兜底。
 
     task_id（11-23 用量账）：仅 compile.stage5 传——实例=任务（每任务新建），
@@ -878,6 +928,7 @@ def make_llm(*, temperature: float = 0.1, max_tokens: Optional[int] = None,
         temperature=temperature, max_tokens=max_tokens,
         profile=getattr(base, "profile", None),
         task_id=task_id,
+        task_label=task_label,
     )
 
 

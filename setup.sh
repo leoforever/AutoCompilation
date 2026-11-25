@@ -422,6 +422,16 @@ SQL
     # serving 路径不再有常驻 node（preview/esbuild 死亡类事故根除）
     install_nginx_conf
 
+    # backend.log 滚动（11-25）：copytruncate 模板，50M×4 份压缩；
+    # 系统 crond 的 /etc/cron.daily/logrotate 驱动，无需平台自身动作
+    if [ -s /usr/sbin/logrotate ]; then
+        sudo sed "s|__LOG_DIR__|$LOG_DIR|" "$PROJECT_DIR/deploy/logrotate-compile-platform.conf" \
+            | sudo tee /etc/logrotate.d/compile-platform >/dev/null
+        info "logrotate 已装：/etc/logrotate.d/compile-platform（backend.log 50M×4）"
+    else
+        warn "系统无 logrotate——backend.log 将无限增长，建议 dnf install logrotate 后重跑 install"
+    fi
+
     info "安装前端依赖..."
     cd "$FRONTEND_DIR"
     # npm install 本身幂等（已装会 skip）；加 --no-audit --no-fund 加速
