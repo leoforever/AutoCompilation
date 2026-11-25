@@ -808,7 +808,7 @@ numpy2.x 桥接瘫痪这类坑（2500D1 实证）。
 runtime_libs 可选：ELF 类产物（binary/so/rpm/tgz 内裸 ELF）从产物机 ldd 实测抄录其
 动态依赖的 .so 名（如 "liblua5.4.so.0"），供复用者判断目标机要不要补装运行库——
 **必须是 ldd 真实输出、不许凭记忆填**；whl/node 类自带依赖声明可不填。只放成品，
-验证临时物/日志/脚本不放。平台在任务成功后核对门禁并提交管理员审批，通过才上架。
+验证临时物/日志/脚本不放。平台在任务成功后核对门禁并自动上货架（人人可见可下载）；是否进 AI 复用库由管理员在后台开关。
 
 【验证口径】本平台是编译平台，验收只证明"装得上、导入得动、能最小调用"，三件套即可：
 ① 干净环境安装产物（pip install whl / npm i tgz / 二进制 ldd+file 检查，按产物类型）
@@ -1397,8 +1397,8 @@ def _write_package_json(state: TaskState, artifacts_dir: Path, on_log=None) -> N
 def _fallback_system_pkg(state: TaskState, artifacts_dir: Path, on_log=None) -> None:
     """兜底产系统包（交付矩阵·二期，默认开）：AI 未产 .deb/.rpm 且 output 是散装
     install 树时，宿主 dpkg-deb/rpmbuild 补产一个进 output（随 bundle 进下载包）。
-    不注入晋升 cache_out——货架口径保持"AI 自愿申报+人审"，平台自动产物不进审批流
-    （11-17 设计定稿）。失败只 warn；config pkg_fallback.enabled=false 可整体关。"""
+    不注入晋升 cache_out——货架口径="AI 自愿申报+门禁"，兜底产包不自动挤货架
+    （11-17 设计定稿；v3 起门禁过即上架，更须防兜底包无 meta 自报涌入）。失败只 warn；config pkg_fallback.enabled=false 可整体关。"""
     try:
         from app.config import get_cfg
         if not get_cfg("artifact_cache.pkg_fallback.enabled", True, env_alias="PKG_FALLBACK"):
@@ -1925,7 +1925,7 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
             if _hits:
                 _log(state, "info", f"[阶段5] 复用命中记账：{len(_hitset)} 项货架件被使用", on_log)
             if _prom:
-                _log(state, "info", f"[阶段5] 晋升候选 {len(_prom)} 件待管理员审批: {_prom}", on_log)
+                _log(state, "info", f"[阶段5] ✅ 已自动上货架 {len(_prom)} 件（人侧立即可见可下载；AI 复用库由管理员选入）: {_prom}", on_log)
             if _rej:
                 _log(state, "info", f"[阶段5] 晋升拒收: {_rej}", on_log)
         except Exception as _ce:

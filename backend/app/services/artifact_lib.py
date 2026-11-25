@@ -270,6 +270,19 @@ def collect_promotables(cache_out: Path, system_id: int) -> tuple[list[dict], li
 
 
 # ── INDEX.md（动态查库入口，平台生成；总设计 增补A）─────────────────
+# 货架 v2 谓词：AI 侧（INDEX/摘要/挂载视图）只收 audience∉{human}；
+# 空串=存量行（迁移默认 both 前也不该漏件），语义并入 both。
+def _ai_visible():
+    from app.models import ArtifactIndex
+    return ArtifactIndex.audience.isnot(None) & (ArtifactIndex.audience != "human")
+
+
+def _human_visible():
+    """人侧（公开列表/下载）只收 audience∉{ai}；同理 "" 并入 both。"""
+    from app.models import ArtifactIndex
+    return ArtifactIndex.audience.isnot(None) & (ArtifactIndex.audience != "ai")
+
+
 def regenerate_index(db, system_id: int) -> str:
     """货架 = approved(含存量"")∪upload 且未软删的行；每次库变更调用（幂等重写）。
     只报事实不做判断——用不用是 AI 的事。
@@ -286,6 +299,7 @@ def regenerate_index(db, system_id: int) -> str:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",
+        _ai_visible(),
     ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     d = shelf_dir(system_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -318,6 +332,7 @@ def shelf_summary(db, system_id: int, limit: int = 15) -> str:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",          # 仅账本的回填行不进 AI 摘要（真在架才算货架）
+        _ai_visible(),                           # 货架v2：仅供下载的件 AI 不可见
     ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     baseline = system_baseline(db, system_id)
     rows = [r for r in rows
@@ -333,19 +348,18 @@ def shelf_summary(db, system_id: int, limit: int = 15) -> str:
 
 
 # ── 审批动作核心（端点调；事务由调用方 commit）────────────────────
-def approve_row(db, row, operator_id: int) -> str:
-    """pending → 在架：文件从 promote_pending move 进货架 + cache_path 落值 + INDEX 重生成。
-    返回相对路径。源文件不存在 = 数据异常，抛错由端点转 404（不静默）。"""
+def promote_shelved_row(db, row, audience: str = "human") -> str:
+    """账本行 pending→approved 的公共内核（v3 拆分：extract 自动上架/端点审批/
+    存量迁移三处共用）：文件从 promote_pending move 进货架 + 同名"新版本赢"
+    去重 + 状态/用途/路径落值 + 池 INDEX 重生成。返回 cache 相对路径。
+    指纹不符抛 ValueError、文件缺抛 FileNotFoundError（调用方定夺）。"""
     from app.config import artifacts_dir
     from app.models import ArtifactIndex
-    if row.status != "pending":
-        raise ValueError(f"仅 pending 可审批（当前 {row.status or '存量'}）")
     src = artifacts_dir() / row.source_task_key / "promote_pending" / row.name
     if not src.is_file():
-        raise FileNotFoundError(f"待晋升文件不在盘：{row.name}")
+        raise FileNotFoundError(f"待上架文件不在盘：{row.name}")
     if row.sha256 and sha256_of(src) != row.sha256:
-        # 身份钉复核：提取→审批窗口内文件变了（篡改/损坏/人换货）=拒绝上架，账本不动
-        raise ValueError("指纹与晋升时不符（文件可能被改动），拒绝上架；请驳回重验")
+        raise ValueError("指纹与入库时不符（文件可能被改动），拒绝上架")
     dst_dir = system_cache_dir(row.system_id) / row.name_norm
     dst_dir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst_dir / row.name))
@@ -353,8 +367,8 @@ def approve_row(db, row, operator_id: int) -> str:
     if meta_src.is_file():
         shutil.move(str(meta_src), str(dst_dir / (row.name + ".meta.json")))
     rel = f"{row.system_id}/{row.name_norm}/{row.name}"
-    # 同名覆盖必去重（总设计§3.3"新版本赢"的后半段；11-04 R2 复验实测暴露：物理文件
-    # move 天然覆盖但账本留双行 → INDEX 双行、flush_hits 按 name_norm 全行计数=翻倍）
+    # 同名覆盖必去重（总设计§3.3"新版本赢"后半段；11-04 R2 实测：物理 move 覆盖
+    # 但账本双行 → INDEX 双行、flush_hits 全行计数=翻倍）
     prev = db.query(ArtifactIndex).filter(
         ArtifactIndex.system_id == row.system_id,
         ArtifactIndex.name_norm == row.name_norm,
@@ -365,13 +379,28 @@ def approve_row(db, row, operator_id: int) -> str:
     ).all()
     for p in prev:
         row.hits = (row.hits or 0) + (p.hits or 0)      # 复用史随货架槽位迁移
-        row.views = (row.views or 0) + (p.views or 0)   # views 同步迁（11-04 实测漏迁修正）
+        row.views = (row.views or 0) + (p.views or 0)
         p.deleted_at = datetime.utcnow()
         p.note = ((p.note or "") + f" [superseded-by #{row.id}]").strip()[:300]
     row.status = "approved"
+    row.audience = audience or "human"
     row.cache_path = rel
     row.note = (row.note or "")[:280]
     regenerate_index(db, row.system_id)
+    return rel
+
+
+def approve_row(db, row, operator_id: int, audience: str = "both") -> str:
+    """pending → 在架（v2 审批端点保留兼容；v3 起 UI 已无审批面，
+    新链路走 extract_promotions 自动上架）。文件/指纹/去重/INDEX
+    全在 promote_shelved_row 内核，此处只守 pending 语义与用途校验。"""
+    if audience not in ("both", "ai", "human"):
+        raise ValueError(f"非法用途: {audience}")
+    from app.models import ArtifactIndex
+    if row.status != "pending":
+        raise ValueError(f"仅 pending 可审批（当前 {row.status or '存量'}）")
+    rel = promote_shelved_row(db, row, audience=audience)
+    row.note = (row.note or "")[:280]
     return rel
 
 
@@ -731,6 +760,7 @@ def _link_pool_into_view(db, pool_id: int, view: Path, baseline: str = "", fmt: 
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",
+        _ai_visible(),
     ).all()
     if pool_id == COMMON_SYSTEM_ID:
         rows = [r for r in rows if _common_passes(r, baseline)]   # 三层闸·配给过滤
@@ -777,6 +807,7 @@ def build_shelf_view(db, system_id: int, container_work) -> Path:
         ArtifactIndex.deleted_at.is_(None),
         ArtifactIndex.status.in_(("approved", "")),
         ArtifactIndex.cache_path != "",
+        _ai_visible(),   # 货架v2：视图 INDEX 与硬链接同闸（仅供下载件 AI 两见皆无）
     ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.desc()).all()
     rows = [r for r in rows if r.system_id != COMMON_SYSTEM_ID or _common_passes(r, baseline)]
     rows = [r for r in rows if _format_passes(r, fmt)]   # INDEX 与硬链接视图同闸（口径一致）
@@ -912,10 +943,11 @@ def flush_hits(db, system_id: int, names: set, views: "set | None" = None) -> in
     return n
 
 
-# ── 期二：晋升提取（run_task success 调：合格件移 promote_pending + 建 pending 行 + 通知）──
+# ── 期二：晋升提取（货架 v3，11-25 拍板：编译通过即上货架，默认只在货架=human；
+#    进不进 AI 复用库由管理员后台开关——"审批"这道门从人侧整体挪到 AI 侧）────
 def extract_promotions(db, task, state: dict, art_root) -> tuple[list, list]:
-    """返回 (晋升候选名, 拒收原因)。文件移置 promote_pending（随任务生命周期，
-    不进 container_work——那里 7 天自动清）；账本 pending 行等审批。"""
+    """返回 (已上架名, 拒收原因)。合格件直接 move 进货架池 + 账本 approved/human；
+    同名"新版本赢"去重与 INDEX 重生成沿用 promote_shelved_row；门禁拒收留痕不变。"""
     from app.config import get_cfg
     from app.models import ArtifactIndex, User
     from app.services.notify import notify
@@ -928,53 +960,87 @@ def extract_promotions(db, task, state: dict, art_root) -> tuple[list, list]:
         # 全拒也留痕+通知：管理员看不见"AI 交过货被门禁拒"就永远救不了它（11-04 真机：
         # node-pty 任务 meta.toolchain 空被拒，只有任务 log 知道——信息孤岛）
         if rejects:
-            from app.services.audit import log_audit
-            from app.services.notify import notify as _nt
-            from app.models import User as _U
             log_audit(db, user_id=None, action="artifact_rejected", target_type="compile_task",
                       target_id=task.id, target_key=task.task_id,
                       details=f"全拒收:{rejects}")
             try:
-                for adm in db.query(_U).filter(_U.role == "admin", _U.is_active == True,
-                                               _U.deleted_at.is_(None)).all():
-                    _nt(db, user_id=adm.user_id, type="artifact_rejected",
-                        title=f"晋升被门禁拒收：{task.task_id}（{len(rejects)} 件）",
-                        body="；".join(rejects)[:200], link="")
+                for adm in db.query(User).filter(User.role == "admin", User.is_active == True,
+                                                 User.deleted_at.is_(None)).all():
+                    notify(db, user_id=adm.user_id, type="artifact_rejected",
+                           title=f"晋升被门禁拒收：{task.task_id}（{len(rejects)} 件）",
+                           body="；".join(rejects)[:200], link="")
             except Exception:
                 pass
         return [], rejects
-    pend_dir = art_root / "promote_pending"
-    pend_dir.mkdir(parents=True, exist_ok=True)
     names = []
     for it in items:
-        src = it["file"]
-        dst = pend_dir / it["name"]
-        import shutil as _sh
-        _sh.move(str(src), str(dst))
-        meta_src = src.with_name(src.name + ".meta.json")
-        if meta_src.is_file():
-            _sh.move(str(meta_src), str(pend_dir / (it["name"] + ".meta.json")))
+        # meta 与文件同目录随迁：promote_shelved_row 按 src 同位找 .meta.json
+        meta_src = it["file"].with_name(it["file"].name + ".meta.json")
+        if meta_src.is_file() and it["name"] != it["file"].name:
+            shutil.move(str(meta_src), str(it["file"].with_name(it["name"] + ".meta.json")))
+            meta_src = it["file"].with_name(it["name"] + ".meta.json")
         row = ArtifactIndex(
             name=it["name"], name_norm=it["name_norm"], version=it["version"],
             system_id=it["system_id"], kind=it["kind"], origin="task", status="pending",
+            audience="human",
             source_task_id=task.id, source_task_key=task.task_id,
             build_env=json.dumps(it.get("toolchain") or {}, ensure_ascii=False),
             runtime_env=json.dumps(it.get("runtime_libs") or [], ensure_ascii=False),
             image=state.get("docker_image") or "", size_bytes=it["size"],
             source_commit=_source_identity(task, state)[:64],
-            sha256=it.get("sha256") or "")
+            sha256=it.get("sha256") or "",
+            note="v3自动上架" if not it.get("renamed") else "v3自动上架（货架名规范化）")
         db.add(row)
+        db.flush()
+        # 文件先落到 promote_pending 惯例位（复用 promote_shelved_row 的搬移+去重+INDEX）
+        pend_dir = art_root / "promote_pending"
+        pend_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(it["file"]), str(pend_dir / it["name"]))
+        if meta_src.is_file():
+            shutil.move(str(meta_src), str(pend_dir / (it["name"] + ".meta.json")))
+        promote_shelved_row(db, row)
         names.append(it["name"])
-    log_audit(db, user_id=None, action="artifact_pending", target_type="compile_task",
+    log_audit(db, user_id=None, action="artifact_shelved", target_type="compile_task",
               target_id=task.id, target_key=task.task_id,
-              details=f"候选={names},拒收={rejects}")
-    # 通知全体 admin（T15 best-effort，自发排除不适用——系统发起）
+              details=f"自动上架={names},拒收={rejects}")
+    # 通知全体 admin（T15 best-effort）：v3 语义=已上架，动作变"选入 AI 库"
     try:
         for adm in db.query(User).filter(User.role == "admin", User.is_active == True,
                                          User.deleted_at.is_(None)).all():
-            notify(db, user_id=adm.user_id, type="artifact_pending",
-                   title=f"产物待晋升审批：{task.task_id} 提交 {len(names)} 件",
-                   body="、".join(names)[:200], link="")
+            notify(db, user_id=adm.user_id, type="artifact_shelved",
+                   title=f"已自动上货架：{task.task_id}（{len(names)} 件）",
+                   body="、".join(names)[:200] + "——后台可移入 AI 复用库", link="/admin/artifacts")
     except Exception:
         pass
     return names, rejects
+
+
+def migrate_shelf_v3(db) -> int:
+    """货架 v3 存量迁移（幂等，可反复跑）：全部 pending 件自动上架（默认 human）。
+    文件灭/指纹不符的个别件降级处理并留痕，不挡其余。返回成功件数。"""
+    from app.config import artifacts_dir
+    from app.models import ArtifactIndex
+    rows = db.query(ArtifactIndex).filter(ArtifactIndex.status == "pending",
+                                          ArtifactIndex.deleted_at.is_(None)).all()
+    moved = 0
+    for row in rows:
+        src = artifacts_dir() / row.source_task_key / "promote_pending" / row.name
+        if not src.is_file():
+            row.status = "approved"; row.audience = "human"
+            row.note = ((row.note or "") + " [v3迁移:文件不在盘,仅账本]").strip()[:300]
+            db.flush()
+            continue
+        if row.sha256 and sha256_of(src) != row.sha256:
+            # 转"仅账本"行（不悬 pending——v3 后 UI 无待晋升面）：文件留原位随任务清理，
+            # admin 在货架表见"仅账本"徽标，处置=删除
+            row.status = "approved"; row.audience = "human"
+            row.note = ((row.note or "") + " [v3迁移:指纹不符未上架,文件留任务目录,请人工处置]").strip()[:300]
+            continue
+        promote_shelved_row(db, row, audience="human")
+        moved += 1
+    db.commit()
+    if rows:
+        for sid in {r.system_id for r in rows}:
+            regenerate_index(db, sid)
+        db.commit()
+    return moved

@@ -11,12 +11,11 @@
         <template v-if="sel.length">
           <el-divider direction="vertical" />
           <el-button size="small" @click="selectAllSource">全选本来源</el-button>
-          <el-button size="small" type="primary" plain :loading="batchDl" @click="doBatchDownload">批量下载 {{ sel.length }}</el-button>
         </template>
         <template v-if="isAdmin && sel.length">
           <el-divider direction="vertical" />
-          <el-button size="small" type="success" @click="openBatch('approve')">批量通过 {{ sel.length }}</el-button>
-          <el-button size="small" type="warning" @click="openBatch('reject')">批量驳回 {{ sel.length }}</el-button>
+          <el-button size="small" type="primary" @click="batchAudienceTo('both')">批量入AI库 {{ sel.length }}</el-button>
+          <el-button size="small" @click="batchAudienceTo('human')">批量移出AI库 {{ sel.length }}</el-button>
           <el-button v-if="canManage" size="small" type="danger" plain @click="openBatch('delete')">批量下架 {{ sel.length }}</el-button>
         </template>
         <span class="spacer" />
@@ -25,16 +24,8 @@
       </div>
     </el-card>
 
-    <el-tabs v-if="isAdmin" v-model="tab" @tab-change="load">
-      <el-tab-pane label="在架货架" name="shelf" />
-      <el-tab-pane name="pending">
-        <template #label>
-          待晋升审批
-          <el-badge v-if="pendingCount" :value="pendingCount" class="tab-badge" />
-        </template>
-      </el-tab-pane>
-
-    </el-tabs>
+    <!-- 货架 v3（11-25 拍板）：单表面无 tab——编译通过自动上架人人可见可下载；
+         管理员动作只剩三件：选入/移出 AI 复用库、下架(物理删)、上传。 -->
 
     <div class="toolbar">
       <el-input v-model="search" placeholder="搜软件名 / 文件名 / 任务号" clearable style="width: 260px" @change="load" />
@@ -47,59 +38,81 @@
       <el-select v-model="systemId" placeholder="目标系统" clearable style="width: 200px" @change="load">
         <el-option v-for="sy in systems" :key="sy.system_id" :label="sy.name" :value="sy.system_id" />
       </el-select>
+      <!-- 11-25 v3：状态筛选与列表徽标一一对应（仅后台面） -->
+      <el-select v-if="isAdmin" v-model="shelf" placeholder="状态" clearable style="width: 140px" @change="page = 1; load()">
+        <el-option value="in" label="在架·已入选" />
+        <el-option value="out" label="在架·未入选" />
+        <el-option value="ledger" label="仅账本" />
+      </el-select>
+      <!-- 11-25：批量下载前移到工具条，前台用户同款可用（后端公开端点本就全员同闸） -->
+      <el-button v-if="sel.length" size="small" type="primary" plain :loading="batchDl"
+                 style="margin-left:8px" @click="doBatchDownload">批量下载 {{ sel.length }}</el-button>
     </div>
 
     <el-table ref="tableRef" :data="rows" v-loading="loading" size="small" border
               @selection-change="(v: any[]) => sel = v">
-      <el-table-column v-if="isAdmin" type="selection" width="42" :selectable="() => isAdmin" />
+      <el-table-column type="selection" width="42" />
       <el-table-column type="index" label="#" width="52" />
-      <el-table-column prop="name" label="文件名" min-width="220" show-overflow-tooltip />
-      <el-table-column prop="name_norm" label="软件名" width="150" show-overflow-tooltip />
-      <el-table-column label="系统" width="150">
+      <el-table-column prop="name" label="文件名" :min-width="isAdmin ? 150 : 220" show-overflow-tooltip />
+      <el-table-column prop="name_norm" label="软件名" :width="isAdmin ? 205 : undefined" :min-width="isAdmin ? undefined : 170" show-overflow-tooltip />
+      <el-table-column label="系统" :width="isAdmin ? 180 : undefined" :min-width="isAdmin ? undefined : 160" show-overflow-tooltip>
         <template #default="{ row }">
           <el-tag v-if="row.system_id === 0" size="small" type="warning">通用</el-tag>
           <span v-else>{{ sysName(row.system_id) }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="kind" label="类型" width="105" />
-      <el-table-column label="大小" width="90">
+      <el-table-column prop="kind" label="类型" width="70" />
+      <el-table-column label="大小" width="70">
         <template #default="{ row }">{{ fmtSize(row.size_bytes) }}</template>
       </el-table-column>
-      <el-table-column v-if="isAdmin" label="复用" width="88" align="center">
+      <!-- 人气账（11-25）：下载次数单列全员可见——人的账；旁边"复用"是机器账，分色不混 -->
+      <el-table-column label="下载" width="58" align="center">
+        <template #default="{ row }">
+          <span v-if="row.dl_count" style="color:var(--el-color-primary)">{{ row.dl_count }}次</span>
+          <span v-else class="hint-dim">0次</span>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="isAdmin" label="复用" width="60" align="center">
         <template #default="{ row }">{{ row.hits }}用/{{ row.views || 0 }}览</template>
       </el-table-column>
-      <el-table-column v-if="isAdmin" label="最近使用" width="120">
-        <template #default="{ row }">{{ (row.last_used_at || '').slice(5, 16) || '-' }}</template>
-      </el-table-column>
-      <el-table-column v-if="isAdmin" label="来源" width="150" show-overflow-tooltip>
+      <!-- 11-25 列表瘦身 v3（两向截图取证）：弹性列按面分配——admin 仅文件名吃富余；
+           前台列少，富余分给 文件名/软件名/系统 三列（防单列真空带，vision 复验指出）。
+           教训：来源 min-width 弹性曾虚胖、操作 190+hidden 曾裁钮，皆定宽修复 -->
+      <el-table-column v-if="isAdmin" label="来源" width="180" show-overflow-tooltip>
         <template #default="{ row }">
           <el-tag v-if="row.origin === 'upload'" size="small">上传·{{ row.uploader }}</el-tag>
           <span v-else>{{ row.source_task_key || '-' }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="构建上下文" min-width="170" show-overflow-tooltip>
+      <!-- AI 复用库并入状态列（v3：一个事实的两半——在架是身份，入选是属性） -->
+      <el-table-column label="状态" :width="isAdmin ? 132 : 86">
         <template #default="{ row }">
-          <span :class="{ unk: !row.build_env || row.build_env === '{}' }">{{ fmtEnv(row.build_env) }}</span>
+          <template v-if="!isAdmin">
+            <el-tag type="success" size="small">在架</el-tag>
+          </template>
+          <template v-else>
+            <el-tag v-if="row.deleted_at" type="info" size="small">已下架</el-tag>
+            <el-tag v-else-if="row.status === 'pending'" type="warning" size="small">待迁移</el-tag>
+            <el-tag v-else-if="!row.cache_path" size="small">仅账本</el-tag>
+            <el-tag v-else-if="(row.audience || 'both') === 'both'" type="success" size="small">在架·已入选</el-tag>
+            <el-tag v-else type="success" size="small">在架·未入选</el-tag>
+          </template>
         </template>
       </el-table-column>
-      <el-table-column v-if="isAdmin" label="状态" width="92">
+      <el-table-column label="操作" :width="isAdmin ? 230 : 120" fixed="right" class-name="ops-col">
         <template #default="{ row }">
-          <el-tag v-if="row.deleted_at" type="info" size="small">已下架</el-tag>
-          <el-tag v-else-if="row.status === 'pending'" type="warning" size="small">待晋升</el-tag>
-          <el-tag v-else-if="row.status === 'rejected'" type="danger" size="small">已驳回</el-tag>
-          <el-tag v-else-if="row.cache_path" type="success" size="small">在架</el-tag>
-          <el-tag v-else size="small">仅账本</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" :width="isAdmin ? 210 : 130" fixed="right">
-        <template #default="{ row }">
-          <el-button size="small" type="primary" plain @click="doDownload(row)">下载</el-button>
-          <el-button size="small" @click="showDetail(row)">详情</el-button>
-          <el-button v-if="isAdmin && row.status === 'pending'" size="small" type="success"
-                     :disabled="!canManage" @click="doApprove(row)">通过</el-button>
-          <el-button v-if="isAdmin && row.status === 'pending'" size="small" type="warning"
-                     :disabled="!canManage" @click="openReject(row)">驳回</el-button>
-          <el-button v-if="isAdmin && tab === 'shelf'" size="small" type="danger" plain
+          <!-- 11-25：文字钮防折行（四枚色块钮 200px 放不下曾致行高不齐）；颜色分语义 -->
+          <el-button size="small" text type="primary" @click="doDownload(row)">下载</el-button>
+          <el-button size="small" text @click="showDetail(row)">详情</el-button>
+          <el-button v-if="isAdmin && row.cache_path && (row.audience || 'both') !== 'both'"
+                     size="small" text type="success" :disabled="!canManage"
+                     title="移入 AI 复用库：后续编译任务可从货架自动取用"
+                     @click="setAudience(row, 'both')">入AI库</el-button>
+          <el-button v-if="isAdmin && row.cache_path && (row.audience || 'both') === 'both'"
+                     size="small" text :disabled="!canManage"
+                     title="移出 AI 复用库：人仍可下载，AI 不再自动取用"
+                     @click="setAudience(row, 'human')">出AI库</el-button>
+          <el-button v-if="isAdmin && row.cache_path" size="small" text type="danger"
                      :disabled="!canManage" title="货架文件物理删除，不可恢复（账留墓碑）"
                      @click="openDelete(row)">下架</el-button>
 
@@ -110,32 +123,32 @@
                    :page-size="20" v-model:current-page="page" @current-change="load" />
 
     <!-- 详情弹层：meta 全量 + 血缘 -->
-    <el-dialog v-model="detailVisible" title="产物详情" width="640">
-      <el-descriptions v-if="cur" :column="1" border size="small">
+    <el-dialog v-model="detailVisible" title="产物详情" width="720">
+      <el-descriptions v-if="cur" :column="1" border size="small" width="100%" class="detail-desc">
         <el-descriptions-item label="文件">{{ cur.name }}</el-descriptions-item>
         <el-descriptions-item label="软件名 / 版本">{{ cur.name_norm }} / {{ cur.version || '-' }}</el-descriptions-item>
         <el-descriptions-item label="类型 / 大小">{{ cur.kind }} / {{ fmtSize(cur.size_bytes) }}</el-descriptions-item>
         <el-descriptions-item label="目标系统">{{ sysName(cur.system_id) }}（镜像 {{ cur.image || '-' }}）</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="来源">{{ cur.origin === 'upload' ? `管理员上传 · ${cur.uploader}` : `任务晋升 · ${cur.source_task_key}` }}</el-descriptions-item>
         <el-descriptions-item label="构建上下文(ABI 依据)">{{ fmtEnv(cur.build_env, true) }}</el-descriptions-item>
-        <el-descriptions-item label="身份钉(晋升时平台自验)">源码 commit {{ cur.source_commit || '-' }} · sha256 {{ (cur.sha256 || '').slice(0, 16) }}{{ cur.sha256 ? '…' : '' }}</el-descriptions-item>
+        <el-descriptions-item v-if="cur.git_src" label="源码仓库">
+          <a :href="cur.git_src.url" target="_blank" rel="noopener" style="color:var(--el-color-primary)">{{ cur.git_src.url }}</a>
+          <template v-if="cur.git_src.branch"> · branch <b>{{ cur.git_src.branch }}</b></template>
+        </el-descriptions-item>
+        <el-descriptions-item label="身份钉(入库时平台自验)">源码 commit {{ cur.source_commit || '-' }} · sha256 {{ (cur.sha256 || '').slice(0, 16) }}{{ cur.sha256 ? '…' : '' }}</el-descriptions-item>
         <el-descriptions-item label="运行需求(glibc 机提)">{{ cur.glibc_requires || '未检出/非ELF类' }}<template v-if="cur.system_id === 0"> · 按各系统基线自动配给</template></el-descriptions-item>
         <el-descriptions-item label="运行依赖库(ldd 实测)">{{ fmtLibs(cur.runtime_env) }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="复用次数 / 最近使用">{{ cur.hits }} / {{ cur.last_used_at || '-' }}</el-descriptions-item>
+        <el-descriptions-item v-if="isAdmin" label="下载人气">{{ cur.dl_count || 0 }} 次 / {{ (cur.dl_last_at || '').slice(0, 16).replace('T', ' ') || '从未' }}</el-descriptions-item>
+        <el-descriptions-item v-if="isAdmin && cur.status === 'approved'" label="AI 复用库">
+          <el-select v-model="curAudience" size="small" style="width:150px" @change="saveAudience">
+            <el-option value="both" label="已入选（AI 可自动取用）" /><el-option value="human" label="未入选（仅人下载）" />
+          </el-select>
+          <span class="tip" style="margin-left:8px">即时生效（审计留痕）；人侧下载不受此开关影响</span>
+        </el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="货架路径">{{ cur.cache_path || '（未上架）' }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="备注">{{ cur.note || '-' }}</el-descriptions-item>
       </el-descriptions>
-    </el-dialog>
-
-    <!-- 驳回理由 -->
-    <el-dialog v-model="rejectVisible" title="驳回晋升" width="480">
-      <p style="margin:0 0 8px;color:var(--el-text-color-secondary);font-size:13px">
-        驳回后文件留在任务晋升区随任务生命周期清理；理由留痕并计入审计。</p>
-      <el-input v-model="rejectReason" type="textarea" :rows="3" placeholder="驳回理由（如：版本过旧/上下文缺失/与在架件重复）" />
-      <template #footer>
-        <el-button @click="rejectVisible = false">取消</el-button>
-        <el-button type="warning" :disabled="!rejectReason.trim()" @click="doReject">确认驳回</el-button>
-      </template>
     </el-dialog>
 
     <!-- 下架确认（简化拍板：下架=删货终局；restore/ledger 留后端应急，UI 不挂） -->
@@ -151,10 +164,8 @@
 
     <!-- 上传对话框（人放的免审直入；拍板6 权限=管理角色） -->
     <el-dialog v-model="batchVisible" :title="batchTitle" width="640">
-      <el-alert v-if="batchAction === 'delete'" :closable="false" type="warning" style="margin-bottom:10px"
+      <el-alert :closable="false" type="warning" style="margin-bottom:10px"
                 title="下架将物理删除各件货架文件与 meta，不可恢复——下方清单逐件过目再决定" />
-      <el-alert v-else-if="batchAction === 'approve'" :closable="false" type="info" style="margin-bottom:10px"
-                title="通过后文件移入货架并对全部编译任务可见（同名件按'新版本赢'合并历史账）" />
       <el-table :data="sel" size="small" border max-height="240">
         <el-table-column prop="id" label="#" width="52" />
         <el-table-column prop="name" label="文件" min-width="200" show-overflow-tooltip />
@@ -164,9 +175,6 @@
         <el-table-column prop="kind" label="类型" width="80" />
         <el-table-column prop="status" label="状态" width="90" />
       </el-table>
-      <div v-if="batchAction === 'reject'" style="margin-top:10px">
-        <el-input v-model="batchReason" placeholder="统一驳回理由（逐件留痕）" maxlength="120" show-word-limit />
-      </div>
       <div v-if="batchResult" style="margin-top:10px;font-size:12px">
         成功 {{ batchResult.ok.length }} 件<span v-if="batchResult.failed.length">；失败 {{ batchResult.failed.length }} 件：</span>
         <ul style="margin:4px 0;padding-left:18px">
@@ -175,8 +183,8 @@
       </div>
       <template #footer>
         <el-button @click="batchVisible = false">关闭</el-button>
-        <el-button :type="batchAction === 'delete' ? 'danger' : 'primary'" :loading="batchBusy" :disabled="!!batchResult" @click="doBatch">
-          {{ batchAction === 'approve' ? '确认通过' : batchAction === 'reject' ? '确认驳回' : '确认下架（删除文件）' }}
+        <el-button type="danger" :loading="batchBusy" :disabled="!!batchResult" @click="doBatch">
+          确认下架（删除文件）
         </el-button>
       </template>
     </el-dialog>
@@ -223,15 +231,18 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/utils/request'
 import { useAuthStore } from '@/stores/auth'
+import { useRoute } from 'vue-router'
 
 const auth = useAuthStore()
-const isAdmin = computed(() => auth.user?.role === 'admin')
+const route = useRoute()
+// 货架 v3（11-25 拍板）：管理面由入口决定而非角色——admin 走前台"/artifacts"
+// 与普通用户所见完全一致；仅后台入口"/admin/artifacts"（菜单=货架管理）给管理动作。
+const isAdmin = computed(() => auth.user?.role === 'admin' && route.path.startsWith('/admin/'))
 // 简化拍板①（11-06）：驳回/下架全部=require_admin（任意管理员）；
 // restore/ledger 后端仍 require_preset_admin（应急后门未上 UI）——isPreset 随退役钮一同退出前端
 const canManage = computed(() => isAdmin.value)
 
 const KINDS = ['whl', 'tgz', 'rpm', 'binary', 'node_binding', 'so', 'a', 'tool', 'other']
-const tab = ref('shelf')
 const rows = ref<any[]>([])
 const tableRef = ref<any>(null)
 const total = ref(0)
@@ -239,15 +250,13 @@ const page = ref(1)
 const search = ref('')
 const kind = ref('')
 const systemId = ref<number | ''>('')
+const shelf = ref('')   // 11-25 v3 状态筛选：in/out/ledger
 const loading = ref(false)
-const pendingCount = ref(0)
 const systems = ref<any[]>([])
 const disk = reactive<any>({ data_used_pct: '-', data_free_gb: '-', data_path: '', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
 
 const cur = ref<any>(null)
 const detailVisible = ref(false)
-const rejectVisible = ref(false)
-const rejectReason = ref('')
 const delVisible = ref(false)
 const uploadVisible = ref(false)
 const uploading = ref(false)
@@ -280,25 +289,49 @@ async function doBatchDownload() {
     a.href = URL.createObjectURL(blob)
     a.download = `shelf-batch-${sel.value.length}items.tar.gz`
     a.click(); URL.revokeObjectURL(a.href); ElMessage.success('批量包已开始下载')
+    sel.value.forEach((x) => { x.dl_count = (x.dl_count || 0) + 1 })   // 11-25 就地反映（后端整包已发出即逐件记账）
   } catch (e: any) { ElMessage.error(e?.message || '批量下载失败') }
   finally { batchDl.value = false }
 }
 const batchVisible = ref(false)
-const batchAction = ref<'approve' | 'reject' | 'delete'>('approve')
-const batchReason = ref('批量驳回')
+const batchAction = ref<'delete'>('delete')   // v3：批量仅剩下架
 const batchBusy = ref(false)
 const batchResult = ref<any>(null)
-const batchTitle = computed(() => ({ approve: '批量审批上架', reject: '批量驳回', delete: '批量下架' }[batchAction.value]))
-function openBatch(a: 'approve' | 'reject' | 'delete') {
+const batchTitle = computed(() => '批量下架')
+function openBatch(a: 'delete') {
   batchAction.value = a
   batchResult.value = null
   batchVisible.value = true
+}
+// v3 批量入/出 AI 库（逐件走单件 audience 端点——服务端统一审计/INDEX 重建，
+// 上限 100 件逐发毫秒级，不另造批量端点）
+async function batchAudienceTo(aud: 'both' | 'human') {
+  batchBusy.value = true
+  try {
+    let okN = 0
+    for (const x of sel.value) {
+      await api.post(`/admin/artifacts/${x.id}/audience`, new URLSearchParams({ audience: aud }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+      okN++
+    }
+    ElMessage.success(`已${aud === 'both' ? '移入' : '移出'} AI 复用库 ${okN} 件`)
+    load()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '批量操作失败') }
+  finally { batchBusy.value = false }
+}
+async function setAudience(row: any, aud: 'both' | 'human') {
+  try {
+    await api.post(`/admin/artifacts/${row.id}/audience`, new URLSearchParams({ audience: aud }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+    ElMessage.success(aud === 'both' ? '已移入 AI 复用库（后续任务可自动取用）' : '已移出 AI 复用库（人下载不受影响）')
+    load()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '操作失败') }
 }
 async function doBatch() {
   batchBusy.value = true
   try {
     const r: any = await api.post(`/admin/artifacts/batch-${batchAction.value}`, {
-      ids: sel.value.map((x) => x.id), reason: batchReason.value,
+      ids: sel.value.map((x) => x.id),
     })
     batchResult.value = r?.data ?? { ok: [], failed: [] }
     ElMessage.success(r?.message || '批量完成')
@@ -333,7 +366,17 @@ function fmtLibs(raw: string) {
     return Array.isArray(a) && a.length ? a.join('  ') : '未记录（whl/node 类可省）'
   } catch { return raw.slice(0, 80) }
 }
-function showDetail(row: any) { cur.value = row; detailVisible.value = true }
+function showDetail(row: any) { cur.value = row; curAudience.value = (row.audience || 'both') === 'ai' ? 'both' : (row.audience || 'both'); detailVisible.value = true }
+const curAudience = ref('both')
+async function saveAudience() {
+  try {
+    await api.post(`/admin/artifacts/${cur.value.id}/audience`,
+      new URLSearchParams({ audience: curAudience.value }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+    ElMessage.success('用途已更新（两边视图即时生效）')
+    load()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '更新失败'); curAudience.value = cur.value.audience || 'both' }
+}
 
 async function doDownload(row: any) {
   // 与任务产物下载同姿势：fetch+blob 带 JWT，后端人话（410 灭失/404 不在架）透传
@@ -355,6 +398,7 @@ async function doDownload(row: any) {
       ? row.name : `${row.name_norm}-${row.name}`
     a.click()
     URL.revokeObjectURL(url)
+    row.dl_count = (row.dl_count || 0) + 1   // 11-25：下载即走 blob，就地 +1 免整表刷新
   } catch (e: any) { ElMessage.error(e?.message || '下载失败') }
 }
 
@@ -362,7 +406,7 @@ async function load() {
   loading.value = true
   try {
     if (!isAdmin.value) {
-      // 普通用户：公开端点（服务端 SQL 钉死仅在架件；无 status 入口、无 pending/账本概念）
+      // 用户前台（含 admin 走前台入口）：公开端点，服务端钉死仅在架件
       const params: any = { page: page.value, page_size: 20 }
       if (search.value) params.search = search.value
       if (source.value) params.source = source.value
@@ -380,17 +424,14 @@ async function load() {
     if (source.value) params.source = source.value
     if (kind.value) params.kind = kind.value
     if (systemId.value) params.system_id = systemId.value
-    // 简化后仅剩两 tab，状态恒有——include_deleted 参数面退役（墓碑行查询不再暴露 UI）
-    params.status = tab.value === 'shelf' ? 'approved' : 'pending' 
+    // 货架 v3：后台单表=在架件（墓碑行查询不暴露 UI 的旧拍板不变）
+    params.status = 'approved'
+    if (shelf.value) params.shelf = shelf.value
     const t: any = await api.get('/admin/artifacts', { params })
     const d = t?.data || t || {}          // 拦截器返回 ApiResponse 整包，取 .data（平台惯例同 SkillLib）
     rows.value = d.items || []
     sources.value = d.sources || sources.value
     total.value = d.total || 0
-    if (tab.value !== 'pending') {
-      const p: any = await api.get('/admin/artifacts', { params: { page: 1, page_size: 1, status: 'pending' } })
-      pendingCount.value = (p?.data || p)?.total || 0
-    }
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '加载失败') }
   finally { loading.value = false }
 }
@@ -408,22 +449,6 @@ async function loadSystems() {
   } catch { systems.value = [] }
 }
 
-async function doApprove(row: any) {
-  try {
-    await api.post(`/admin/artifacts/${row.id}/approve`)
-    ElMessage.success('已晋升上架（后续任务可见可复用）')
-    load(); loadDisk()
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '审批失败') }
-}
-function openReject(row: any) { cur.value = row; rejectReason.value = ''; rejectVisible.value = true }
-async function doReject() {
-  try {
-    await api.post(`/admin/artifacts/${cur.value.id}/reject`, new URLSearchParams({ reason: rejectReason.value }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
-    ElMessage.success('已驳回（理由留痕）')
-    rejectVisible.value = false; load()
-  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '驳回失败') }
-}
 function openDelete(row: any) { cur.value = row; delVisible.value = true }
 async function doDelete() {
   try {
@@ -497,4 +522,10 @@ onMounted(() => { loadSystems(); load(); loadDisk() })
 .tip { color: var(--el-text-color-secondary); font-size: 12px; margin: 4px 0; }
 .unk { color: var(--el-color-warning); }
 .tab-badge { margin-left: 6px; }
+/* 详情弹框（11-25 用户报"左列太短拉特别长"）：标签列定宽，内容列自适应换行 */
+.detail-desc :deep(.el-descriptions__cell.el-descriptions__label) { width: 150px; min-width: 150px; }
+.detail-desc :deep(.el-descriptions__content) { word-break: break-word; }
+/* 操作列单行排齐（截图复验：文字钮默认 12px 间距致四钮折两行、行高不齐） */
+:deep(.ops-col .cell) { white-space: nowrap; overflow: visible; }
+:deep(.ops-col .el-button + .el-button) { margin-left: 4px; }
 </style>

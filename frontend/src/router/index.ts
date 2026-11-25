@@ -71,11 +71,18 @@ const router = createRouter({
       meta: { requiresAuth: true, role: 'admin' }
     },
     {
+      // 用户前台入口（admin 从这进=与用户同视图；v3 拍板：管理动作只在后台面）
+      path: '/artifacts',
+      name: 'shelf',
+      component: () => import('@/views/admin/ArtifactLib.vue'),
+      meta: { requiresAuth: true }
+    },
+    {
+      // 管理员后台：AI 库入选/下架/上传/对账（v3 管理动作面，role=admin）
       path: '/admin/artifacts',
       name: 'artifactlib',
       component: () => import('@/views/admin/ArtifactLib.vue'),
-      // 拍板6：产物库全体登录用户可见可查（管理动作页内按角色控制）——role 不设
-      meta: { requiresAuth: true }
+      meta: { requiresAuth: true, role: 'admin' }
     },
     {
       path: '/admin/systems',

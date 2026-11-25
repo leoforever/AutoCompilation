@@ -151,6 +151,7 @@ class ArtifactIndex(Base):
     kind = Column(String(20), default="other")          # whl/tgz/rpm/binary/node_binding/so/a/tool
     origin = Column(String(10), default="task")         # task=晋升 | upload=管理员
     status = Column(String(12), default="")             # pending|approved|rejected|""
+    audience = Column(String(8), default="both")        # 货架v2 用途：both=人+AI / ai=仅供复用 / human=仅供下载；""存量=both 语义
     source_task_id = Column(Integer, nullable=True)
     source_task_key = Column(String(50), default="")
     uploader = Column(String(50), default="")
@@ -162,6 +163,9 @@ class ArtifactIndex(Base):
     runtime_env = Column(Text, default="")            # meta.runtime_libs JSON（运行期共享库需求，RUN.md 同源；货架展示+复用预检）
     hits = Column(Integer, default=0)
     views = Column(Integer, default=0)               # 查阅计数（cat/ls/tar -t；与 hits=消费分开，11-04 拍板）
+    # 人气账（11-25 拍板）：人下载次数——与 hits/views"机器账"严格分列，互不掺水
+    dl_count = Column(Integer, default=0)
+    dl_last_at = Column(DateTime, nullable=True)
     last_used_at = Column(DateTime, nullable=True)
     source_commit = Column(String(64), default="")   # 身份钉①：产出货的源码 commit（晋升自 state）
     sha256 = Column(String(64), default="")          # 身份钉②：平台自算文件指纹（不信 AI 自报；审批复核）
@@ -460,6 +464,11 @@ def ensure_stage5_phase_columns():
     _safe_add_column("compile_tasks", "verified_ok", "BOOLEAN DEFAULT FALSE")
     _safe_add_column("compile_tasks", "artifact_partial", "BOOLEAN DEFAULT FALSE")
     _safe_add_column("compile_tasks", "phase_state", "TEXT")
+    # 货架 v2（11-25）：用途列，DEFAULT 'both'=存量/上传行为逐字不变（设计档 §2）
+    _safe_add_column("artifact_index", "audience", "VARCHAR(8) NOT NULL DEFAULT 'both'")
+    # 下载统计（11-25）：幂等两列，存量=0 次无需回填
+    _safe_add_column("artifact_index", "dl_count", "INTEGER DEFAULT 0")
+    _safe_add_column("artifact_index", "dl_last_at", "TIMESTAMP")
 
 
 def _relax_auditlog_user_notnull():

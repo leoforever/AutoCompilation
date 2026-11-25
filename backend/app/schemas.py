@@ -83,6 +83,7 @@ class ArtifactBatchRequest(BaseModel):
     """货架批量操作（11-06 拍板：pending 积压逐件点之痛）。上限 100 防误刷大事务面。"""
     ids: List[int]
     reason: str = "批量驳回"      # reject 用
+    audience: str = "both"        # 货架v2：approve 用（both/ai/human 三去向）
     purge: bool = False           # delete 用；前端预览默认不勾
 
 

@@ -2714,18 +2714,29 @@ async def list_artifacts(
     system_id: int | None = None,
     kind: str = "",
     status: str = "",
+    shelf: str = "",
     source: str = "",
     include_deleted: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),        # 拍板6：全体登录用户可查
 ):
     """货架账本查询：pending/approved/存量/上传全在一页筛；软删行默认隐藏。
-    source=任务号 精确筛该来源上架件；source=upload 筛全部上传件（11-06 来源聚合）。"""
+    source=任务号 精确筛该来源上架件；source=upload 筛全部上传件（11-06 来源聚合）。
+    shelf（11-25 v3 状态筛选，语义与列表徽标一一对应）：
+      in=在架·已入选 / out=在架·未入选 / ledger=仅账本（approved 无池路径）。"""
     from app.models import ArtifactIndex
     from sqlalchemy import or_
     q = db.query(ArtifactIndex)
     if not include_deleted:
         q = q.filter(ArtifactIndex.deleted_at.is_(None))
+    if shelf == "in":
+        q = q.filter(ArtifactIndex.status == "approved", ArtifactIndex.cache_path != "",
+                     ArtifactIndex.audience == "both")
+    elif shelf == "out":
+        q = q.filter(ArtifactIndex.status == "approved", ArtifactIndex.cache_path != "",
+                     or_(ArtifactIndex.audience != "both", ArtifactIndex.audience.is_(None)))
+    elif shelf == "ledger":
+        q = q.filter(ArtifactIndex.status == "approved", ArtifactIndex.cache_path == "")
     if source == "upload":
         q = q.filter(ArtifactIndex.origin == "upload")
     elif source:
@@ -2742,14 +2753,27 @@ async def list_artifacts(
         q = q.filter(ArtifactIndex.status == status)
     total = q.count()
     rows = q.order_by(ArtifactIndex.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    # 11-25：批量带源码仓库信息（详情"git 地址+分支"行）——仅 git 型任务；
+    # 本页一次 IN 查询，不逐行 JOIN
+    from app.models import CompileTask
+    _tids = sorted({r.source_task_id for r in rows if r.source_task_id})
+    _src = {}
+    if _tids:
+        for t in db.query(CompileTask).filter(CompileTask.id.in_(_tids)).all():
+            if (t.source_type or "") == "git" and t.git_url:
+                _src[t.id] = {"url": t.git_url, "branch": t.git_branch or ""}
     from app.services.artifact_lib import shelf_sources
     _sources = shelf_sources(db)   # 在架来源全集（不受分页影响）
     return ApiResponse(data={"total": total, "sources": _sources, "items": [{
         "id": r.id, "name": r.name, "name_norm": r.name_norm, "version": r.version,
         "system_id": r.system_id, "kind": r.kind, "origin": r.origin, "status": r.status,
+        "audience": r.audience or "both",   # 货架v2：管理页用途下拉用
+        "git_src": _src.get(r.source_task_id),   # None=非git来源（upload/archive/存量）
         "source_task_key": r.source_task_key, "uploader": r.uploader, "build_env": r.build_env,
         "image": r.image, "cache_path": r.cache_path, "size_bytes": r.size_bytes,
-        "hits": r.hits, "views": r.views, "source_commit": r.source_commit,
+        "hits": r.hits, "views": r.views, "dl_count": r.dl_count or 0,
+        "dl_last_at": r.dl_last_at,
+        "source_commit": r.source_commit,
         "glibc_requires": r.glibc_requires, "sha256": r.sha256,
         "runtime_env": r.runtime_env,
         "last_used_at": r.last_used_at, "note": r.note,
@@ -2854,10 +2878,12 @@ async def upload_artifact(
 @router.post("/artifacts/{artifact_db_id}/approve", response_model=ApiResponse)
 async def approve_artifact(
     artifact_db_id: int, request: Request,
+    audience: str = Form("both"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """晋升审批（拍板5）：pending 件 move 进货架 + INDEX 重生成。"""
+    """晋升审批（拍板5；货架v2 三去向）：pending 件 move 进货架 + INDEX 重生成。
+    audience：both=人+AI / ai=仅供复用 / human=仅供下载（默认 both=旧行为逐字不变）。"""
     from app.models import ArtifactIndex
     from app.services.artifact_lib import approve_row
     row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
@@ -2865,16 +2891,47 @@ async def approve_artifact(
     if not row:
         raise HTTPException(status_code=404, detail="账本行不存在")
     try:
-        rel = approve_row(db, row, current_user.user_id)
+        rel = approve_row(db, row, current_user.user_id, audience=audience)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     log_audit(db, user_id=current_user.user_id, action="artifact_promoted",
               target_type="artifact", target_id=row.id, target_key=row.name, request=request,
-              details=f"from_task={row.source_task_key},path={rel}")
+              details=f"from_task={row.source_task_key},path={rel},audience={audience}")
     db.commit()
-    return ApiResponse(data={"cache_path": rel}, message="已晋升上架")
+    return ApiResponse(data={"cache_path": rel, "audience": audience}, message="已晋升上架")
+
+
+@router.post("/artifacts/{artifact_db_id}/audience", response_model=ApiResponse)
+async def set_artifact_audience(
+    artifact_db_id: int, request: Request,
+    audience: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """货架 v3 核心开关：在架件进/出 AI 复用库，即时生效（INDEX 重建+
+    硬链接视图每任务重建天然跟上），审计留痕。
+    v3 语义：both=在货架+在AI库 / human=只在货架（默认，编译自动上架即此态）；
+    旧值 ai（仅供复用）自 v3 起不再由 UI 产生，传入时按 both 处理（兼容）。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import regenerate_index
+    if audience == "ai":
+        audience = "both"   # v3 兼容：旧"仅供复用"并入"在AI库"
+    if audience not in ("both", "human"):
+        raise HTTPException(status_code=400, detail="用途仅 both(进AI库)/human(移出) 二选一")
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_(None)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="账本行不存在")
+    old = row.audience or "both"
+    row.audience = audience
+    regenerate_index(db, row.system_id)   # 池 INDEX 即时重生成（AI 侧立竿见影）
+    log_audit(db, user_id=current_user.user_id, action="artifact_audience_changed",
+              target_type="artifact", target_id=row.id, target_key=row.name, request=request,
+              details=f"{old}→{audience}")
+    db.commit()
+    return ApiResponse(message="用途已更新")
 
 
 @router.post("/artifacts/{artifact_db_id}/reject", response_model=ApiResponse)
@@ -2940,6 +2997,7 @@ async def batch_approve_artifacts(
     审计双落：逐件 artifact_promoted（口径同单件）+ 一条 artifact_batch 总账。"""
     from app.models import ArtifactIndex
     from app.services.artifact_lib import approve_row
+    _aud = body.audience if body.audience in ("both", "ai", "human") else "both"
     ok, failed = [], []
     for i in body.ids[:100]:
         row = db.query(ArtifactIndex).filter(ArtifactIndex.id == i,
@@ -2948,10 +3006,10 @@ async def batch_approve_artifacts(
             failed.append({"id": i, "name": "", "why": "账本行不存在或已删除"})
             continue
         try:
-            rel = approve_row(db, row, current_user.user_id)
+            rel = approve_row(db, row, current_user.user_id, audience=_aud)
             log_audit(db, user_id=current_user.user_id, action="artifact_promoted",
                       target_type="artifact", target_id=row.id, target_key=row.name,
-                      request=request, details=f"batch,from_task={row.source_task_key},path={rel}")
+                      request=request, details=f"batch,from_task={row.source_task_key},path={rel},audience={_aud}")
             db.commit()
             ok.append({"id": row.id, "name": row.name})
         except (FileNotFoundError, ValueError) as e:

@@ -81,6 +81,19 @@ async def lifespan(app: FastAPI):
     from app.services import agent_compat
     _align_uvicorn_log_format()   # 11-25 U3：此刻 uvicorn handler 已装配，挂同款 formatter
     agent_compat.install()   # 11-23 网关溢出文案识别补丁（须在首个 agent 前）
+    # 货架 v3（11-25 拍板）：存量 pending 一次性自动上架（幂等，迁毕即 no-op）
+    try:
+        from app.models import SessionLocal as _SL
+        from app.services.artifact_lib import migrate_shelf_v3
+        _db = _SL()
+        try:
+            _n = migrate_shelf_v3(_db)
+            if _n:
+                logger.info("[lifespan] 货架v3 迁移：%d 件存量 pending 已自动上架", _n)
+        finally:
+            _db.close()
+    except Exception as _me:
+        logger.warning("[lifespan] 货架v3 迁移跳过: %s", _me)
 
     import uuid as _uuid
     import os as _os
