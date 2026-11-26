@@ -4,7 +4,9 @@ type: layer1-infra
 description: |
   autotools/configure 系项目在龙芯上构建的通用病与通用药。以下场景读这条：
   configure 报 cannot guess build type / unrecognised host，config.guess 太老，
-  老项目交叉编译识别不出 loongarch64，autogen.sh/autoreconf 报错。
+  老项目交叉编译识别不出 loongarch64，autogen.sh/autoreconf 报错；
+  超大型构建系统（gbuild 类）关功能开关后报 used LinkTarget not defined、
+  链接报 undefined inflate*/静态库缺符号、configure 探到旧 JDK（alternatives 骗）。
 allowed-tools: [execute, read_file]
 ---
 
@@ -56,3 +58,21 @@ loongarch64)  ARCH_CFLAGS="-march=la64v1.0" ;;   # 先保 configure 通过
 ## 别做的事
 - 别 patch configure 主脚本硬编码 triplet（升级一次全丢）；
 - 别用假参数强行跳过 host 检查——host 认错了编出废件。
+
+## 巨型构建系统的三条纪律（11-26 libreoffice 26.2 案实测，适用一切 gbuild/大 autotools 工程）
+1. **瘦身开关先核"两处条件一致"**：`--disable-X` 敢不敢用，取决于该库在
+   注册处（如 Repository.mk 的 optionals）与引用处（mergedlist/下游
+   use_libraries）**两处的条件是否同一个**。只有一处带条件=上游没测过的
+   组合，关了必断，症状是全局 `used LinkTarget libXXX.so not defined`。
+   LO 实测不能关：xmlhelp / database-connectivity / cairo-canvas。
+   纪律：开关**逐个单独验证**，别一次裁七个再回头大海捞针。
+2. **`-Wl,-z,defs` 缺符号排查法**：undefined 来自内部静态库（如 libcdr.a
+   引 inflate*）→ 用 `make -f <构建入口> verbose=T <目标.so>` 打真实链接行，
+   看 --start-group 段里缺不缺 `-lz`；缺了查该 Library mk 的 use_externals
+   列表，**对照兄弟 mk**（LO 案：wpftwriter 有 zlib、draw/calc/impress 漏——
+   即上游 bug）。注意动态 NEEDED 不算数（libpng.so NEEDED libz 不会把
+   inflate 带进链接）。
+3. **alternatives 骗探测**：多 JDK/多 python 共存镜像里裸 `java` 可能指旧版，
+   configure 显示"found"但版本不对（LO 探到 1.8 只给 WARNING 不报错）。
+   显式 `--with-jdk-home=<路径>` 并在 configure 输出里**核对版本号字样**
+   （"found ... (JDK 17.0.17)"）才算过。

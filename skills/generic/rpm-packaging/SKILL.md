@@ -22,7 +22,9 @@ allowed-tools: [execute, read_file]
 1. **`_install_langs` 空宏**：症状
    `error: /etc/rpm/macros.image-language-conf: line 1: Macro %_install_langs has empty body`。
    根因是容器镜像里该文件写成了 `%_install_langs `（空值），影响所有 rpm 命令。
-   规避：命令行加 `--define "_install_langs %{nil}"`。
+   规避：命令行加 `--define "_install_langs %_null"`。
+   ⚠ 传 `%{nil}` 无效（11-26 libreoffice 案实测勘误，旧口径纠错）：`%{nil}` 本身
+   就展开成空 → rpm 照样报 empty body；`%_null` 才是 rpm 内建的非空"空值宏"。
    ⚠ 别试 spec 里 `%undef _install_langs`——rpm 报 `Unknown tag`，实测无效（lsx 案取证）。
 2. **debug_package 缺 gdb**：症状 `gdb-add-index: gdb: command not found`。
    Loongnix/openEuler 镜像默认启用 debuginfo 子包并调 gdb 建索引，构建镜像通常无 gdb。
@@ -105,6 +107,18 @@ rpm -q --whatprovides 'libc.so.6(GLIBC_2.36)(64bit)'
 ## 发行版包名差异速查
 - openEuler 24.03 系：`audit-libs-devel` 不存在，包名 **`audit-devel`**
   （Loongnix Server 23.x 用 audit-libs-devel）；dnf 报 No match 先互为镜像找一遍。
+
+## Loongnix 特有 BRP：check-desktop-files（11-26 libreoffice 案实测）
+Loongnix 的 `/usr/lib/rpm/loongnix/macros` 在 `%__os_install_post` 挂了自家
+`check-desktop-files`（Fedora/openEuler 没有这条），对 buildroot 里的 .desktop 直接跑
+desktop-file-validate——**不认 `dont_check_desktop_files` 宏**（上游想靠它跳过，实测无效）。
+症状：`file does not exist → Validating <...> failed! → Bad exit status (%install)`，
+多发于 spec 只放"指向 /opt 的符号链接 .desktop"的包（LO freedesktop-menus 即此）。
+正解：rpmbuild 追加 `--define "__brp_check_desktop_files %nil"`——只关这一条 BRP，
+strip/压缩/rpath 全保留。⚠ 别抄 `--define "__spec_install_post %nil"`：那是全关，
+debuginfo/strip 一起没，产物失真。验证姿势：先写最小 spec（一个悬空 .desktop 链接）
+rpmbuild 复现失败/加 define 成功，再落到构建系统调用处。
+openEuler 上无此坑，别白加。
 
 ## 别做的事
 - 不为消 debuginfo 报错去装 gdb（改 spec 一行 vs 动镜像）；
