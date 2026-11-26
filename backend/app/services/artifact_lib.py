@@ -269,6 +269,22 @@ def collect_promotables(cache_out: Path, system_id: int) -> tuple[list[dict], li
     return out, rejects
 
 
+# ── 货架列排序（11-26）：白名单映射，排序字段绝不裸拼；次级键恒 id desc
+#    保证并列值（大量 dl=0）翻页稳定不重不漏。非法 sort_by 回调用方默认。
+_SHELF_SORT_COLS = {"dl": "dl_count", "hits": "hits", "views": "views",
+                    "size": "size_bytes", "created": "created_at",
+                    "name": "name", "name_norm": "name_norm"}
+
+
+def shelf_sort_order(sort_by: str, order: str, model, default):
+    col = _SHELF_SORT_COLS.get((sort_by or "").strip())
+    if col is None:
+        return [default]
+    expr = getattr(model, col)
+    primary = expr.asc() if (order or "").strip() == "asc" else expr.desc()
+    return [primary, model.id.desc()]
+
+
 # ── INDEX.md（动态查库入口，平台生成；总设计 增补A）─────────────────
 # 货架 v2 谓词：AI 侧（INDEX/摘要/挂载视图）只收 audience∉{human}；
 # 空串=存量行（迁移默认 both 前也不该漏件），语义并入 both。

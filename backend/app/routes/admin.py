@@ -2717,6 +2717,8 @@ async def list_artifacts(
     status: str = "",
     shelf: str = "",
     idle_days: int = 0,
+    sort_by: str = "",
+    order: str = "",
     source: str = "",
     include_deleted: bool = False,
     db: Session = Depends(get_db),
@@ -2727,6 +2729,7 @@ async def list_artifacts(
     shelf（11-25 v3 状态筛选，语义与列表徽标一一对应）：
       in=在架·已入选 / out=在架·未入选 / ledger=仅账本（approved 无池路径）。"""
     from app.models import ArtifactIndex
+    from app.services.artifact_lib import shelf_sort_order
     from sqlalchemy import or_, and_
     q = db.query(ArtifactIndex)
     if not include_deleted:
@@ -2774,7 +2777,9 @@ async def list_artifacts(
         _idle_stat = q.with_entities(
             _fs.count(ArtifactIndex.id),
             _fs.coalesce(_fs.sum(ArtifactIndex.size_bytes), 0)).one()
-    rows = q.order_by(ArtifactIndex.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    rows = q.order_by(*shelf_sort_order(sort_by, order, ArtifactIndex,
+                                        default=ArtifactIndex.id.desc())
+    ).offset((page - 1) * page_size).limit(page_size).all()
     # 11-25：批量带源码仓库信息（详情"git 地址+分支"行）——仅 git 型任务；
     # 本页一次 IN 查询，不逐行 JOIN
     from app.models import CompileTask

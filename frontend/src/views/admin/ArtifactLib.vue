@@ -4,7 +4,7 @@
          （11-04 实报：loadDisk 曾无条件打 /admin/disk 触发 403"无权访问"弹提示） -->
     <el-card v-if="isAdmin" shadow="never" class="disk-card">
       <div class="disk-row">
-        <span>数据盘已用 <b>{{ disk.data_used_pct }}%</b>（剩 {{ disk.data_free_gb }}GB，警戒线 {{ disk.warn_pct }}%）<span class="hint-dim" style="margin-left:6px">{{ disk.data_path }}</span></span>
+        <span>数据盘已用 <b>{{ disk.data_used_pct }}%</b>（剩 {{ disk.data_free_gb }}GB，警戒线 {{ disk.warn_pct }}%）</span>
         <el-divider direction="vertical" />
         <span>在架货架 <b>{{ disk.shelf_count }}</b> 件 / {{ disk.cache_mb }}MB（账本口径）</span>
         <el-tag v-if="disk.warn" type="warning" size="small" style="margin-left:10px">接近警戒线：请在本页决定去留（平台不会自动删货架）</el-tag>
@@ -59,11 +59,11 @@
     </div>
 
     <el-table ref="tableRef" :data="rows" v-loading="loading" size="small" border
-              @selection-change="(v: any[]) => sel = v">
+              @selection-change="(v: any[]) => sel = v" @sort-change="onSortChange">
       <el-table-column type="selection" width="42" />
       <el-table-column type="index" label="#" width="52" />
-      <el-table-column prop="name" label="文件名" :min-width="isAdmin ? 150 : 220" show-overflow-tooltip />
-      <el-table-column prop="name_norm" label="软件名" :width="isAdmin ? 205 : undefined" :min-width="isAdmin ? undefined : 170" show-overflow-tooltip />
+      <el-table-column prop="name" label="文件名" :min-width="isAdmin ? 75 : 160" sortable="custom" show-overflow-tooltip />
+      <el-table-column prop="name_norm" label="软件名" :width="isAdmin ? 181 : undefined" :min-width="isAdmin ? undefined : 170" show-overflow-tooltip />
       <el-table-column label="系统" :width="isAdmin ? 180 : undefined" :min-width="isAdmin ? undefined : 160" show-overflow-tooltip>
         <template #default="{ row }">
           <el-tag v-if="row.system_id === 0" size="small" type="warning">通用</el-tag>
@@ -71,17 +71,17 @@
         </template>
       </el-table-column>
       <el-table-column prop="kind" label="类型" width="70" />
-      <el-table-column label="大小" width="70">
+      <el-table-column label="大小" prop="size_bytes" width="70" sortable="custom">
         <template #default="{ row }">{{ fmtSize(row.size_bytes) }}</template>
       </el-table-column>
       <!-- 人气账（11-25）：下载次数单列全员可见——人的账；旁边"复用"是机器账，分色不混 -->
-      <el-table-column label="下载" width="58" align="center">
+      <el-table-column label="下载" prop="dl_count" :width="isAdmin ? 100 : 118" align="center" sortable="custom">
         <template #default="{ row }">
           <span v-if="row.dl_count" style="color:var(--el-color-primary)">{{ row.dl_count }}次</span>
           <span v-else class="hint-dim">0次</span>
         </template>
       </el-table-column>
-      <el-table-column v-if="isAdmin" label="复用" width="60" align="center">
+      <el-table-column v-if="isAdmin" label="复用" prop="hits" width="102" align="center" sortable="custom">
         <template #default="{ row }">{{ row.hits }}用/{{ row.views || 0 }}览</template>
       </el-table-column>
       <!-- 11-25 列表瘦身 v3（两向截图取证）：弹性列按面分配——admin 仅文件名吃富余；
@@ -303,6 +303,16 @@ const systemId = ref<number | ''>('')
 const shelf = ref('')   // 11-25 v3 状态筛选：in/out/ledger
 const idleDays = ref<number | ''>('')   // 11-25 沉寂筛选：30/60/90
 const idleStat = ref<any>(null)
+// 11-26 服务端排序（分页下表内排=假排序，必须回源）：prop→后端白名单键
+const sortBy = ref(''); const sortDir = ref('')
+const SORT_KEY: Record<string, string> = {
+  dl_count: 'dl', hits: 'hits', size_bytes: 'size', name: 'name',
+}
+function onSortChange(ev: { prop: string; order: string | null }) {
+  sortBy.value = ev.order ? (SORT_KEY[ev.prop] || '') : ''
+  sortDir.value = ev.order === 'ascending' ? 'asc' : ev.order === 'descending' ? 'desc' : ''
+  page.value = 1; load()
+}
 const loading = ref(false)
 const systems = ref<any[]>([])
 const disk = reactive<any>({ data_used_pct: '-', data_free_gb: '-', data_path: '', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
@@ -489,6 +499,7 @@ async function load() {
       if (source.value) params.source = source.value
       if (kind.value) params.kind = kind.value
       if (systemId.value) params.system_id = systemId.value
+      if (sortBy.value) { params.sort_by = sortBy.value; params.order = sortDir.value }
       const t: any = await api.get('/artifacts', { params })
       const d = t?.data || t || {}
       rows.value = d.items || []
@@ -505,6 +516,7 @@ async function load() {
     params.status = 'approved'
     if (shelf.value) params.shelf = shelf.value
     if (idleDays.value) params.idle_days = idleDays.value
+    if (sortBy.value) { params.sort_by = sortBy.value; params.order = sortDir.value }
     const t: any = await api.get('/admin/artifacts', { params })
     const d = t?.data || t || {}          // 拦截器返回 ApiResponse 整包，取 .data（平台惯例同 SkillLib）
     rows.value = d.items || []
@@ -610,4 +622,6 @@ onMounted(() => { loadSystems(); load(); loadDisk() })
 .dup-group { margin-bottom: 14px; }
 .dup-head { font-size: 13px; margin-bottom: 6px; color: var(--el-text-color-primary); }
 .dup-actions { margin-top: 6px; text-align: right; }
+/* 表头单行（11-26 用户点名"排序按钮别分两行"）：文字+排序箭头不许折 */
+:deep(.el-table th.el-table__cell .cell) { white-space: nowrap; }
 </style>

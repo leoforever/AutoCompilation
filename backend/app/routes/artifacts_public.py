@@ -42,11 +42,15 @@ async def public_list_artifacts(
     system_id: int | None = None,
     kind: str = "",
     source: str = "",
+    sort_by: str = "",
+    order: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """货架公开目录：全员登录可查，仅返回在架件（服务端钉死，无 status 入口）。
-    source 筛选与来源聚合：只回任务号字符串（无用户身份链，不违公开口径）。"""
+    source 筛选与来源聚合：只回任务号字符串（无用户身份链，不违公开口径）。
+    sort_by 白名单复用 admin 的 shelf_sort_order（默认 hits desc=机器账优先）。"""
+    from app.services.artifact_lib import shelf_sort_order
     q = _onshelf_query(db)
     if source == "upload":
         q = q.filter(ArtifactIndex.origin == "upload")
@@ -60,7 +64,8 @@ async def public_list_artifacts(
     if kind:
         q = q.filter(ArtifactIndex.kind == kind)
     total = q.count()
-    rows = (q.order_by(ArtifactIndex.hits.desc(), ArtifactIndex.id.desc())
+    rows = (q.order_by(*shelf_sort_order(sort_by, order, ArtifactIndex,
+                                         default=ArtifactIndex.hits.desc()))
              .offset((page - 1) * page_size).limit(page_size).all())
     from app.services.artifact_lib import shelf_sources
     return ApiResponse(data={"total": total, "sources": shelf_sources(db), "items": [{
