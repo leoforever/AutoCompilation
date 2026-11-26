@@ -18,6 +18,7 @@ from app.schemas import (
     SkillCreate, SkillUpdate, SkillResponse,
     UserPasswordReset, UserAdminCreate, UserAdminUpdate,
     ArtifactBatchRequest,
+    ArtifactDedupeRequest,
     StatsOverview, ApiResponse
 )
 from app.dependencies import get_current_user, require_preset_admin, require_admin
@@ -2715,6 +2716,7 @@ async def list_artifacts(
     kind: str = "",
     status: str = "",
     shelf: str = "",
+    idle_days: int = 0,
     source: str = "",
     include_deleted: bool = False,
     db: Session = Depends(get_db),
@@ -2725,7 +2727,7 @@ async def list_artifacts(
     shelf（11-25 v3 状态筛选，语义与列表徽标一一对应）：
       in=在架·已入选 / out=在架·未入选 / ledger=仅账本（approved 无池路径）。"""
     from app.models import ArtifactIndex
-    from sqlalchemy import or_
+    from sqlalchemy import or_, and_
     q = db.query(ArtifactIndex)
     if not include_deleted:
         q = q.filter(ArtifactIndex.deleted_at.is_(None))
@@ -2737,6 +2739,19 @@ async def list_artifacts(
                      or_(ArtifactIndex.audience != "both", ArtifactIndex.audience.is_(None)))
     elif shelf == "ledger":
         q = q.filter(ArtifactIndex.status == "approved", ArtifactIndex.cache_path == "")
+    if idle_days:
+        # 沉寂筛选（11-25）：上架龄 > N 天 且 三账全零（hits/views/dl 从未
+        # 发生）= 候选——正是"30/60/90 天无复用无浏览无下载"。只列不删，
+        # 生死归管理员（数据治理铁律）。有账但时间戳老的行也算活跃（宁漏勿错杀：
+        # 机器账历史时间戳不可靠，凡被碰过一次就不催删）。
+        cutoff = datetime.utcnow() - timedelta(days=idle_days)
+        from sqlalchemy import func as _fc
+        q = q.filter(
+            ArtifactIndex.created_at < cutoff,
+            _fc.coalesce(ArtifactIndex.hits, 0) == 0,
+            _fc.coalesce(ArtifactIndex.views, 0) == 0,
+            _fc.coalesce(ArtifactIndex.dl_count, 0) == 0,
+        )
     if source == "upload":
         q = q.filter(ArtifactIndex.origin == "upload")
     elif source:
@@ -2752,6 +2767,13 @@ async def list_artifacts(
     if status is not None and status != "":
         q = q.filter(ArtifactIndex.status == status)
     total = q.count()
+    _idle_stat = None
+    if idle_days:
+        # 候选体量回显（删前看省多少）：同筛选条件的 件数+体积 聚合
+        from sqlalchemy import func as _fs
+        _idle_stat = q.with_entities(
+            _fs.count(ArtifactIndex.id),
+            _fs.coalesce(_fs.sum(ArtifactIndex.size_bytes), 0)).one()
     rows = q.order_by(ArtifactIndex.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
     # 11-25：批量带源码仓库信息（详情"git 地址+分支"行）——仅 git 型任务；
     # 本页一次 IN 查询，不逐行 JOIN
@@ -2764,7 +2786,10 @@ async def list_artifacts(
                 _src[t.id] = {"url": t.git_url, "branch": t.git_branch or ""}
     from app.services.artifact_lib import shelf_sources
     _sources = shelf_sources(db)   # 在架来源全集（不受分页影响）
-    return ApiResponse(data={"total": total, "sources": _sources, "items": [{
+    return ApiResponse(data={"total": total, "sources": _sources,
+        "idle_stat": ({"count": _idle_stat[0], "bytes": int(_idle_stat[1] or 0)}
+                      if _idle_stat else None),
+        "items": [{
         "id": r.id, "name": r.name, "name_norm": r.name_norm, "version": r.version,
         "system_id": r.system_id, "kind": r.kind, "origin": r.origin, "status": r.status,
         "audience": r.audience or "both",   # 货架v2：管理页用途下拉用
@@ -2843,6 +2868,20 @@ async def upload_artifact(
         tmp.unlink(missing_ok=True)
         raise
     from datetime import datetime as _dt
+    # ── 去重 D1·上传路（11-25）：管理员上传是有意动作，同 sha 不静默并——409 人话
+    from app.services.artifact_lib import sha256_of as _sha
+    from app.models import ArtifactIndex as _AI
+    up_sha = _sha(dst)
+    twin = db.query(_AI).filter(
+        _AI.system_id == system_id, _AI.sha256 == up_sha, _AI.sha256 != "",
+        _AI.deleted_at.is_(None), _AI.status.in_(("approved", "")),
+        _AI.cache_path != "").first()
+    if twin is not None:
+        dst.unlink(missing_ok=True)
+        dst.with_name(dst.name + ".meta.json").unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail=(
+            f"与货架件 #{twin.id} {twin.name} 内容完全相同（指纹一致）已拦截——"
+            "确需以新名字另上架？先删旧件或用「重复检测」合并后重传"))
     # ── 三层闸·第二层：运行需求机提（objdump/tar 展开实测，不信自报；判不了=空=未知放行+标注）
     from app.services.artifact_lib import extract_glibc_requires
     glibc_req = extract_glibc_requires(dst)
@@ -2854,10 +2893,10 @@ async def upload_artifact(
     dst.with_name(dst.name + ".meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
     row = ArtifactIndex(name=shelf, name_norm=norm, version=version, system_id=system_id,
-                        kind=knd, origin="upload", status="approved",
+                        kind=knd, origin="upload", status="approved", audience="both",
                         uploader=current_user.username,
                         build_env=json.dumps({"note": note[:200]}, ensure_ascii=False),
-                        glibc_requires=glibc_req,
+                        glibc_requires=glibc_req, sha256=up_sha,
                         cache_path=f"{system_id}/{norm}/{shelf}", size_bytes=size, note=note[:290])
     db.add(row)
     # 公共池变更 → 刷新所有系统 INDEX/视图缓存入口（视图每任务重建，这里刷各池 INDEX 无意义；
@@ -2901,6 +2940,95 @@ async def approve_artifact(
               details=f"from_task={row.source_task_key},path={rel},audience={audience}")
     db.commit()
     return ApiResponse(data={"cache_path": rel, "audience": audience}, message="已晋升上架")
+
+
+@router.get("/artifacts/dupes", response_model=ApiResponse)
+async def artifact_dupes(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """重复检测（货架卫生 D2，11-25）：同系统 ∧ 同 sha256 ∧ 未删 分组。
+    只报告不动手——合并归管理员（数据治理铁律）。sha 空/仅指纹历史行不参与。
+    keeper 建议规则（确定性）：文件在盘 > hits 高 > created 早。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import cache_root
+    from sqlalchemy import func
+    dup_keys = db.query(ArtifactIndex.system_id, ArtifactIndex.sha256).filter(
+        ArtifactIndex.deleted_at.is_(None), ArtifactIndex.sha256 != "",
+        ArtifactIndex.sha256.isnot(None)
+    ).group_by(ArtifactIndex.system_id, ArtifactIndex.sha256
+     ).having(func.count(ArtifactIndex.id) > 1).all()
+    groups = []
+    root = cache_root()
+    for sid, sha in dup_keys:
+        rows = db.query(ArtifactIndex).filter(
+            ArtifactIndex.system_id == sid, ArtifactIndex.sha256 == sha,
+            ArtifactIndex.deleted_at.is_(None)
+        ).order_by(ArtifactIndex.created_at.asc()).all()
+        def _ondisk(r):
+            return bool(r.cache_path) and (root / r.cache_path).is_file()
+        keeper = sorted(rows, key=lambda r: (not _ondisk(r), -(r.hits or 0), r.created_at))[0]
+        groups.append({
+            "system_id": sid, "sha256": sha[:16],
+            "keep_suggest": keeper.id,
+            "items": [{"id": r.id, "name": r.name, "name_norm": r.name_norm,
+                       "status": r.status, "origin": r.origin, "hits": r.hits,
+                       "dl_count": r.dl_count or 0, "size_bytes": r.size_bytes,
+                       "on_disk": _ondisk(r), "source_task_key": r.source_task_key,
+                       "created_at": r.created_at} for r in rows],
+        })
+    return ApiResponse(data={"groups": groups})
+
+
+@router.post("/artifacts/dedupe", response_model=ApiResponse)
+async def artifact_dedupe(
+    body: ArtifactDedupeRequest, request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """重复合并（D2）：keep 保留，其余行账并入 + 文件物删 + 软删墓碑。
+    幂等（重复跑只剩 keep）；账（hits/views/dl）一条不丢随槽迁移。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import cache_root, _rm_pair
+    from app.services.audit import log_audit
+    keep = db.query(ArtifactIndex).filter(ArtifactIndex.id == body.keep_id,
+                                          ArtifactIndex.deleted_at.is_(None)).first()
+    if keep is None:
+        raise HTTPException(status_code=404, detail="保留件不存在")
+    merged, freed = [], 0
+    others = db.query(ArtifactIndex).filter(
+        ArtifactIndex.system_id == keep.system_id,
+        ArtifactIndex.sha256 == keep.sha256,
+        ArtifactIndex.sha256 != "",
+        ArtifactIndex.deleted_at.is_(None),
+        ArtifactIndex.id != keep.id,
+    ).all()
+    root = cache_root()
+    for r in others:
+        if r.cache_path:
+            f = root / r.cache_path
+            gone = _rm_pair(f)
+            freed += r.size_bytes or 0
+            if not f.exists():
+                r.cache_path = ""
+            r.note = ((r.note or "") + f" [dedup-merged→#{keep.id};文件已删:{','.join(gone) or '无'}]").strip()[:300]
+        else:
+            r.note = ((r.note or "") + f" [dedup-merged→#{keep.id}]").strip()[:300]
+        keep.hits = (keep.hits or 0) + (r.hits or 0)
+        keep.views = (keep.views or 0) + (r.views or 0)
+        keep.dl_count = (keep.dl_count or 0) + (r.dl_count or 0)
+        r.deleted_at = datetime.utcnow()
+        merged.append(r.id)
+    if not merged:
+        return ApiResponse(data={"merged": []}, message="该组无重复（可能已合并过）")
+    from app.services.artifact_lib import regenerate_index
+    regenerate_index(db, keep.system_id)
+    log_audit(db, user_id=current_user.user_id, action="artifact_deduped",
+              target_type="artifact", target_id=keep.id, target_key=keep.name, request=request,
+              details=f"keep=#{keep.id},merged={merged},freed={freed}")
+    db.commit()
+    return ApiResponse(data={"merged": merged, "freed_bytes": freed},
+                       message=f"已合并 {len(merged)} 件到 #{keep.id}")
 
 
 @router.post("/artifacts/{artifact_db_id}/audience", response_model=ApiResponse)

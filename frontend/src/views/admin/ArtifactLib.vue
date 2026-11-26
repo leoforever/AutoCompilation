@@ -19,6 +19,7 @@
           <el-button v-if="canManage" size="small" type="danger" plain @click="openBatch('delete')">批量下架 {{ sel.length }}</el-button>
         </template>
         <span class="spacer" />
+        <el-button v-if="isAdmin" size="small" @click="openDupes" :loading="dupLoading">重复检测{{ dupCount ? ` (${dupCount})` : '' }}</el-button>
         <el-button v-if="isAdmin" size="small" :loading="reindexing" @click="doReindex">账本对账</el-button>
         <el-button v-if="canManage" type="primary" size="small" @click="uploadVisible = true">上传工具</el-button>
       </div>
@@ -44,6 +45,14 @@
         <el-option value="out" label="在架·未入选" />
         <el-option value="ledger" label="仅账本" />
       </el-select>
+      <!-- 11-25 货架卫生：沉寂筛选（三账全零超 N 天，只列不删） -->
+      <el-select v-if="isAdmin" v-model="idleDays" placeholder="沉寂" clearable style="width: 130px"
+                 @change="page = 1; load()">
+        <el-option :value="30" label="30天无活跃" />
+        <el-option :value="60" label="60天无活跃" />
+        <el-option :value="90" label="90天无活跃" />
+      </el-select>
+      <span v-if="isAdmin && idleStat" class="hint-dim" style="font-size:12px">候选 {{ idleStat.count }} 件 / {{ fmtSize(idleStat.bytes) }}</span>
       <!-- 11-25：批量下载前移到工具条，前台用户同款可用（后端公开端点本就全员同闸） -->
       <el-button v-if="sel.length" size="small" type="primary" plain :loading="batchDl"
                  style="margin-left:8px" @click="doBatchDownload">批量下载 {{ sel.length }}</el-button>
@@ -189,6 +198,47 @@
       </template>
     </el-dialog>
 
+    <!-- 11-25 货架卫生 D2：重复组面板（只报告，合并逐组人拍板） -->
+    <el-dialog v-model="dupVisible" title="重复检测（同系统 · 内容指纹一致）" width="760">
+      <div v-if="!dupGroups.length" class="tip">货架干净——无同系统同内容指纹的重复。</div>
+      <div v-for="g in dupGroups" :key="g.system_id + g.sha256" class="dup-group">
+        <div class="dup-head">
+          <b>{{ g.items[0].name_norm }}</b> · {{ sysName(g.system_id) }} · 指纹 {{ g.sha256 }}… · {{ g.items.length }} 行
+        </div>
+        <el-table :data="g.items" size="small" border>
+          <el-table-column width="46">
+            <template #default="{ row }">
+              <el-radio v-model="g._keep" :value="row.id"><span /></el-radio>
+            </template>
+          </el-table-column>
+          <el-table-column prop="id" label="#" width="56" />
+          <el-table-column prop="name" label="文件名" min-width="180" show-overflow-tooltip />
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag v-if="row.on_disk" type="success" size="small">文件在架</el-tag>
+              <el-tag v-else size="small" type="info">仅账本</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="账" width="120">
+            <template #default="{ row }">{{ row.hits }}用/{{ row.dl_count }}下</template>
+          </el-table-column>
+          <el-table-column label="大小" width="80">
+            <template #default="{ row }">{{ fmtSize(row.size_bytes) }}</template>
+          </el-table-column>
+          <el-table-column label="来源" width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.origin === 'upload' ? '上传' : row.source_task_key }}</template>
+          </el-table-column>
+        </el-table>
+        <div class="dup-actions">
+          <el-button size="small" type="warning" :loading="batchBusy"
+                     :disabled="!canManage" @click="doDedupe(g)">
+            合并 {{ g.items.length - 1 }} 件到所选保留行
+          </el-button>
+        </div>
+      </div>
+      <template #footer><el-button @click="dupVisible = false">关闭</el-button></template>
+    </el-dialog>
+
     <el-dialog v-model="uploadVisible" title="上传工具到复用货架" width="560">
       <el-form label-width="110px">
         <el-form-item label="目标系统">
@@ -251,6 +301,8 @@ const search = ref('')
 const kind = ref('')
 const systemId = ref<number | ''>('')
 const shelf = ref('')   // 11-25 v3 状态筛选：in/out/ledger
+const idleDays = ref<number | ''>('')   // 11-25 沉寂筛选：30/60/90
+const idleStat = ref<any>(null)
 const loading = ref(false)
 const systems = ref<any[]>([])
 const disk = reactive<any>({ data_used_pct: '-', data_free_gb: '-', data_path: '', shelf_count: '-', cache_mb: '-', warn: false, warn_pct: 85 })
@@ -262,6 +314,31 @@ const uploadVisible = ref(false)
 const uploading = ref(false)
 const upPct = ref(0)
 const reindexing = ref(false)
+// 11-25 货架卫生 D2：重复检测面板
+const dupVisible = ref(false)
+const dupLoading = ref(false)
+const dupGroups = ref<any[]>([])
+const dupCount = computed(() => dupGroups.value.length)
+async function openDupes() {
+  dupLoading.value = true
+  try {
+    const r: any = await api.get('/admin/artifacts/dupes')
+    const d = r?.data || r || {}
+    dupGroups.value = (d.groups || []).map((g: any) => ({ ...g, _keep: g.keep_suggest }))
+    dupVisible.value = true
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '检测失败') }
+  finally { dupLoading.value = false }
+}
+async function doDedupe(g: any) {
+  batchBusy.value = true
+  try {
+    const r: any = await api.post('/admin/artifacts/dedupe', { keep_id: g._keep })
+    ElMessage.success(r?.message || '已合并')
+    await openDupes()          // 重扫刷新组列表
+    load(); loadDisk()
+  } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '合并失败') }
+  finally { batchBusy.value = false }
+}
 const sel = ref<any[]>([])
 const source = ref('')
 const sources = ref<string[]>([])
@@ -427,11 +504,13 @@ async function load() {
     // 货架 v3：后台单表=在架件（墓碑行查询不暴露 UI 的旧拍板不变）
     params.status = 'approved'
     if (shelf.value) params.shelf = shelf.value
+    if (idleDays.value) params.idle_days = idleDays.value
     const t: any = await api.get('/admin/artifacts', { params })
     const d = t?.data || t || {}          // 拦截器返回 ApiResponse 整包，取 .data（平台惯例同 SkillLib）
     rows.value = d.items || []
     sources.value = d.sources || sources.value
     total.value = d.total || 0
+    idleStat.value = d.idle_stat || null
   } catch (e: any) { ElMessage.error(e?.response?.data?.detail || '加载失败') }
   finally { loading.value = false }
 }
@@ -528,4 +607,7 @@ onMounted(() => { loadSystems(); load(); loadDisk() })
 /* 操作列单行排齐（截图复验：文字钮默认 12px 间距致四钮折两行、行高不齐） */
 :deep(.ops-col .cell) { white-space: nowrap; overflow: visible; }
 :deep(.ops-col .el-button + .el-button) { margin-left: 4px; }
+.dup-group { margin-bottom: 14px; }
+.dup-head { font-size: 13px; margin-bottom: 6px; color: var(--el-text-color-primary); }
+.dup-actions { margin-top: 6px; text-align: right; }
 </style>

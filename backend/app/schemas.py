@@ -87,6 +87,11 @@ class ArtifactBatchRequest(BaseModel):
     purge: bool = False           # delete 用；前端预览默认不勾
 
 
+class ArtifactDedupeRequest(BaseModel):
+    """重复合并（货架卫生 D2，11-25）：keep_id 保留，同系统同 sha 其余并账软删。"""
+    keep_id: int
+
+
 class TargetSystemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     system_id: int

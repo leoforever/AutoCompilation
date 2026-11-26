@@ -360,6 +360,34 @@ def promote_shelved_row(db, row, audience: str = "human") -> str:
         raise FileNotFoundError(f"待上架文件不在盘：{row.name}")
     if row.sha256 and sha256_of(src) != row.sha256:
         raise ValueError("指纹与入库时不符（文件可能被改动），拒绝上架")
+    # ── 去重 D1（11-25 拍板）：同系统 ∧ 同 sha256 ∧ 文件真在架 = 同一文件铁证
+    #    → 并槽：账并入既有行、新件即弃、本行软删墓碑（复用史随槽迁移，
+    #    同 superseded 姿势）；仅账本行（无文件）不作合并目标——并过去货架
+    #    还是没文件，重复生产留给 D2 面板人判。
+    if row.sha256:
+        twin = None
+        cands = db.query(ArtifactIndex).filter(
+            ArtifactIndex.system_id == row.system_id,
+            ArtifactIndex.sha256 == row.sha256,
+            ArtifactIndex.deleted_at.is_(None),
+            ArtifactIndex.status.in_(("approved", "")),
+            ArtifactIndex.cache_path != "",
+            ArtifactIndex.id != row.id,
+        ).order_by(ArtifactIndex.hits.desc(), ArtifactIndex.created_at.asc()).all()
+        for c in cands:
+            if (cache_root() / c.cache_path).is_file():
+                twin = c
+                break
+        if twin is not None:
+            twin.hits = (twin.hits or 0) + (row.hits or 0)
+            twin.views = (twin.views or 0) + (row.views or 0)
+            twin.dl_count = (twin.dl_count or 0) + (row.dl_count or 0)
+            row.status = "approved"
+            row.deleted_at = datetime.utcnow()
+            row.note = ((row.note or "") + f" [dedup→#{twin.id}]").strip()[:300]
+            src.unlink(missing_ok=True)
+            src.with_name(src.name + ".meta.json").unlink(missing_ok=True)
+            return twin.cache_path
     dst_dir = system_cache_dir(row.system_id) / row.name_norm
     dst_dir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst_dir / row.name))
