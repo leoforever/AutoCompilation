@@ -79,7 +79,7 @@ llm:                          # LLM 调用治理（2026-11-03；设计档 refere
 
 artifact_cache:                 # 产物复用库（总设计 artifact-reuse-master-design-20261103.md）
   enabled: true                 # 关闭=停止晋升与挂载注入（账本页仍可用）
-  promote_kinds: "whl,tgz,rpm,deb,binary,node_binding,so,a,jar"   # 晋升白名单（tool 类走上传通道；deb=11-17 交付矩阵；jar=11-24 nacos 案与 artifact_lib 的 .jar kind 同笔生效，只改一边=白名单拒）
+  promote_kinds: "whl,tgz,rpm,deb,binary,node_binding,so,a,jar,doc"   # 晋升白名单（tool 类走上传通道；deb=11-17 交付矩阵；jar=11-24 nacos 案与 artifact_lib 的 .jar kind 同笔生效，只改一边=白名单拒）
   # 交付矩阵（11-17）：AI 未产系统包且产物为散装 install 树时，stage6 宿主兜底产 .deb/.rpm
   # （拍板②默认开；false=整体关闭，行为回到"只交付原始树"）
   pkg_fallback:

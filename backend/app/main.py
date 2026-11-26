@@ -90,6 +90,10 @@ async def lifespan(app: FastAPI):
             _n = migrate_shelf_v3(_db)
             if _n:
                 logger.info("[lifespan] 货架v3 迁移：%d 件存量 pending 已自动上架", _n)
+            from app.services.artifact_lib import migrate_docs_v1
+            _d = migrate_docs_v1(_db)   # A档存量：仅账本的说明文档补上架（幂等，no-op 快）
+            if _d:
+                logger.info("[lifespan] 文档件迁移：%d 份说明文档已上架", _d)
         finally:
             _db.close()
     except Exception as _me:

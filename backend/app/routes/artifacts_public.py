@@ -197,3 +197,30 @@ def _cleanup_quiet(p: str):
         pass
 
 
+@router.get("/{artifact_db_id}/siblings", response_model=ApiResponse)
+async def artifact_siblings(
+    artifact_db_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """同任务同系统的人侧可见在架件（11-26 C 档：详情"配套文档"区+整组下载
+    的数据源）。同一次编译的包与文档是一组，按任务号聚合最准（name_norm 会
+    因改名漂移）。身份链字段不外泄（同公开口径）。"""
+    from app.models import ArtifactIndex
+    from app.services.artifact_lib import _human_visible
+    row = db.query(ArtifactIndex).filter(ArtifactIndex.id == artifact_db_id,
+                                         ArtifactIndex.deleted_at.is_(None)).first()
+    if not row or row.source_task_id is None:
+        return ApiResponse(data={"items": []})
+    rs = db.query(ArtifactIndex).filter(
+        ArtifactIndex.source_task_id == row.source_task_id,
+        ArtifactIndex.system_id == row.system_id,
+        ArtifactIndex.deleted_at.is_(None),
+        ArtifactIndex.cache_path != "",
+        _human_visible(),
+    ).order_by(ArtifactIndex.kind.desc(), ArtifactIndex.name.asc()).all()
+    return ApiResponse(data={"items": [
+        {"id": r.id, "name": r.name, "kind": r.kind, "size_bytes": r.size_bytes,
+         "dl_count": r.dl_count or 0} for r in rs]})
+
+

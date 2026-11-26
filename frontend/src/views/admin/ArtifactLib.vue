@@ -157,6 +157,18 @@
         </el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="货架路径">{{ cur.cache_path || '（未上架）' }}</el-descriptions-item>
         <el-descriptions-item v-if="isAdmin" label="备注">{{ cur.note || '-' }}</el-descriptions-item>
+        <!-- 11-26 C 档：同任务配套文档 + 整组打包（数据源 siblings 端点） -->
+        <el-descriptions-item v-if="curSibs.filter(x => x.kind === 'doc').length" label="配套文档">
+          <span v-for="d in curSibs.filter(x => x.kind === 'doc')" :key="d.id" style="margin-right:14px">
+            <a href="javascript:;" style="color:var(--el-color-primary)" @click="dlSib(d)">{{ d.name }}</a>
+            <span class="tip"> {{ fmtSize(d.size_bytes) }}</span>
+          </span>
+        </el-descriptions-item>
+        <el-descriptions-item v-if="curSibs.length > 1" label="同任务在架件">
+          <b>{{ curSibs.length }}</b> 件 / {{ fmtSize(curSibs.reduce((s, x) => s + (x.size_bytes || 0), 0)) }}
+          <el-button size="small" type="primary" plain style="margin-left:10px" :loading="sibDl"
+                     @click="dlGroup">整组打包下载</el-button>
+        </el-descriptions-item>
       </el-descriptions>
     </el-dialog>
 
@@ -292,7 +304,7 @@ const isAdmin = computed(() => auth.user?.role === 'admin' && route.path.startsW
 // restore/ledger 后端仍 require_preset_admin（应急后门未上 UI）——isPreset 随退役钮一同退出前端
 const canManage = computed(() => isAdmin.value)
 
-const KINDS = ['whl', 'tgz', 'rpm', 'binary', 'node_binding', 'so', 'a', 'tool', 'other']
+const KINDS = ['whl', 'tgz', 'rpm', 'deb', 'binary', 'node_binding', 'so', 'a', 'jar', 'doc', 'tool', 'other']   // deb/jar 系旧漏（白名单早有），doc=11-26 A 档
 const rows = ref<any[]>([])
 const tableRef = ref<any>(null)
 const total = ref(0)
@@ -453,7 +465,44 @@ function fmtLibs(raw: string) {
     return Array.isArray(a) && a.length ? a.join('  ') : '未记录（whl/node 类可省）'
   } catch { return raw.slice(0, 80) }
 }
-function showDetail(row: any) { cur.value = row; curAudience.value = (row.audience || 'both') === 'ai' ? 'both' : (row.audience || 'both'); detailVisible.value = true }
+function showDetail(row: any) {
+  cur.value = row; curAudience.value = (row.audience || 'both') === 'ai' ? 'both' : (row.audience || 'both')
+  detailVisible.value = true
+  curSibs.value = []          // 11-26 C 档：同任务配套件异步带出（失败静默=不显示该区）
+  api.get(`/artifacts/${row.id}/siblings`).then((r: any) => {
+    curSibs.value = (r?.data || r || {}).items || []
+  }).catch(() => {})
+}
+const curSibs = ref<any[]>([])
+const sibDl = ref(false)
+function dlSib(d: any) {
+  doDownload({ id: d.id, name: d.name, name_norm: d.name, dl_count: d.dl_count })
+}
+async function dlGroup() {
+  if (!curSibs.value.length) return
+  sibDl.value = true
+  try {
+    const token = localStorage.getItem('token') || ''
+    const r = await fetch('/api/artifacts/batch-download', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: curSibs.value.map((x) => x.id) }),
+    })
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`
+      try { msg = (await r.json()).detail || msg } catch { /* 非 JSON 保留码 */ }
+      throw new Error(msg)
+    }
+    const blob = await r.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `${(cur.value?.name_norm || 'group')}-whole-group.tar.gz`
+    a.click(); URL.revokeObjectURL(a.href)
+    ElMessage.success(`整组 ${curSibs.value.length} 件打包开始下载`)
+    load()   // 组内每件 dl_count 已 +1，刷新对齐
+  } catch (e: any) { ElMessage.error(e?.message || '整组下载失败') }
+  finally { sibDl.value = false }
+}
 const curAudience = ref('both')
 async function saveAudience() {
   try {

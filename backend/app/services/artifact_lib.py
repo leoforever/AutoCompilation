@@ -48,7 +48,10 @@ _KIND_BY_EXT = {".whl": "whl", ".tgz": "tgz", ".tar.gz": "tgz", ".tar.xz": "tool
                 # jar=Java 归档 kind（11-24 nacos 案：loongarch 专版 rocksdbjni jar
                 # 被 kind=other 拒晋升；同 deb 教训，promote_kinds 已同笔加 jar）
                 ".deb": "deb", ".so": "so", ".a": "a", ".node": "node_binding",
-                ".jar": "jar"}   # exe 类不列：Linux ELF .exe 由下方 magic 兜底归 binary（保守正确）
+                # doc 类（11-26 A 档）：RUN.md/BUILD_NOTES/PACKAGE.json/patch——
+                # 说明文档随包上货架，AI cat INDEX 即见"这软件有运行说明"。
+                # ⚠ 必须与 config.yaml promote_kinds 的 doc 同笔生效（deb 教训）
+                ".jar": "jar", ".md": "doc", ".patch": "doc"}   # exe 类不列：Linux ELF .exe 由下方 magic 兜底归 binary（保守正确）
 
 
 def kind_of(filename: str, file_path: "str | None" = None) -> str:
@@ -297,6 +300,62 @@ def _human_visible():
     """人侧（公开列表/下载）只收 audience∉{ai}；同理 "" 并入 both。"""
     from app.models import ArtifactIndex
     return ArtifactIndex.audience.isnot(None) & (ArtifactIndex.audience != "ai")
+
+
+def migrate_docs_v1(db) -> int:
+    """A 档存量迁移（11-26，幂等）：账本里"仅账本"态的说明文档行
+    （RUN.md/BUILD_NOTES.md/PACKAGE.json/source-changes.patch）→ 从任务
+    output 树复制进 promote_pending → 走 promote_shelved_row 内核入架。
+    货架名钉 <组名>- 前缀防撞名；组名取同任务包行 name_norm。
+    文件不在盘/指纹变/无包上下文 → 跳过留账本（平台不造货）。"""
+    from app.config import artifacts_dir
+    from app.models import ArtifactIndex
+    rows = db.query(ArtifactIndex).filter(
+        ArtifactIndex.deleted_at.is_(None),
+        ArtifactIndex.cache_path == "",
+        ArtifactIndex.name.in_(tuple(_DOC_FILES.keys())),
+    ).order_by(ArtifactIndex.id.asc()).all()
+    moved = 0
+    for row in rows:
+        tdir = artifacts_dir() / (row.source_task_key or "_none")
+        src = tdir / "artifacts" / "output" / row.name
+        if not src.is_file():
+            continue
+        if row.sha256 and sha256_of(src) != row.sha256:
+            continue                      # 指纹变=留账本人判，不静默上架
+        twins = db.query(ArtifactIndex).filter(
+            ArtifactIndex.source_task_id == row.source_task_id,
+            ArtifactIndex.deleted_at.is_(None),
+            ArtifactIndex.cache_path != "",
+            ArtifactIndex.kind != "doc",
+        ).order_by(ArtifactIndex.size_bytes.desc()).all()
+        if not twins:
+            continue                      # 无包上下文=文档孤儿
+        shelf = f"{twins[0].name_norm}-{row.name}"
+        pend = tdir / "promote_pending"
+        pend.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(pend / shelf))
+        m0 = cache_root() / (twins[0].cache_path + ".meta.json")
+        if m0.is_file():
+            try:
+                mj = json.loads(m0.read_text(encoding="utf-8"))
+                mj["kind"] = "doc"
+                (pend / (shelf + ".meta.json")).write_text(
+                    json.dumps(mj, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+        row.name, row.name_norm, row.kind = shelf, twins[0].name_norm, "doc"
+        row.version = row.version or twins[0].version or ""
+        row.build_env = row.build_env or twins[0].build_env or ""
+        row.note = "A档存量文档迁移"
+        try:
+            promote_shelved_row(db, row)
+            moved += 1
+            db.commit()
+        except Exception:
+            db.rollback()
+            continue
+    return moved
 
 
 def regenerate_index(db, system_id: int) -> str:
@@ -989,6 +1048,52 @@ def flush_hits(db, system_id: int, names: set, views: "set | None" = None) -> in
 
 # ── 期二：晋升提取（货架 v3，11-25 拍板：编译通过即上货架，默认只在货架=human；
 #    进不进 AI 复用库由管理员后台开关——"审批"这道门从人侧整体挪到 AI 侧）────
+_DOC_FILES = {"RUN.md": "RUN.md", "BUILD_NOTES.md": "BUILD_NOTES.md",
+              "PACKAGE.json": "PACKAGE.json", "source-changes.patch": "source-changes.patch"}
+
+
+def _adopt_docs(db, task, cache_out: Path) -> list:
+    """doc 附件随包上架（11-26 A 档）：cache_out/output 顶层的说明文档复制进
+    promote_pending 候选区（复制非搬移——output 树归交付 tar 完整性管），
+    meta 从同目录真包借 toolchain（文档与包同次编译产出，构建上下文一致）。
+    返回 [(file, meta_dict, 原名)]。"""
+    # 容器 /work/output 的宿主机映射 = art_root/artifacts/output
+    out_root = cache_out.parent.parent / "artifacts" / "output"
+    if not out_root.is_dir():
+        return []
+    tc, ver = {}, ""
+    from app.models import ArtifactIndex
+    # 从本任务已上架件借构建上下文（主循环已把 cache_out 搬进池，读池内 meta）
+    src_rows = db.query(ArtifactIndex).filter(
+        ArtifactIndex.source_task_id == task.id, ArtifactIndex.kind != "doc",
+        ArtifactIndex.deleted_at.is_(None), ArtifactIndex.cache_path != "").all()
+    for r0 in src_rows:
+        mp = cache_root() / (r0.cache_path + ".meta.json")
+        m = read_meta(mp) if mp.is_file() else None
+        if isinstance(m, dict) and m.get("toolchain"):
+            tc = m.get("toolchain") or {}
+            ver = m.get("version") or r0.version or ""
+            if any(str(v).strip() for v in tc.values()):
+                break
+    pend_dir = cache_out.parent.parent / "promote_pending"
+    got = []
+    for doc in sorted(out_root.iterdir()):
+        want = _DOC_FILES.get(doc.name)
+        if not want or not doc.is_file():
+            continue
+        if not any(str(v).strip() for v in tc.values()):
+            continue                     # 无包上下文=文档孤儿，留账本待人工
+        pend_dir.mkdir(parents=True, exist_ok=True)
+        dstf = pend_dir / want           # 候选区用原名；最终货架名在循环里钉前缀
+        shutil.copy2(str(doc), str(dstf))
+        meta = {"name": want, "version": ver, "kind": "doc",
+                "toolchain": dict(tc), "runtime_libs": []}
+        dstf.with_name(dstf.name + ".meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        got.append((dstf, meta, want))
+    return got
+
+
 def extract_promotions(db, task, state: dict, art_root) -> tuple[list, list]:
     """返回 (已上架名, 拒收原因)。合格件直接 move 进货架池 + 账本 approved/human；
     同名"新版本赢"去重与 INDEX 重生成沿用 promote_shelved_row；门禁拒收留痕不变。"""
@@ -1044,6 +1149,38 @@ def extract_promotions(db, task, state: dict, art_root) -> tuple[list, list]:
             shutil.move(str(meta_src), str(pend_dir / (it["name"] + ".meta.json")))
         promote_shelved_row(db, row)
         names.append(it["name"])
+    # doc 附件轮（11-26 A 档）：货架名钉 <软件名>- 前缀防撞名（多任务 RUN.md 同坑）；
+    # 与真包同闸同轨（promote_shelved_row 内含 sha 去重/INDEX 重生成）
+    for dstf, meta, orig in _adopt_docs(db, task, cache_out):
+        # name_norm 与包行同键（详情同组/INDEX 聚眼一致），无包行时退 slug
+        _pk = db.query(ArtifactIndex).filter(
+            ArtifactIndex.source_task_id == task.id, ArtifactIndex.kind != "doc",
+            ArtifactIndex.deleted_at.is_(None), ArtifactIndex.cache_path != ""
+        ).order_by(ArtifactIndex.size_bytes.desc()).first()
+        soft = (_pk.name_norm if _pk else "") or \
+            re.sub(r"[^\w.\-+]", "-", (task.software_name or "artifact").strip().lower())[:80]
+        shelf = f"{soft}-{orig}"
+        row = ArtifactIndex(
+            name=shelf, name_norm=soft, version=meta.get("version", ""),
+            system_id=int(state["system_id"]), kind="doc", origin="task", status="pending",
+            audience="human",
+            source_task_id=task.id, source_task_key=task.task_id,
+            build_env=json.dumps(meta.get("toolchain") or {}, ensure_ascii=False),
+            runtime_env="[]", image=state.get("docker_image") or "",
+            size_bytes=dstf.stat().st_size,
+            source_commit=_source_identity(task, state)[:64],
+            sha256=sha256_of(dstf),
+            note="v3自动上架（文档附件）")
+        db.add(row)
+        db.flush()
+        final = dstf.with_name(shelf)
+        if final != dstf:
+            dstf.rename(final)
+            mf = dstf.with_name(dstf.name + ".meta.json")
+            if mf.is_file():
+                mf.rename(final.with_name(final.name + ".meta.json"))
+        promote_shelved_row(db, row)
+        names.append(shelf)
     log_audit(db, user_id=None, action="artifact_shelved", target_type="compile_task",
               target_id=task.id, target_key=task.task_id,
               details=f"自动上架={names},拒收={rejects}")
