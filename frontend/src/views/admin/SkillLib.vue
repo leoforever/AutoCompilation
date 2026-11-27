@@ -46,6 +46,7 @@
           @keyup.enter="loadSkills"
         />
         <el-button type="primary" @click="loadSkills">🔍 查询</el-button>
+        <el-button v-if="sel.length" type="warning" @click="showBulk">批量设置适用系统 {{ sel.length }}</el-button>
         <el-button @click="showTrashDrawer">🗑️ 回收站</el-button>
         <el-button type="primary" @click="showAddDialog">+ 新增 Skill</el-button>
       </div>
@@ -61,7 +62,8 @@
       </el-alert>
 
       <!-- 列表 -->
-      <el-table :data="skills" stripe style="width: 100%" v-loading="loading">
+      <el-table :data="skills" stripe style="width: 100%" v-loading="loading" @selection-change="(v: any[]) => sel = v">
+        <el-table-column type="selection" width="42" />
         <el-table-column type="index" label="#" width="56" />
         <el-table-column label="名称 / 描述" min-width="220">
           <template #default="{ row }">
@@ -149,20 +151,28 @@
           />
         </el-form-item>
         <el-form-item label="适用系统">
+          <!-- 架构×包格式 快捷组（11-27 两维正交：rpm≠龙芯专属，组键=arch|pkg） -->
+          <div class="arch-chips" v-if="archGroups.length">
+            <span class="muted" style="margin-right:6px">快捷：</span>
+            <el-button v-for="g in archGroups" :key="g.key" size="small" plain
+                       :type="groupState(skillForm.system_ids, g)==='full' ? 'primary' : (groupState(skillForm.system_ids, g)==='part' ? 'warning' : 'default')"
+                       @click="skillForm.system_ids = toggleGroup(skillForm.system_ids, g)">
+              {{ g.label }} ×{{ g.ids.length }}
+            </el-button>
+            <el-button size="small" text @click="skillForm.system_ids = []">清空=通用</el-button>
+          </div>
           <el-select
             v-model="skillForm.system_ids"
             multiple
             collapse-tags
             collapse-tags-tooltip
             placeholder="留空表示适用全部系统"
-            style="width:100%"
+            style="width:100%; margin-top:6px"
           >
-            <el-option
-              v-for="s in systems"
-              :key="s.system_id"
-              :label="`${s.name} (${s.arch})`"
-              :value="s.system_id"
-            />
+            <el-option-group v-for="g in archGroups" :key="g.key" :label="g.label">
+              <el-option v-for="s in g.items" :key="s.system_id" :label="s.name" :value="s.system_id" />
+            </el-option-group>
+            <el-option v-for="s in archRest" :key="s.system_id" :label="`${s.name} (${s.arch})`" :value="s.system_id" />
           </el-select>
         </el-form-item>
         <el-form-item label="SKILL.md 内容">
@@ -227,6 +237,37 @@
 
     <!-- 从磁盘导入 Drawer 已被移除：reconcile 在进入页面时自动跑 -->
 
+    <!-- 批量设置适用系统（11-27）：勾中的 N 篇统一赋值，逐篇 PUT 审计留痕 -->
+    <el-dialog v-model="bulkVisible" :title="`批量设置适用系统（${sel.length} 篇）`" width="620">
+      <div class="form-hint" style="margin-bottom:10px">
+        组键=架构×包格式两维（rpm 不等于龙芯专属）；点组=整组并入/整组移出；
+        保存时对每篇各发一次更新（操作日志逐篇可查）。
+      </div>
+      <el-descriptions :column="1" border size="small" style="margin-bottom:12px">
+        <el-descriptions-item label="将应用到的篇目">{{ selNames }}</el-descriptions-item>
+      </el-descriptions>
+      <div class="arch-chips">
+        <span class="muted" style="margin-right:6px">目标：</span>
+        <el-button v-for="g in archGroups" :key="g.key" size="small" plain
+                   :type="groupState(bulkIds, g)==='full' ? 'primary' : (groupState(bulkIds, g)==='part' ? 'warning' : 'default')"
+                   @click="bulkIds = toggleGroup(bulkIds, g)">
+          {{ g.label }} ×{{ g.ids.length }}
+        </el-button>
+        <el-button size="small" text @click="bulkIds = []">清空=通用</el-button>
+      </div>
+      <div style="margin-top:10px">
+        <span class="muted">展开清单：</span>
+        <span v-if="!bulkIds.length" class="muted">空 = 这些篇适用全部系统</span>
+        <template v-else>
+          <el-tag v-for="id in bulkIds" :key="id" size="small" style="margin:2px">{{ sysNameById(id) }}</el-tag>
+        </template>
+      </div>
+      <template #footer>
+        <el-button @click="bulkVisible = false">取消</el-button>
+        <el-button type="primary" :loading="bulkSaving" @click="applyBulk">应用到 {{ sel.length }} 篇</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 回收站 Drawer -->
     <el-drawer
       v-model="trashDrawerVisible"
@@ -277,6 +318,72 @@ import { ElMessage, ElMessageBox, type FormInstance } from 'element-plus'
 // ============ 状态 ============
 const skills = ref<any[]>([])
 const systems = ref<any[]>([])
+const sel = ref<any[]>([])          // 批量勾选行
+
+// 组键 = arch × 包格式（两维正交：x86 也有 rpm、旧世界也有 rpm——11-27）
+const archGroups = computed(() => {
+  const m = new Map<string, { key: string; label: string; ids: number[]; items: any[] }>()
+  for (const s of systems.value) {
+    if (!s.pkg_format) continue
+    const key = `${s.arch || 'loongarch64'}|${s.pkg_format}`
+    if (!m.has(key)) {
+      const [arch, pkg] = key.split("|")
+      m.set(key, { key, label: `${arch} · ${pkg}`, ids: [], items: [] })
+    }
+    const g = m.get(key)!
+    g.ids.push(s.system_id); g.items.push(s)
+  }
+  // ids 恒升序：/admin/systems 返回 created_at desc——不排的话 chip 赋出的
+  // 标签是 [8,7,..] 乱序串，与分类脚本/API 直存的 [1,3,..] 对账口径不齐（11-27）
+  for (const g of m.values()) { g.ids.sort((a, c) => a - c); g.items.sort((a, c) => a.system_id - c.system_id) }
+  return [...m.values()].sort((a, b) => a.key.localeCompare(b.key))
+})
+const archRest = computed(() => systems.value.filter((s) => !s.pkg_format))
+
+// 组三态：full=全勾 part=部分 none=未勾（chip 配色用）
+function groupState(ids: number[], g: { ids: number[] }): "full" | "part" | "none" {
+  const hit = g.ids.filter((x) => ids.includes(x)).length
+  return hit === 0 ? "none" : hit === g.ids.length ? "full" : "part"
+}
+// 点组：未全勾→整组并入；已全勾→整组移出（快捷不霸权，手勾区仍可减）
+// 返回新数组（调用方显式赋值）——不就地 splice：嵌套 ref 数组的代理引用
+// 与模板 v-model 绑定不同源，就地改会"点了没反应"（11-27 实测教训）
+function toggleGroup(target: number[], g: { ids: number[] }): number[] {
+  const st = groupState(target, g)
+  const set = new Set(target)
+  if (st === "full") g.ids.forEach((x) => set.delete(x))
+  else g.ids.forEach((x) => set.add(x))
+  return [...set]
+}
+function sysNameById(id: number) {
+  return systems.value.find((s) => s.system_id === id)?.name || `#${id}`
+}
+
+// 批量设置适用系统
+const bulkVisible = ref(false)
+const bulkIds = ref<number[]>([])
+const bulkSaving = ref(false)
+const selNames = computed(() => sel.value.map((x) => x.name).join("、"))
+function showBulk() {
+  if (!sel.value.length) return
+  bulkIds.value = []          // 默认=通用，需显式挑组——防手滑把大批存量静默限缩
+  bulkVisible.value = true
+}
+async function applyBulk() {
+  bulkSaving.value = true
+  let ok = 0, bad: string[] = []
+  for (const row of sel.value) {
+    try {
+      await api.put(`/admin/skills/${row.skill_id}`, { system_ids: [...bulkIds.value] })
+      ok++
+    } catch { bad.push(row.name) }
+  }
+  bulkSaving.value = false
+  if (bad.length) ElMessage.warning(`成功 ${ok} 篇，失败：${bad.join("、")}`)
+  else ElMessage.success(`已对 ${ok} 篇${bulkIds.value.length ? "勾定 " + bulkIds.value.length + " 个系统" : "设为通用（清空）"}`)
+  bulkVisible.value = false
+  await loadSkills()
+}
 const loading = ref(false)
 const mismatchCount = ref(0)
 const mismatchNames = ref<string[]>([])
@@ -571,6 +678,7 @@ async function permanentDelete(t: any) {
 .desc { font-size: 11.5px; color: var(--text3); max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 
 .form-hint { font-size: 11px; color: var(--text3); margin-top: 2px }
+.arch-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
 
 .md-tabs { width: 100% }
 .md-preview {
