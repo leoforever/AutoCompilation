@@ -102,8 +102,49 @@ def get_skills_paths() -> list[str]:
 
     approve/update/delete skill 后调用一次即可热生效
     性能：rglob 几个文件 < 5ms，可忽略
+
+    ⚠ 返回【层目录】(generic/specific)不是单篇路径——既有契约：
+    DeepAgents SkillsMiddleware 经 backend.ls 从 source 根【递归】
+    发现 SKILL.md，29 篇全在视野内；日志 skills=N 的 N=source 数
+    （11-27 实证，勿误读为篇数）。按系统过滤闸=DockerBackend.ls 的
+    skill_excl 剔除式（本模块 skill_exclusion_paths 供路径）。
     """
     return discover_skill_sources()
+
+
+def skill_exclusion_paths(system_id, container_root: "str | None" = None) -> list[str]:
+    """按目标系统算【应剔除】的 skill 目录容器路径（§九方案 a，11-27）。
+
+    语义：篇的 DB system_ids 非空 ∧ 不含本系统 → 剔除；
+    空数组=通用放行；DB 无行（磁盘新篇未 reconcile）放行——
+    闸门失效模式只允许"经验少一条"，不允许错注入/误杀。
+    system_id 空/非法 → [] （=不过滤，工单/问答台走这路）。
+    返回容器路径（DeepAgents 的 ls 世界）；DockerBackend.ls 按
+    祖先匹配剔除，被剔篇连目录条目都不给 agent。"""
+    if system_id is None or str(system_id).strip() == "":
+        return []
+    try:
+        sid = int(system_id)
+    except (TypeError, ValueError):
+        return []
+    import json as _j
+    from app.models import SessionLocal, Skill
+    excl = []
+    cr = container_root or SKILLS_DIR_CONTAINER
+    pdb = SessionLocal()
+    try:
+        for sk in pdb.query(Skill).filter(Skill.deleted_at.is_(None)).all():
+            raw = str(sk.system_ids or "")
+            try:
+                ids = _j.loads(raw) if raw else []
+            except ValueError:
+                ids = []
+            ids = [int(x) for x in ids if str(x).lstrip("-").isdigit()]
+            if ids and sid not in ids:
+                excl.append(f"{cr}/{sk.type}/{sk.name}")
+    finally:
+        pdb.close()
+    return excl
 
 
 def write_skill_to_disk(skill_type: str, skill_name: str, content: str,

@@ -91,6 +91,12 @@ const router = createRouter({
       meta: { requiresAuth: true, role: 'admin' }
     },
     {
+      path: '/admin/executors',
+      name: 'executors-admin',
+      component: () => import('@/views/admin/Executors.vue'),
+      meta: { requiresAuth: true, role: 'admin' }
+    },
+    {
       path: '/admin/qa',
       name: 'qa-console',
       component: () => import('@/views/admin/QaConsole.vue'),

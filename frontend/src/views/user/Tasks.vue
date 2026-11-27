@@ -25,6 +25,13 @@
         <el-table-column prop="software_name" label="软件" min-width="120" />
         <el-table-column prop="system_name" label="系统" min-width="140" show-overflow-tooltip />
         <el-table-column v-if="auth.isAdmin" prop="username" label="提交人" width="100" show-overflow-tooltip />
+        <el-table-column v-if="auth.isAdmin" label="执行机" width="110" show-overflow-tooltip>
+          <!-- 11-26 多执行机：归属只在派出去时显示，本机/存量=—（低噪声） -->
+          <template #default="{ row }">
+            <span v-if="row.executor_name && !row.executor_name.includes('本机')" class="muted">{{ row.executor_name }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="模式" width="80">
           <template #default="{ row }">
             <el-tag :type="row.compile_mode === 'container' ? 'primary' : 'warning'" size="small">

@@ -180,6 +180,7 @@ const menuItems = computed(() => {
       { id: 'skilllib', ico: '📚', label: '经验库管理' },
       { id: 'artifactlib', ico: '📦', label: '货架管理' },   // v3：与前台"产品复用库"分名分面
       { id: 'systems-admin', ico: '🖥️', label: '目标系统管理' },
+      { id: 'executors-admin', ico: '🐳', label: '编译执行机管理' },
       { id: 'users', ico: '👥', label: '用户权限管理' },
       { id: 'audit-logs', ico: '📋', label: '操作日志审计' },
       { id: 'qa-console', ico: '💬', label: '问答台' },

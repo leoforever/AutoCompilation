@@ -40,13 +40,21 @@ def get_docker_client():
 class DockerBackend(SandboxBackendProtocol):
     """让 DeepAgent 在 Docker 容器内执行命令和操作文件"""
 
-    def __init__(self, container_id: str, work_dir: str, exec_registry: "dict | None" = None):
+    def __init__(self, container_id: str, work_dir: str, exec_registry: "dict | None" = None,
+                 docker_host: str = "", skill_excl: "list[str] | None" = None):
         self.container_id = container_id
         self.work_dir = work_dir
         # T9-U 工单停止功能：活跃 exec 登记簿 {exec_id: {"pid","cmd","started"}}（session 注入，
         # 命令起止进出登记；stop 端点遍历击杀。None=不登记，编译引擎等路径零影响）
         self.exec_registry = exec_registry
-        cli = get_docker_client()
+        # skills 按系统剔除闸（11-27 §九a）：容器路径清单；None/空=不过滤（旧行为）
+        self.skill_excl = [p.rstrip("/") for p in (skill_excl or [])]
+        # 多执行机（11-26）：非空=远程隧道 client；空=本机单例（旧行为逐字不变）
+        if docker_host:
+            from app.services.executor_pool import client_for
+            cli = client_for(docker_host)
+        else:
+            cli = get_docker_client()
         if cli is None:
             raise RuntimeError("Docker 客户端未连接")
         self.container = cli.containers.get(container_id)
@@ -155,6 +163,21 @@ class DockerBackend(SandboxBackendProtocol):
             truncated=(exit_code == -1),
         )
 
+    def _filter_excluded(self, entries: list) -> list:
+        """skills 剔除闸（11-27 §九a，仅 skill_excl 非空时启用）：
+        剔【命中排除项本体或其子孙】的条目；排除项的祖先层目录绝不误剔
+        （excl=/skills/specific/x 时 /skills/specific 本身必须保留，
+        否则整层失明）。纯内存过滤，不碰执行。"""
+        if not self.skill_excl:
+            return entries
+        def keep(p: str) -> bool:
+            p = (p or "").rstrip("/")
+            for x in self.skill_excl:
+                if p == x or p.startswith(x + "/"):
+                    return False
+            return True
+        return [e for e in entries if keep(e.get("path", ""))]
+
     def ls(self, path: str, **kwargs) -> "LsResult":
         rel = path.rstrip("/") or "/"
         output, exit_code = self._exec(
@@ -178,7 +201,7 @@ class DockerBackend(SandboxBackendProtocol):
                 "size": int(size) if size.isdigit() else 0,
                 "modified_at": mtime,
             })
-        return LsResult(entries=entries)
+        return LsResult(entries=self._filter_excluded(entries))
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000, **kwargs) -> "ReadResult":
         wc_out, wc_code = self._exec(f"wc -l < {shlex.quote(file_path)} 2>/dev/null")

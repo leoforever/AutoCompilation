@@ -385,6 +385,13 @@ async def list_compile_tasks(
     # 批量取 system_name（一次 join 查所有 task 的 system_id 对应的 name）
     sys_names = _system_names_for_tasks(db, [t.system_id for t in tasks])
     unames = _usernames_for_tasks(db, [t.user_id for t in tasks])
+    # 11-26 多执行机：派单归属名（一次 IN 查；本机/未派=不显示）
+    _eids = sorted({t.executor_id for t in tasks if getattr(t, "executor_id", 0)})
+    executor_names = {}
+    if _eids:
+        from app.models import Executor
+        executor_names = {e.id: e.name for e in db.query(Executor).filter(
+            Executor.id.in_(_eids)).all()}
 
     return CompileTaskListResponse(
         total=total,
@@ -392,7 +399,9 @@ async def list_compile_tasks(
             CompileTaskResponse(
                 system_name=sys_names.get(t.system_id),
                 username=unames.get(t.user_id),
-                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name", "bundle_size", "username"}),
+                executor_name=(executor_names.get(t.executor_id)
+                               if getattr(t, "executor_id", 0) else None),
+                **CompileTaskResponse.model_validate(t).model_dump(exclude={"system_name", "bundle_size", "username", "executor_name"}),   # executor_name 非 ORM 列，model_dump 出的 None 默认值必须排掉否则双 kwarg（11-27 500 教训）
                 bundle_size=_bundle_size_for(t.task_id),
             )
             for t in tasks
@@ -649,9 +658,21 @@ async def cancel_compile_task(
         try:
             import threading
             from app.services.docker_backend import get_docker_client
+            _ehost = ""   # 11-26 多执行机：远程单杀回归属执行机
+            try:
+                if getattr(task, "executor_id", 0):
+                    from app.models import Executor as _EXk
+                    _ek = db.query(_EXk).filter(_EXk.id == task.executor_id).first()
+                    _ehost = (_ek.docker_host or "") if _ek else ""
+            except Exception:
+                _ehost = ""
             def _stop_container():
                 try:
-                    cli = get_docker_client()
+                    if _ehost:
+                        from app.services.executor_pool import client_for
+                        cli = client_for(_ehost)
+                    else:
+                        cli = get_docker_client()
                     if cli is None:
                         return
                     c = cli.containers.get(task.container_id)

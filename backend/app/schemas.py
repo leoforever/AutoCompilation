@@ -69,6 +69,7 @@ class TargetSystemCreate(BaseModel):
     base_image: str = Field(default="loongnix-build:23.2", min_length=1)
     glibc_version: str = Field(default="", max_length=20)   # 11-05 公共池配给基线（SP2=2.38）
     pkg_format: str = Field(default="", pattern="^(|rpm|deb)$")  # 11-17 交付矩阵（空=未知不过滤）
+    arch: str = Field(default="loongarch64", max_length=20)   # 11-26 多执行机：选机第④硬过滤（默认龙芯=存量零变化）
 
 
 class TargetSystemUpdate(BaseModel):
@@ -76,6 +77,7 @@ class TargetSystemUpdate(BaseModel):
     base_image: Optional[str] = Field(None, min_length=1)
     glibc_version: Optional[str] = Field(None, max_length=20)   # 空串=显式清空基线
     pkg_format: Optional[str] = Field(None, pattern="^(|rpm|deb)$")  # 11-17 交付矩阵
+    arch: Optional[str] = Field(None, max_length=20)
     is_active: Optional[bool]
 
 
@@ -99,6 +101,7 @@ class TargetSystemResponse(BaseModel):
     base_image: str
     glibc_version: str = ""
     pkg_format: str = ""     # 11-17 交付矩阵 rpm/deb/空
+    arch: str = "loongarch64"   # 11-26 多执行机（选机第④硬过滤依据）
     is_active: bool
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -213,6 +216,7 @@ class CompileTaskResponse(BaseModel):
     artifact_partial: bool = False
     phase_state: Optional[str]
     username: Optional[str] = None   # 11-23 任务管理"提交人"列（列表端点批量注入）
+    executor_name: Optional[str] = None   # 11-26 多执行机：派单归属（列表端点批量注入；None=本机）
     llm_stats: List["LlmStatRow"] = []   # 11-23 任务 LLM 用量账（无账=空列表）
 
     @field_validator("depend_tree", mode="before")

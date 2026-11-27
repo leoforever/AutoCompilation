@@ -113,3 +113,6 @@ qa:                           # T16 问答台（一次调用+后台 job+SSE，�
   max_per_day: 30             # 每用户日限额，账本=当日 qa_ask 审计行数（重启不清零）
   history_rounds: 5           # 会话窗口轮数（超从最老丢，保近弃远）
   ttl_minutes: 30             # 会话空闲过期（分钟）
+
+executors:                    # 多执行机池（11-26 设计档 §三/§五注）
+  cooldown_minutes: 10        # 派失败/心跳不可达冷却时长（到期自动回池；面板 ping 提前回）

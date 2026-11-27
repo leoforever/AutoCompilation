@@ -59,6 +59,8 @@ class TaskState(TypedDict, total=False):
     _chunk_seen_ts: float    # 11-24 W2：最后一个 chunk 到达时刻
     status: str
     software_name: str
+    executor_id: int     # 11-26 多执行机：派单归属（stage3 选机写入）
+    docker_host: str     # ""=本机 socket（存量单执行机行为逐字不变）
     source_type: str
     git_url: str
     git_branch: str
@@ -271,6 +273,8 @@ def stage2_match_env(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             return state
         state["system_name"] = sys_rec.name
         state["pkg_format"] = (getattr(sys_rec, "pkg_format", "") or "").strip()  # 11-17 交付矩阵
+        # 11-26 多执行机：目标架构随环境一起读出（选机第④硬过滤依据）
+        state["sys_arch"] = (getattr(sys_rec, "arch", "") or "loongarch64").strip().lower()
         # base_image 是 admin 配置的完整镜像名（含 tag）
         state["docker_image"] = (sys_rec.base_image or DEFAULT_BASE_IMAGE).strip()
         _log(state, "info", f"[阶段2] 环境匹配: {sys_rec.name} (image={state['docker_image']})", on_log)
@@ -332,6 +336,98 @@ def stage3_create_container(state: TaskState, on_log: Optional[LogCallback] = No
         state["last_error"] = "Docker 客户端未连接"
         _log(state, "error", state["last_error"], on_log)
         return state
+
+    # ── 多执行机选机（11-26 设计档 §三）：stage3 前最后一刻定机 ──
+    # 无在线候选（arch 无匹配机/全冷却）→ 人话失败，绝不把 x86 任务扔龙芯
+    try:
+        from app.services.executor_pool import pick_executor
+        from app.models import SessionLocal as _PSL
+        _pdb = _PSL()
+        try:
+            _eid, _ehost = pick_executor(_pdb, state.get("sys_arch", "loongarch64"),
+                                         exclude_id=int(state.get("_exclude_executor") or 0))
+        finally:
+            _pdb.close()
+        if not _eid:
+            state["status"] = TaskStatus.FAILED.value
+            state["last_error"] = (f"无可执行该架构({state.get('sys_arch','?')})的执行机"
+                                   "（在线池内无 arch 匹配或全部冷却中——执行机管理页核查，或给本机登记该架构）")
+            _log(state, "error", state["last_error"], on_log)
+            return state
+        state["executor_id"] = _eid
+        state["docker_host"] = _ehost
+        if _ehost:
+            from app.services.executor_pool import client_for
+            _rcli = client_for(_ehost)
+            if _rcli is None:
+                # 远程机失联：冷却它，换下一台（一次）；再无候选才失败
+                try:
+                    from app.services.executor_pool import mark_failure
+                    _md = SessionLocal()
+                    try:
+                        mark_failure(_md, _eid, "起容器前连接失败")
+                    finally:
+                        _md.close()
+                except Exception:
+                    pass
+                _pdb = SessionLocal()
+                try:
+                    _eid, _ehost = pick_executor(_pdb, state.get("sys_arch", "loongarch64"),
+                                                 exclude_id=state.get("executor_id") or 0)
+                finally:
+                    _pdb.close()
+                if not _eid:
+                    state["status"] = TaskStatus.FAILED.value
+                    state["last_error"] = "选中的执行机连接失败且池内无其它候选（已记冷却，稍后自动回池）"
+                    _log(state, "error", state["last_error"], on_log)
+                    return state
+                state["executor_id"] = _eid
+                state["docker_host"] = _ehost
+                if _ehost:
+                    _rcli = client_for(_ehost)
+                    if _rcli is None:
+                        state["status"] = TaskStatus.FAILED.value
+                        state["last_error"] = f"执行机连接失败（{_ehost}）"
+                        _log(state, "error", state["last_error"], on_log)
+                        return state
+                else:
+                    _rcli = get_docker_client()
+                cli = _rcli
+                _log(state, "warn", "[阶段3] 首选执行机失联，已换台继续", on_log)
+        # 归属落库（观测/重试排除依据）
+        _task = state.get("_task")
+        if _task is not None:
+            _task.executor_id = _eid
+            try:
+                from app.models import SessionLocal as _SL2, CompileTask as _CT2
+                _s2 = _SL2()
+                _t2 = _s2.query(_CT2).filter(_CT2.task_id == state["task_id"]).first()
+                if _t2:
+                    _t2.executor_id = _eid
+                    _s2.commit()
+                _s2.close()
+            except Exception:
+                pass
+        try:
+            from app.models import Executor as _EX
+            _s3 = SessionLocal()
+            _en = _s3.query(_EX).filter(_EX.id == _eid).first()
+            _log(state, "info", f"[阶段3] 执行机: {_en.name if _en else _eid}"
+                 + (f" ({_ehost})" if _ehost else "（本机）"), on_log)
+            _s3.close()
+        except Exception:
+            pass
+    except Exception as _pe:
+        # 选机模块自身异常绝不拦任务：落本机继续（多执行机是增益不是依赖）
+        state["executor_id"] = 0
+        state["docker_host"] = ""
+        cli = get_docker_client()
+        if cli is None:
+            state["status"] = TaskStatus.FAILED.value
+            state["last_error"] = "Docker 客户端未连接"
+            _log(state, "error", state["last_error"], on_log)
+            return state
+        _log(state, "warn", f"[阶段3] 选机异常回落本机: {str(_pe)[:120]}", on_log)
 
     base_dir = _artifacts_dir() / state["task_id"]
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -585,7 +681,8 @@ def _extract_archive_safely(
 # ==================== 阶段 4 ====================
 def stage4_import_source(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
     """容器内：校验 stage4a 在宿主机下载好的源码已挂载进容器"""
-    cli = get_docker_client()
+    from app.services.executor_pool import client_for as _cf
+    cli = _cf(state.get("docker_host", "")) or get_docker_client()
     container = cli.containers.get(state["container_id"])
     src_dir = f"{state['container_work_dir']}/src"
 
@@ -615,13 +712,17 @@ def stage4_import_source(state: TaskState, on_log: Optional[LogCallback]) -> Tas
 
 # ==================== 阶段 5 (DeepAgent) ====================
 def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
-    cli = get_docker_client()
+    from app.services.executor_pool import client_for as _cf
+    cli = _cf(state.get("docker_host", "")) or get_docker_client()
     container = cli.containers.get(state["container_id"])
     src_dir = f"{state['container_work_dir']}/src"
     output_dir = state["output_dir"]
 
     container.exec_run(["mkdir", "-p", output_dir])
-    backend = DockerBackend(state["container_id"], src_dir)
+    from app.services.skill_loader import skill_exclusion_paths
+    backend = DockerBackend(state["container_id"], src_dir,
+                              docker_host=state.get("docker_host", ""),
+                              skill_excl=skill_exclusion_paths(state.get("system_id")))
 
     # ===== system_prompt（精简 meta，不含地址/命令/流程）=====
     # CPU 限速：服务器 32 物理核 → MAX_WORKERS 个 worker 每个限 32/MAX_WORKERS 核
@@ -716,7 +817,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             _log(_state, "debug", f"[阶段5] LLM 用量 flush 失败(旁路): {_fe}", on_log)
 
     # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
-    _skills_paths = get_skills_paths()
+    _skills_paths = get_skills_paths(system_id=state.get("system_id"))   # 11-27 §九a：按目标系统过滤（空 system_ids=通用恒注入）
     from deepagents import create_deep_agent
     # T9-V 收尾闸门（docs/stage5-verify-discipline-v2.md §七 801346 校准）：检测首次验证
     # 全绿（RESULT pass=N fail=0）后计收尾预算，超限 execute 拒答引导收尾
@@ -943,7 +1044,8 @@ whl/node/纯脚本包可省 RUN.md（自带依赖声明）；ELF 类（binary/so
                     _st["_external_error"] = f"stage5 墙钟硬闸（看门狗线程）：超 {_limit}s 且 chunk 流停滞，已强停容器"
                     _log(_st, "error", f"[阶段5] 墙钟硬闸触发：{int(_limit)}s，docker stop 容器强断（防检查点饿死）", on_log)
                     try:
-                        _cli = get_docker_client()
+                        from app.services.executor_pool import client_for as _cf2
+                        _cli = _cf2(_st.get("docker_host", "")) or get_docker_client()
                         if _cli and _st.get("container_id"):
                             _cli.containers.get(_st["container_id"]).stop(timeout=10)
                     except Exception as e:
@@ -1469,7 +1571,8 @@ def _rescue_build_notes(state: TaskState, container, on_log=None) -> None:
 
 
 def stage6_cleanup(state: TaskState, on_log: Optional[LogCallback]) -> TaskState:
-    cli = get_docker_client()
+    from app.services.executor_pool import client_for as _cf
+    cli = _cf(state.get("docker_host", "")) or get_docker_client()
 
     # _stop_only：只停容器，不归档不删除不碰 work_dir（工单 resolved/cleanup-container 复用恢复路径）
     if state.get("_stop_only") and state.get("container_id") and cli:

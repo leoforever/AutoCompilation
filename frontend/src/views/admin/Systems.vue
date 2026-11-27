@@ -25,6 +25,9 @@
         <el-table-column label="包格式" width="90">
           <template #default="{ row }">{{ row.pkg_format || '未登记' }}</template>
         </el-table-column>
+        <el-table-column label="架构" width="120">
+          <template #default="{ row }">{{ row.arch || 'loongarch64' }}</template>
+        </el-table-column>
 <el-table-column label="编译镜像" min-width="280">
           <template #default="{ row }">
             <code class="img-code">{{ row.base_image }}</code>
@@ -76,6 +79,15 @@
           </el-select>
           <div class="form-hint">决定货架格式过滤与产物打包指向（dpkg -i / rpm -ivh）</div>
         </el-form-item>
+        <el-form-item label="架构">
+          <el-select v-model="form.arch" style="width: 100%">
+            <el-option label="loongarch64（龙芯，当前池内全部）" value="loongarch64" />
+            <el-option label="loongarch64-abi1.0（旧世界，需登记该架构执行机）" value="loongarch64-abi1.0" />
+            <el-option label="x86_64（需池内有 amd64 执行机）" value="x86_64" />
+            <el-option label="aarch64（需池内有 arm64 执行机）" value="aarch64" />
+          </el-select>
+          <div class="form-hint">选机硬过滤：任务只会派给架构匹配的编译执行机（执行机管理页登记）</div>
+        </el-form-item>
         <el-form-item label="编译镜像" prop="base_image">
           <el-input v-model="form.base_image" placeholder="如：loongnix-build:23.2" />
           <div class="form-hint">完整镜像名（含 tag）。worker 会 docker pull 这个镜像</div>
@@ -113,6 +125,7 @@ const form = ref({
   base_image: '',
   glibc_version: '',
   pkg_format: '',
+  arch: 'loongarch64',
   is_active: true,
 })
 
@@ -155,6 +168,7 @@ function editSystem(s: any) {
     base_image: s.base_image,
     glibc_version: s.glibc_version || '',
     pkg_format: s.pkg_format || '',
+    arch: s.arch || 'loongarch64',
     is_active: s.is_active,
   }
   dialogVisible.value = true
@@ -167,6 +181,7 @@ function resetForm() {
     base_image: '',
     glibc_version: '',
     pkg_format: '',
+    arch: 'loongarch64',
     is_active: true,
   }
   formRef.value?.clearValidate()
@@ -186,6 +201,7 @@ async function saveSystem() {
         base_image: form.value.base_image,
         glibc_version: form.value.glibc_version || '',   // 每次显式带（空串=清空基线）
         pkg_format: form.value.pkg_format || '',          // 同上，空=未登记不过滤
+        arch: form.value.arch || 'loongarch64',            // 11-26 多执行机选机依据
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已更新')
@@ -195,6 +211,7 @@ async function saveSystem() {
         base_image: form.value.base_image,
         glibc_version: form.value.glibc_version || '',
         pkg_format: form.value.pkg_format || '',
+        arch: form.value.arch || 'loongarch64',
         is_active: form.value.is_active,
       })
       ElMessage.success('系统已创建')

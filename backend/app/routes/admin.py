@@ -3,6 +3,7 @@ Admin routes
 Based on design doc section 11.2: stats, tickets management, skill CRUD, users, systems
 """
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -674,6 +675,16 @@ async def admin_get_ticket(
 
 # ==================== Skill 管理 ====================
 
+def _skill_system_ids(sk) -> list:
+    """skills.system_ids 是 Text 列存 JSON 字符串（'[3]'）——统一解析出口。
+    旧写法 isinstance(x, list) 对 str 恒 False：读侧永远吐 []，前端编辑弹框
+    回填即空，保存把看到的空写回库=静默清值（11-27"无法保存"根因实测）。"""
+    try:
+        v = json.loads(sk.system_ids) if sk.system_ids else []
+    except ValueError:
+        v = []
+    return v if isinstance(v, list) else []
+
 @router.get("/skills", response_model=ApiResponse)
 async def list_skills(
     skill_type: Optional[str] = None,
@@ -714,7 +725,7 @@ async def list_skills(
         data.append({
             "skill_id": sk.skill_id, "name": sk.name, "type": sk.type,
             "description": sk.description,
-            "system_ids": sk.system_ids if isinstance(sk.system_ids, list) else [],
+            "system_ids": _skill_system_ids(sk),   # Text 列存 JSON 字符串——此前 isinstance(list) 判据恒 False：读侧洗 []→编辑一次静默清值（11-27"无法保存"根因）
             "version": sk.version, "is_active": sk.is_active, "source": sk.source,
             "skill_content": None, "script_content": None,
             "deleted_at": sk.deleted_at.isoformat() if sk.deleted_at else None,
@@ -1022,7 +1033,7 @@ async def get_skill_detail(skill_id: int, db: Session = Depends(get_db)):
     return ApiResponse(data={
         "skill_id": sk.skill_id, "name": sk.name, "type": sk.type,
         "description": sk.description,
-        "system_ids": sk.system_ids if isinstance(sk.system_ids, list) else [],
+        "system_ids": _skill_system_ids(sk),   # 同列表端点：JSON 字符串解析（11-27 修读侧洗 []）
         "version": sk.version, "is_active": sk.is_active, "source": sk.source,
         "skill_content": str(sk.skill_content or ""),
         "script_content": str(sk.script_content or ""),
@@ -1094,6 +1105,7 @@ async def create_system(
         # 11-17 修既有缺口：这两项此前只 update 支持、create 漏传（新建系统填了不生效）
         glibc_version=(system_data.glibc_version or "").strip(),
         pkg_format=(system_data.pkg_format or "").strip(),
+        arch=(system_data.arch or "loongarch64").strip().lower(),   # 11-26 多执行机
     )
     db.add(system)
     try:
@@ -1138,6 +1150,8 @@ async def update_system(
         system.glibc_version = system_data.glibc_version.strip()   # 11-05 配给基线
     if system_data.pkg_format is not None:
         system.pkg_format = system_data.pkg_format.strip()         # 11-17 交付矩阵 rpm/deb
+    if system_data.arch is not None:
+        system.arch = system_data.arch.strip().lower() or "loongarch64"   # 11-26 多执行机
     if system_data.is_active is not None:
         system.is_active = system_data.is_active
 
@@ -1153,6 +1167,170 @@ async def update_system(
     db.commit()
 
     return ApiResponse(data=TargetSystemResponse.model_validate(system).model_dump())
+
+
+# ==================== 执行机池（11-26 多执行机，设计档 §五①④/§五注/§八） ====================
+
+class ExecutorCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    docker_host: str = Field(default="", max_length=255)   # ""=本机；ssh://root@ip 起步（TLS 备用）
+    arch: str = Field(default="loongarch64", max_length=20)
+    images: List[str] = Field(default_factory=list)        # 预热镜像清单（面板信息，不做否决）
+    nproc: int = Field(default=0, ge=0)
+    note: str = Field(default="", max_length=200)
+
+
+class ExecutorUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=64)
+    docker_host: Optional[str] = Field(None, max_length=255)
+    arch: Optional[str] = Field(None, max_length=20)
+    images: Optional[List[str]] = None
+    nproc: Optional[int] = Field(None, ge=0)
+    status: Optional[str] = Field(None, pattern="^(online|cooldown|removed)$")
+    note: Optional[str] = Field(None, max_length=200)
+
+
+def _exec_row(e, running: int = 0) -> dict:
+    import json as _j
+    try:
+        _ck = _j.loads(e.checks or "{}")
+    except ValueError:
+        _ck = {}
+    return {"id": e.id, "name": e.name, "docker_host": e.docker_host or "",
+            "arch": e.arch or "loongarch64", "images": _j.loads(e.images or "[]"),
+            "nproc": e.nproc or 0, "status": e.status or "online",
+            "cooldown_until": e.cooldown_until.strftime("%Y-%m-%d %H:%M") if e.cooldown_until else "",
+            "last_ping_at": e.last_ping_at.strftime("%m-%d %H:%M") if e.last_ping_at else "",
+            "is_builtin": bool(e.is_builtin), "note": (e.note or "")[:120],
+            "checks": _ck, "running": running,
+            "created_at": e.created_at.strftime("%Y-%m-%d") if e.created_at else ""}
+
+
+@router.get("/executors", response_model=ApiResponse)
+async def list_executors(db: Session = Depends(get_db),
+                         current_user: User = Depends(require_admin)):
+    """执行机列表 + 在跑任务聚合（面板=选机黑箱的钥匙，设计档§④优先级）"""
+    from app.models import Executor
+    es = db.query(Executor).order_by(Executor.is_builtin.desc(), Executor.id.asc()).all()
+    from sqlalchemy import func as _f
+    cnt = dict(db.query(CompileTask.executor_id, _f.count())
+               .filter(CompileTask.status == "compiling",
+                       CompileTask.executor_id.isnot(None))
+               .group_by(CompileTask.executor_id).all())
+    return ApiResponse(data={"items": [_exec_row(e, int(cnt.get(e.id, 0))) for e in es]})
+
+
+@router.post("/executors", response_model=ApiResponse)
+async def create_executor(body: ExecutorCreate, request: Request,
+                          db: Session = Depends(get_db),
+                          current_user: User = Depends(require_admin)):
+    """登记执行机（先 ping 通才收——收一台连不上的机器=选机天天冷却 churn）"""
+    import json as _j
+    from app.models import Executor
+    from app.services.executor_pool import client_for
+    if db.query(Executor).filter(Executor.name == body.name).first():
+        raise HTTPException(status_code=400, detail=f"名称已存在: {body.name}")
+    if body.docker_host:
+        if client_for(body.docker_host) is None:
+            raise HTTPException(status_code=400,
+                                detail="连接失败：docker API 不可达（检查 ssh 免密/地址/docker 服务）")
+    e = Executor(name=body.name.strip(), docker_host=body.docker_host.strip(),
+                 arch=(body.arch or "loongarch64").strip().lower(),
+                 images=_j.dumps([i.strip() for i in body.images if i.strip()]),
+                 nproc=body.nproc, note=body.note.strip(), status="online")
+    db.add(e)
+    db.commit()
+    from app.services.audit import log_audit
+    log_audit(db, user_id=current_user.user_id, action="executor_created",
+              target_type="executor", target_id=e.id, target_key=e.name,
+              details=f"host={e.docker_host or '本机'} arch={e.arch}")
+    return ApiResponse(data=_exec_row(e))
+
+
+@router.put("/executors/{exec_id}", response_model=ApiResponse)
+async def update_executor(exec_id: int, body: ExecutorUpdate, request: Request,
+                          db: Session = Depends(get_db),
+                          current_user: User = Depends(require_admin)):
+    """更新登记 / 人工处置：online 回池、cooldown 强制挂起、removed 摘除"""
+    import json as _j
+    from app.models import Executor
+    e = db.query(Executor).filter(Executor.id == exec_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="执行机不存在")
+    if body.name is not None and not e.is_builtin:
+        e.name = body.name.strip()
+    if body.docker_host is not None:
+        if e.is_builtin:
+            raise HTTPException(status_code=400, detail="内置执行机地址不可改")
+        e.docker_host = body.docker_host.strip()
+    if body.arch is not None:
+        e.arch = body.arch.strip().lower()
+    if body.images is not None:
+        e.images = _j.dumps([i.strip() for i in body.images if i.strip()])
+    if body.nproc is not None:
+        e.nproc = body.nproc
+    if body.note is not None:
+        e.note = body.note.strip()
+    if body.status is not None:
+        if e.is_builtin and body.status == "removed":
+            raise HTTPException(status_code=400, detail="内置执行机不可摘除（池子的最后兜底）")
+        e.status = body.status
+        if body.status == "cooldown":
+            from datetime import datetime as _dt, timedelta as _td
+            e.cooldown_until = _dt.utcnow() + _td(hours=1)   # 人工挂起 1h，ping 提前回池
+        elif body.status == "online":
+            e.cooldown_until = None
+    db.commit()
+    from app.services.audit import log_audit
+    log_audit(db, user_id=current_user.user_id, action="executor_updated",
+              target_type="executor", target_id=e.id, target_key=e.name,
+              details=f"fields={list(body.model_dump(exclude_unset=True).keys())}")
+    return ApiResponse(data=_exec_row(e))
+
+
+@router.delete("/executors/{exec_id}", response_model=ApiResponse)
+async def delete_executor(exec_id: int, request: Request,
+                          db: Session = Depends(get_db),
+                          current_user: User = Depends(require_admin)):
+    """摘除=软处理 status=removed（任务归属历史保留）；物理删仅限从未接活的外接机"""
+    from app.models import Executor
+    e = db.query(Executor).filter(Executor.id == exec_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="执行机不存在")
+    if e.is_builtin:
+        raise HTTPException(status_code=400, detail="内置执行机不可删除")
+    used = db.query(CompileTask).filter(CompileTask.executor_id == e.id).count()
+    if used:
+        e.status = "removed"
+        db.commit()
+        from app.services.audit import log_audit
+        log_audit(db, user_id=current_user.user_id, action="executor_removed",
+                  target_type="executor", target_id=e.id, target_key=e.name,
+                  details=f"曾派 {used} 任务，软摘")
+        return ApiResponse(message=f"已摘除（曾派 {used} 个任务，登记保留供审计）", data=_exec_row(e))
+    db.delete(e)
+    db.commit()
+    from app.services.audit import log_audit
+    log_audit(db, user_id=current_user.user_id, action="executor_deleted",
+              target_type="executor", target_id=e.id, target_key=e.name, details="零任务物理删")
+    return ApiResponse(message="已删除（无历史任务）")
+
+
+@router.post("/executors/{exec_id}/probe", response_model=ApiResponse)
+async def probe_executor(exec_id: int, db: Session = Depends(get_db),
+                         current_user: User = Depends(require_admin)):
+    """进池自检/面板刷新：ping+版本+架构+核数+盘水位；通过自动回池、失败如实报"""
+    import json as _j
+    from app.models import Executor
+    from app.services.executor_pool import probe
+    e = db.query(Executor).filter(Executor.id == exec_id).first()
+    if not e:
+        raise HTTPException(status_code=404, detail="执行机不存在")
+    r = probe(db, e)
+    e.checks = _j.dumps({**r, "checked_at": datetime.utcnow().strftime("%m-%d %H:%M")},
+                        ensure_ascii=False)
+    db.commit()
+    return ApiResponse(data=_exec_row(e), message="自检通过" if r["ok"] else f"自检失败：{r['reason']}")
 
 
 @router.delete("/systems/{system_id}", response_model=ApiResponse)

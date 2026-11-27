@@ -182,6 +182,7 @@ class TargetSystem(Base):
     base_image = Column(String(255), nullable=False)  # Docker/Podman 镜像（不含 tag）
     glibc_version = Column(String(20), default="")    # 系统 glibc 基线（11-05 公共池配给闸：SP2=2.38 等，管理员填）
     pkg_format = Column(String(10), default="")       # 包格式 rpm/deb（11-17 交付矩阵：货架格式过滤+AI 产包指向；空=未知不过滤）
+    arch = Column(String(20), default="loongarch64")  # 目标 CPU 架构（11-26 多执行机：选机第④硬过滤依据；存量全是龙芯镜像，默认值零行为变化）
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -245,12 +246,36 @@ class CompileTask(Base):
     artifact_partial = Column(Boolean, default=False)  # 产物=未验证半成品（下载需标注）
     phase_state = Column(Text)                        # JSON：子阶段快照（只存 5-compile/5-verify）
     duration_seconds = Column(Integer)
+    executor_id = Column(Integer)               # 派单归属（11-26 多执行机；NULL/0=本机存量）——观测+重试排除依据
 
     # 关系
     user = relationship("User", back_populates="compile_tasks")
     system = relationship("TargetSystem", back_populates="compile_tasks")
     ticket = relationship("Ticket", back_populates="task", uselist=False)
     experience = relationship("Experience", back_populates="task", uselist=False)
+
+
+class Executor(Base):
+    """执行机登记表（多执行机池，11-26 设计档 §五①/§八/§五注）：
+    控制机=内置项 is_builtin（本机 docker unix socket，永远在线，选机兜底）；
+    外接=裸 docker daemon + ssh 隧道起步（实测 .91 全链路 0.3s 级，TLS 备用）。
+    纪律：host 路径与 NFS 挂载同路径（§二.1），docker 存储根本地大盘（§二.3）。"""
+    __tablename__ = "executors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False)       # 人话名：本机 / .91试验田
+    docker_host = Column(String(255), default="")                # "" =本机 socket；或 ssh://root@ip
+    arch = Column(String(20), default="loongarch64")             # 选机第④硬过滤
+    images = Column(Text, default="[]")                          # JSON 镜像清单（预热能力声明=硬过滤①依据）
+    nproc = Column(Integer, default=0)                           # 实际核数（限核联动/负载排序参考，登记时 ping 探或人填）
+    status = Column(String(12), default="online")                # online / cooldown / removed
+    cooldown_until = Column(DateTime)                            # 冷却到期时间（派失败置，选机跳过未到期）
+    last_ping_at = Column(DateTime)                              # 最近心跳/自检成功时间
+    note = Column(String(300), default="")
+    checks = Column(Text, default="{}")        # 最近一次进池自检结果 JSON：arch/disk_free_gb/mount_ok/checked_at
+    is_builtin = Column(Boolean, default=False)                  # 内置控制机=不可删，永远候选兜底
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Ticket(Base):
@@ -441,6 +466,28 @@ def ensure_softdelete_columns():
     """软删两列幂等 DDL（_safe_add_column 同族；存量行 NULL=未删，无需回填）"""
     _safe_add_column("compile_tasks", "deleted_at", "TIMESTAMP")
     _safe_add_column("tickets", "deleted_at", "TIMESTAMP")
+    # 多执行机池（11-26）：任务归属列 + 目标系统架构列（存量默认龙芯=零行为变化）
+    _safe_add_column("compile_tasks", "executor_id", "INTEGER")
+    _safe_add_column("target_systems", "arch", "VARCHAR(20) DEFAULT 'loongarch64'")
+    _safe_add_column("executors", "checks", "TEXT DEFAULT '{}'")
+    with engine.begin() as conn:      # 存量系统行补默认（ADD COLUMN 带 DEFAULT 在 PG 已回填，此处兜空）
+        from sqlalchemy import text as _t0
+        conn.execute(_t0("UPDATE target_systems SET arch='loongarch64' "
+                         "WHERE arch IS NULL OR arch=''"))
+
+
+def seed_builtin_executor():
+    """内置执行机=控制机自身（幂等 seed）：选机永远有兜底项，池子不会因
+    外接机全灭而停摆；不可删（admin 端点拒）。"""
+    from sqlalchemy import text as _t
+    with engine.begin() as conn:
+        conn.execute(_t(
+            "INSERT INTO executors (name, docker_host, arch, status, is_builtin, nproc, "
+            " images, note, created_at, updated_at) "
+            "SELECT '控制机(本机)', '', 'loongarch64', 'online', TRUE, 0, '[]', "
+            "       '内置=本机 docker unix socket，永远候选，不可删除', "
+            "       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP "
+            "WHERE NOT EXISTS (SELECT 1 FROM executors WHERE is_builtin = TRUE)"))
 
 
 def ensure_artifact_identity_columns():
@@ -507,7 +554,8 @@ def init_db():
     # 幂等迁移：删字段
     _safe_drop_column("skills", "sync_status")
     # 2026-10-13: TargetSystem 简化（drop arch / tag，只用 name + base_image）
-    _safe_drop_column("target_systems", "arch")
+    # 2026-11-26 反转一半：多执行机池需要 arch（异构选机第④硬过滤）——不再 drop，
+    # 改由 ensure 迁移补回（带 loongarch64 默认值）；tag 维持退役
     _safe_drop_column("target_systems", "tag")
     # 2026-10-16: User 软删（deleted_at + deleted_by + original_username）
     _safe_add_column("users", "deleted_at", "TIMESTAMP NULL")
@@ -528,6 +576,7 @@ def init_db():
     ensure_artifact_identity_columns()
     _relax_auditlog_user_notnull()
     _ensure_audit_indexes()
+    seed_builtin_executor()   # 多执行机池（11-26）：内置本机项幂等 seed（create_all 已建表）
     # 种子数据：默认 target_system（缺了用户提交编译会报"系统不存在"）
     _seed_default_target_systems()
     logger.info("Database initialized")
