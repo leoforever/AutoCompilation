@@ -817,7 +817,7 @@ def stage5_run_agent(state: TaskState, on_log: Optional[LogCallback]) -> TaskSta
             _log(_state, "debug", f"[阶段5] LLM 用量 flush 失败(旁路): {_fe}", on_log)
 
     # 每次启动 stage5 都重扫磁盘（approve/update/delete 后热生效，无需重启后端）
-    _skills_paths = get_skills_paths(system_id=state.get("system_id"))   # 11-27 §九a：按目标系统过滤（空 system_ids=通用恒注入）
+    _skills_paths = get_skills_paths()   # 契约=层目录×2（闸在 DockerBackend.ls skill_excl，11-27 翻案后终态）
     from deepagents import create_deep_agent
     # T9-V 收尾闸门（docs/stage5-verify-discipline-v2.md §七 801346 校准）：检测首次验证
     # 全绿（RESULT pass=N fail=0）后计收尾预算，超限 execute 拒答引导收尾
@@ -2041,7 +2041,10 @@ def run_task(task_id: str, on_log: Optional[LogCallback] = None) -> dict:
     except LlmThrottledError as e:
         # LLM 限流（429）退避耗尽：人话文案 + 审计留痕（2026-11-03）
         # 与"代码编译失败"严格区分——用户不该以为自己的代码有问题
-        from app.services.llm_client import LlmThrottledError, THROTTLE_MSG
+        # ⚠ 只 import THROTTLE_MSG：连 LlmThrottledError 一起 import 会让该名字
+        # 变成本函数局部变量（11-27 B13876 实锤：任何上游异常撞 except 子句求值时
+        # UnboundLocalError，掩盖真实错误且 worker 崩溃、任务永卡 compiling）
+        from app.services.llm_client import THROTTLE_MSG
         state["status"] = TaskStatus.FAILED.value
         state["last_error"] = (f"{THROTTLE_MSG}（已等待 {e.waited:.0f}s，尝试 {e.attempts} 次"
                                f"，模型 {e.slot_id or '-'}）")
