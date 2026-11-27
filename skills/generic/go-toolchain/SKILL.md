@@ -1,11 +1,18 @@
 ---
 name: go-toolchain
 type: layer1-infra
-description: 龙芯平台 Go 工具链：4 个已知可用版本（1.24.13/1.25.6/1.26.9/1.27.2），按 go.mod 要求自动选版本下载安装。安装 Go、go install toolchain、编译 Go 项目时读这条。
+description: 龙芯平台 Go 工具链：选版顺序=货架 go1.* 件优先 ∪ go.dev 白名单 4 版（1.24.13/1.25.6/1.26.9/1.27.2），按 go.mod 要求自动选版本下载安装。安装 Go、go.mod 钉 toolchain、编译 Go 项目时读这条。
 allowed-tools: [execute, read_file]
 ---
 
 # Go 工具链（龙芯 LoongArch）
+
+## 选版顺序：货架 ∪ 白名单
+
+1. 先看货架：`ls /work/cache/go*/go1.*.linux-loong64.tar.gz /work/cache/_common/go*/go1.*.linux-loong64.tar.gz 2>/dev/null | sort -V`
+   有 ≥ go.mod 要求的件 → 直接 `tar -C /usr/local -xzf <件>`，跳到验证
+   （零网络，最快路径）。货架=活白名单：管理员传新版即入库，本篇不用改字。
+2. 货架没有 → 下方 go.dev 白名单，规则原样（挑 ≥ 要求的最低版，只下这 4 个）。
 
 ## 已知可用版本（白名单，4 个）
 
@@ -73,6 +80,10 @@ export GOPROXY=https://goproxy.cn,direct
 - 不要用 `go.dev/dl/?mode=json`（这台机器上经常返空响应）
 - **不要**降级到 < go.mod 要求版本（编译必失败）
 - 不要跳过 `go version` 验证（解压失败 / 404 解压会得到奇怪目录）
+- go.mod 有 `toolchain goX.Y.Z` 行且已装版本 < 钉版时，go 会自己去
+  proxy.golang.org 拉（本环境不通，必挂）——解法：`export GOTOOLCHAIN=local`
+  强制用已装版本，或按「选版顺序」从货架取 ≥ 钉版的件
+- 货架件解压后照旧必须 `go version` 验证（同 404 HTML 防呆，一视同仁）
 
 ## 编译策略（先 go build，必要时再 cmake）
 
