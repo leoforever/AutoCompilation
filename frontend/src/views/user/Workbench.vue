@@ -130,7 +130,7 @@
         <el-button size="small" style="float:right" @click="backToNewForm">＋ 新建编译</el-button>
       </h3>
 
-      <!-- 阶段进度（七段；编译/验证两段来自 2026-11-02 子阶段判定） -->
+      <!-- 阶段进度（六段；11-27 删"验证"格，"编译"=整个阶段5） -->
       <div class="steps" v-if="stageSteps.some(s => s.cls)">
         <div v-for="s in stageSteps" :key="s.key" :class="['step', s.cls]">
           <div class="bub">{{ s.mark }}</div>
@@ -716,34 +716,28 @@ function extractSkillsFromText(text: string, _wsNames?: string[]) {
   }
 }
 
-// ── 阶段进度推导（2026-11-02）────────────────────────────────
-// 1-4/6 由 log 行前缀（[阶段N]）推导；5-编译/5-验证 由后端标记行
-// （[阶段5-编译] ✓ / [阶段5-验证] ✓|✗）推导——后端已在 log 里打标，前端只解析。
-const phaseMarks = reactive({ compile: '', verify: '' })
-
-function _scanPhaseMarks(text: string) {
-  if (!text) return
-  if (text.includes('[阶段5-编译]')) phaseMarks.compile = text.includes('✓') ? 'done' : (text.includes('✗') ? 'failed' : 'running')
-  if (text.includes('[阶段5-验证]')) phaseMarks.verify = text.includes('✓') ? 'done' : (text.includes('✗') ? 'failed' : 'running')
-}
+// ── 阶段进度推导 ────────────────────────────────────────────
+// 全部段由 log 行前缀（[阶段N]）推导。11-27：原"编译/验证"两段
+// 子阶段判定已删——"验证✓"本质是复读 AI 自报声明（恒绿无信息量，
+// 工具输出回声还会误点亮），合并为一格"编译"指示整个阶段5：
+// 起=[阶段5] 完成=[阶段5] 完成/[阶段6] 异常=[阶段5] 异常
 
 const stageSteps = computed(() => {
   const txt = logLines.value.map(l => l.text).join('\n')
   const has = (tag: string) => txt.includes(tag)
+  const s5done = has('[阶段5] 完成') || has('[阶段6]')
   const steps: { key: string; label: string; cls: string; mark: string }[] = [
     { key: '1', label: '初始化', cls: has('[阶段1]') ? 'done' : '', mark: has('[阶段1]') ? '✓' : '' },
     { key: '2', label: '环境匹配', cls: has('[阶段2]') ? 'done' : '', mark: has('[阶段2]') ? '✓' : '' },
     { key: '3', label: '容器', cls: has('[阶段3]') ? 'done' : '', mark: has('[阶段3]') ? '✓' : '' },
     { key: '4', label: '源码', cls: has('[阶段4') ? 'done' : '', mark: has('[阶段4') ? '✓' : '' },
-    { key: '5c', label: '编译', cls: phaseMarks.compile === 'done' ? 'done' : (phaseMarks.compile === 'failed' ? 'fail' : (has('[阶段5]') ? 'doing' : '')), mark: phaseMarks.compile === 'done' ? '✓' : (phaseMarks.compile === 'failed' ? '✗' : '') },
-    { key: '5v', label: '验证', cls: phaseMarks.verify === 'done' ? 'done' : (phaseMarks.verify === 'failed' ? 'fail' : ''), mark: phaseMarks.verify === 'done' ? '✓' : (phaseMarks.verify === 'failed' ? '✗' : '') },
+    { key: '5', label: '编译', cls: has('[阶段5] 异常') ? 'fail' : (s5done ? 'done' : (has('[阶段5]') ? 'doing' : '')), mark: has('[阶段5] 异常') ? '✗' : (s5done ? '✓' : '') },
     { key: '6', label: '归档', cls: has('[阶段6] 产物归档') ? 'done' : (has('[阶段6]') ? 'doing' : ''), mark: has('[阶段6] 产物归档') ? '✓' : '' },
   ]
   return steps
 })
 
 function appendLog(type: string, text: string) {
-  _scanPhaseMarks(text)
   logLines.value.push({ text, type })
   nextTick(() => {
     const el = document.querySelector('.term')
